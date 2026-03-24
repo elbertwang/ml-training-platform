@@ -1,6 +1,7 @@
 {
   "displayName": "ML Training Platform - Overview",
   "mosaicLayout": {
+    "columns": 12,
     "tiles": [
       {
         "width": 12,
