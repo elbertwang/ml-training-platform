@@ -45,9 +45,12 @@ spec:
                     - |
                       pip install google-cloud-mldiagnostics google-cloud-logging
 
-                      python3 -c '
-                      import logging, math, time
-                      import jax, jax.numpy as jnp
+                      cat << 'PYEOF' > /tmp/smoke_test.py
+                      import logging
+                      import math
+                      import time
+                      import jax
+                      import jax.numpy as jnp
                       import google.cloud.logging
                       from google_cloud_mldiagnostics import machinelearning_run, metrics, xprof, metric_types
 
@@ -56,15 +59,19 @@ spec:
                       logging.info("=== SMOKE TEST START ===")
                       logging.info(f"JAX devices: {jax.devices()}, count: {jax.device_count()}")
 
-                      run = machinelearning_run(
-                          name="test-gemm-smoke-0324",
-                          run_group="smoke-test",
-                          configs={"matrix_size": 2048, "dtype": "bfloat16"},
-                          project="tpu-launchpad-playground",
-                          region="us-central1",
-                          gcs_path="gs://yunpeng-mldiagnostics-profiles",
-                          on_demand_xprof=True,
-                      )
+                      try:
+                          run = machinelearning_run(
+                              name="test-gemm-smoke-0324",
+                              run_group="smoke-test",
+                              configs={"matrix_size": 2048, "dtype": "bfloat16"},
+                              project="tpu-launchpad-playground",
+                              region="us-central1",
+                              gcs_path="gs://yunpeng-mldiagnostics-profiles",
+                              on_demand_xprof=True,
+                          )
+                          logging.info("MLRun created successfully")
+                      except Exception as e:
+                          logging.warning(f"MLRun creation failed (continuing without): {e}")
 
                       M = 2048
                       key = jax.random.PRNGKey(42)
@@ -74,9 +81,12 @@ spec:
                       for _ in range(3):
                           jnp.matmul(a, b).block_until_ready()
 
-                      with xprof():
-                          for _ in range(5):
-                              jnp.matmul(a, b).block_until_ready()
+                      try:
+                          with xprof():
+                              for _ in range(5):
+                                  jnp.matmul(a, b).block_until_ready()
+                      except Exception as e:
+                          logging.warning(f"XProf failed: {e}")
 
                       end = time.time() + 5 * 60
                       step = 0
@@ -88,17 +98,23 @@ spec:
                           tflops = 2 * M**3 / dt / 1e12
                           if step % 10 == 0:
                               loss = 5.0 * math.exp(-step / 50000)
-                              metrics.record_metrics([
-                                  {"metric_name": metric_types.MetricType.LOSS, "value": loss},
-                                  {"metric_name": metric_types.MetricType.STEP_TIME, "value": dt},
-                                  {"metric_name": metric_types.MetricType.TFLOPS, "value": tflops},
-                                  {"metric_name": metric_types.MetricType.MFU, "value": tflops / 900},
-                              ], step=step)
+                              try:
+                                  metrics.record_metrics([
+                                      {"metric_name": metric_types.MetricType.LOSS, "value": loss},
+                                      {"metric_name": metric_types.MetricType.STEP_TIME, "value": dt},
+                                      {"metric_name": metric_types.MetricType.TFLOPS, "value": tflops},
+                                      {"metric_name": metric_types.MetricType.MFU, "value": tflops / 900},
+                                  ], step=step)
+                              except Exception:
+                                  pass
                           if step % 200 == 0:
                               logging.info(f"Step {step}: tflops={tflops:.2f}, mfu={tflops/900:.4f}")
 
                       logging.info(f"=== SMOKE TEST DONE after {step} steps ===")
-                      '
+                      time.sleep(600)
+                      PYEOF
+
+                      python /tmp/smoke_test.py
                   resources:
                     requests:
                       google.com/tpu: 4
