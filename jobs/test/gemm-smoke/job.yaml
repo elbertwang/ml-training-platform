@@ -1,0 +1,106 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-gemm-smoke-0324
+  namespace: default
+  labels:
+    managed-mldiagnostics-gke: "true"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            spec:
+              serviceAccountName: mldiag-sa
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-nodepool: np-mldiag-tpu
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+              containers:
+                - name: jax-tpu
+                  image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+                  ports:
+                    - containerPort: 8471
+                    - containerPort: 8080
+                    - containerPort: 8431
+                    - containerPort: 9999
+                  securityContext:
+                    privileged: true
+                  command:
+                    - bash
+                    - -c
+                    - |
+                      pip install google-cloud-mldiagnostics google-cloud-logging
+
+                      python3 -c '
+                      import logging, math, time
+                      import jax, jax.numpy as jnp
+                      import google.cloud.logging
+                      from google_cloud_mldiagnostics import machinelearning_run, metrics, xprof, metric_types
+
+                      google.cloud.logging.Client().setup_logging()
+                      logging.getLogger().setLevel(logging.INFO)
+                      logging.info("=== SMOKE TEST START ===")
+                      logging.info(f"JAX devices: {jax.devices()}, count: {jax.device_count()}")
+
+                      run = machinelearning_run(
+                          name="test-gemm-smoke-0324",
+                          run_group="smoke-test",
+                          configs={"matrix_size": 2048, "dtype": "bfloat16"},
+                          project="tpu-launchpad-playground",
+                          region="us-central1",
+                          gcs_path="gs://yunpeng-mldiagnostics-profiles",
+                          on_demand_xprof=True,
+                      )
+
+                      M = 2048
+                      key = jax.random.PRNGKey(42)
+                      a = jax.random.normal(key, (M, M), dtype=jnp.bfloat16)
+                      b = jax.random.normal(key, (M, M), dtype=jnp.bfloat16)
+
+                      for _ in range(3):
+                          jnp.matmul(a, b).block_until_ready()
+
+                      with xprof():
+                          for _ in range(5):
+                              jnp.matmul(a, b).block_until_ready()
+
+                      end = time.time() + 5 * 60
+                      step = 0
+                      while time.time() < end:
+                          t0 = time.time()
+                          jnp.matmul(a, b).block_until_ready()
+                          dt = time.time() - t0
+                          step += 1
+                          tflops = 2 * M**3 / dt / 1e12
+                          if step % 10 == 0:
+                              loss = 5.0 * math.exp(-step / 50000)
+                              metrics.record_metrics([
+                                  {"metric_name": metric_types.MetricType.LOSS, "value": loss},
+                                  {"metric_name": metric_types.MetricType.STEP_TIME, "value": dt},
+                                  {"metric_name": metric_types.MetricType.TFLOPS, "value": tflops},
+                                  {"metric_name": metric_types.MetricType.MFU, "value": tflops / 900},
+                              ], step=step)
+                          if step % 200 == 0:
+                              logging.info(f"Step {step}: tflops={tflops:.2f}, mfu={tflops/900:.4f}")
+
+                      logging.info(f"=== SMOKE TEST DONE after {step} steps ===")
+                      '
+                  resources:
+                    requests:
+                      google.com/tpu: 4
+                    limits:
+                      google.com/tpu: 4
