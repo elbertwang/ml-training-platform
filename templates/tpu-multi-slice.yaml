@@ -1,0 +1,66 @@
+# TPU Multi-Slice Job Template
+# Usage: Copy this file to jobs/<team>/<task-name>/job.yaml and modify marked fields
+#
+# This template runs training across multiple TPU slices (multi-node).
+#
+# Required changes (marked with # ← CHANGE):
+#   - metadata.name: unique job name
+#   - replicas: number of TPU slices
+#   - parallelism/completions: nodes per slice
+#   - containers.image: your training image
+#   - containers.command: your training command
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: CHANGE-ME-multislice-job               # ← CHANGE: unique job name
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+  labels:
+    managed-mldiagnostics-gke: "true"
+spec:
+  failurePolicy:
+    maxRestarts: 4
+  replicatedJobs:
+    - name: slice
+      replicas: 1                              # ← CHANGE: number of slices
+      template:
+        spec:
+          parallelism: 1                       # ← CHANGE: nodes per slice
+          completions: 1                       # ← CHANGE: must match parallelism
+          backoffLimit: 0
+          template:
+            spec:
+              serviceAccountName: mldiag-sa
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-nodepool: np-mldiag-tpu
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+              containers:
+                - name: jax-tpu
+                  image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest  # ← CHANGE
+                  ports:
+                    - containerPort: 8471
+                    - containerPort: 8080
+                    - containerPort: 8431
+                    - containerPort: 9999
+                  securityContext:
+                    privileged: true
+                  command:                     # ← CHANGE: your training command
+                    - bash
+                    - -c
+                    - |
+                      pip install google-cloud-mldiagnostics google-cloud-logging
+                      python your_training_script.py
+                  resources:
+                    requests:
+                      google.com/tpu: 4
+                    limits:
+                      google.com/tpu: 4

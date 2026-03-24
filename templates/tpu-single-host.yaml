@@ -1,0 +1,64 @@
+# TPU Single Host Job Template
+# Usage: Copy this file to jobs/<team>/<task-name>/job.yaml and modify marked fields
+#
+# Required changes (marked with # ← CHANGE):
+#   - metadata.name: unique job name
+#   - containers.image: your training image
+#   - containers.command: your training command
+#
+# Optional changes:
+#   - resources.limits.google.com/tpu: TPU chip count (default: 4)
+#   - nodeSelector: adjust for different TPU types
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: CHANGE-ME-job-name                     # ← CHANGE: unique job name
+  namespace: default
+  labels:
+    managed-mldiagnostics-gke: "true"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            spec:
+              serviceAccountName: mldiag-sa
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-nodepool: np-mldiag-tpu
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+              containers:
+                - name: jax-tpu
+                  image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest  # ← CHANGE: your image
+                  ports:
+                    - containerPort: 8471
+                    - containerPort: 8080
+                    - containerPort: 8431
+                    - containerPort: 9999
+                  securityContext:
+                    privileged: true
+                  command:                      # ← CHANGE: your training command
+                    - bash
+                    - -c
+                    - |
+                      pip install google-cloud-mldiagnostics google-cloud-logging
+                      python your_training_script.py
+                  resources:
+                    requests:
+                      google.com/tpu: 4
+                    limits:
+                      google.com/tpu: 4

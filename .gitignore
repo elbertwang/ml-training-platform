@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.log
+.DS_Store
+gke_gcloud_auth_plugin_cache

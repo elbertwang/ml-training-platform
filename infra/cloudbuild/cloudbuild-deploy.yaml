@@ -1,0 +1,57 @@
+steps:
+  # Step 1: Detect changed job YAML files
+  - name: 'gcr.io/cloud-builders/git'
+    id: 'detect-changes'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        git diff --name-only HEAD~1 HEAD | grep '^jobs/.*\.yaml$' > /workspace/changed_jobs.txt || true
+        echo "Changed job files:"
+        cat /workspace/changed_jobs.txt || echo "(none)"
+
+  # Step 2: Build and push images if Dockerfile changed
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-images'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        CHANGED_IMAGES=$(git diff --name-only HEAD~1 HEAD | grep '^images/' | head -1)
+        if [ -n "$CHANGED_IMAGES" ]; then
+          for dir in $(git diff --name-only HEAD~1 HEAD | grep '^images/' | xargs -I{} dirname {} | sort -u); do
+            IMAGE_NAME=$(basename "$dir")
+            echo "Building image: $IMAGE_NAME"
+            docker build -t us-central1-docker.pkg.dev/$PROJECT_ID/ml-training-images/$IMAGE_NAME:latest "$dir"
+            docker push us-central1-docker.pkg.dev/$PROJECT_ID/ml-training-images/$IMAGE_NAME:latest
+          done
+        else
+          echo "No image changes detected, skipping build."
+        fi
+
+  # Step 3: Deploy changed jobs to GKE
+  - name: 'gcr.io/cloud-builders/kubectl'
+    id: 'deploy-jobs'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        if [ -s /workspace/changed_jobs.txt ]; then
+          while IFS= read -r f; do
+            if [ -f "$f" ]; then
+              echo "Deploying: $f"
+              kubectl apply -f "$f"
+            else
+              echo "File removed, skipping: $f"
+            fi
+          done < /workspace/changed_jobs.txt
+          echo "Deployment complete."
+        else
+          echo "No job changes detected, nothing to deploy."
+        fi
+    env:
+      - 'CLOUDSDK_COMPUTE_REGION=us-central1'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=shun-elm-poc-gke'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
