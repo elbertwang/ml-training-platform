@@ -26,8 +26,12 @@ steps:
   # Step 2: Resource quota check (prevent excessive TPU requests)
   - name: 'python:3.12-slim'
     id: 'quota-check'
-    entrypoint: 'python'
-    args: ['infra/cloudbuild/check_quota.py']
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        pip install -q pyyaml
+        python infra/cloudbuild/check_quota.py
 
   # Step 3: Dry-run validation against GKE cluster
   - name: 'gcr.io/cloud-builders/kubectl'
