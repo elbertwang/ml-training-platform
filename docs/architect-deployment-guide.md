@@ -188,6 +188,37 @@ kubectl annotate serviceaccount mldiag-sa -n default \
 
 > **踩坑提醒**：K8s SA 的 `iam.gke.io/gcp-service-account` 注解中的项目名**必须**与 GCP SA 所在项目一致。如果写错项目名，Pod 会拿到错误的身份，导致 403 权限错误。
 
+### 3.4 授权 Node Compute SA（hostNetwork 场景必须）
+
+TPU Job 使用 `hostNetwork: true`，这会绕过 GKE 的 Workload Identity 元数据代理，Pod 实际使用的是**节点的 Compute Engine SA**，而非 K8s SA 绑定的 GCP SA。
+
+因此，必须给节点的 Compute SA 也授予 MLDiagnostics 所需权限：
+
+```bash
+# 获取节点 SA（格式：<PROJECT_NUMBER>-compute@developer.gserviceaccount.com）
+NODE_SA=$(gcloud container node-pools describe $NODE_POOL_NAME \
+  --cluster=$CLUSTER_NAME --region=$REGION --project=$PROJECT_ID \
+  --format="value(config.serviceAccount)")
+echo "Node SA: $NODE_SA"
+
+# 授予 Cluster Director 权限
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$NODE_SA" \
+  --role="roles/hypercomputecluster.editor"
+
+# 授予 Cloud Logging 写入权限
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$NODE_SA" \
+  --role="roles/logging.logWriter"
+
+# 授予 GCS 存储权限
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$NODE_SA" \
+  --role="roles/storage.objectUser"
+```
+
+> **关键**：如果跳过这一步，`machinelearning_run()` 会报 403 错误，导致训练指标无法上报到 Cluster Director Console。
+
 ---
 
 ## Step 4: 安装 MLDiagnostics 组件
@@ -361,7 +392,29 @@ gcloud builds triggers list --region=$REGION --project=$PROJECT_ID
 
 ## Step 6: 监控配置
 
-### 6.1 创建 Cloud Monitoring Dashboard
+### 6.1 创建 Log-based Metrics（训练指标）
+
+MLDiagnostics SDK 将训练指标（loss、TFLOPS、MFU 等）写入 Cloud Logging。要在 Dashboard 中显示图表，需要先创建 log-based metrics：
+
+```bash
+bash infra/setup/create-log-metrics.sh
+```
+
+这会创建 7 个 log-based metrics：
+
+| Metric 名称 | 数据来源 | 说明 |
+|-------------|---------|------|
+| `ml_training_loss` | `namespace=loss` | 训练损失 |
+| `ml_training_tflops` | `namespace=tflops` | TFLOPS |
+| `ml_training_mfu` | `namespace=mfu` | MFU |
+| `ml_training_step_time` | `namespace=step_time` | 每步耗时 |
+| `ml_training_learning_rate` | `namespace=learning_rate` | 学习率 |
+| `ml_training_gradient_norm` | `namespace=gradient_norm` | 梯度范数 |
+| `ml_training_throughput` | `namespace=throughput` | 吞吐量 |
+
+> **注意**：log-based metrics 只统计创建之后的新日志，不会回填历史数据。
+
+### 6.2 创建 Cloud Monitoring Dashboard
 
 先修改 `infra/monitoring/dashboard.json` 中所有 `cluster_name` 为你的集群名，然后：
 
@@ -371,12 +424,18 @@ gcloud monitoring dashboards create \
   --project=$PROJECT_ID
 ```
 
-Dashboard 包含：
-- 顶部快捷链接（Cluster Director / Logs Explorer / 提交文档）
-- TPU 利用率 + HBM 内存
-- Pod CPU / 内存
-- 实时日志面板
-- Pod 重启计数 + Node 状态
+Dashboard 分为两个 Section，各带独立筛选器：
+
+**Training Metrics**（按 `job_name` 筛选）：
+- Loss、TFLOPS、Step Time、MFU
+- Learning Rate、Gradient Norm、Throughput
+
+**Infra Metrics**（按 `cluster_name` 筛选）：
+- TPU 利用率、HBM 内存
+- Pod CPU、Pod 内存
+- Pod 重启次数、Node 就绪数
+
+底部还有实时日志面板和快捷链接。
 
 ### 6.2 授权算法团队
 
@@ -453,6 +512,9 @@ kubectl delete jobset gemm-demo
 | Autoscaler 不扩容 | `max-nodes=1` 且已满 | 增大 node pool 的 `--max-nodes` |
 | `machinelearning_run()` 抛异常导致 Job 失败 | SA 权限不足但未捕获异常 | 训练脚本中用 try/except 包裹 MLRun 调用 |
 | quota check 步骤报 `ModuleNotFoundError: yaml` | Cloud Build 容器无 pyyaml | pipeline 中先 `pip install pyyaml` |
+| `hostNetwork: true` 下 Workload Identity 不生效 | hostNetwork 绕过 GKE metadata proxy，Pod 用 node SA | Step 3.4：给 node Compute SA 授予 MLDiagnostics 权限 |
+| Dashboard Training Metrics 图表为空 | 未创建 log-based metrics | Step 6.1：运行 `create-log-metrics.sh` |
+| YAML 中 inline `python3 -c '...'` 脚本静默失败 | 单引号嵌套冲突 | 使用 heredoc 写入临时文件再执行 |
 
 ---
 

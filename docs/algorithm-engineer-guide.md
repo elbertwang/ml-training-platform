@@ -196,13 +196,19 @@ git push -u origin job/alice/llama-finetune
 
 你**不需要** kubectl 权限，所有日志都可以通过浏览器查看。
 
-### 方式 1：Dashboard 日志面板
+### 方式 1：统一 Dashboard
 
 打开统一 Dashboard：
 
 **https://console.cloud.google.com/monitoring/dashboards?project=tpu-launchpad-playground**
 
-找到 `ML Training Platform - Overview`，底部有实时日志面板。
+找到 `ML Training Platform - Overview`，Dashboard 分为两个区域：
+
+- **Training Metrics** — Loss、TFLOPS、Step Time、MFU、Learning Rate、Gradient Norm、Throughput
+  - 使用顶部 `job_name` 筛选器选择你的 Job
+- **Infra Metrics** — TPU 利用率、HBM 内存、Pod CPU/内存、Pod 重启、Node 状态
+  - 使用顶部 `cluster_name` 筛选器选择集群
+- **底部** — 实时日志面板
 
 ### 方式 2：Logs Explorer（搜索/过滤）
 
