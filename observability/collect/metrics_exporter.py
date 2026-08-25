@@ -22,6 +22,13 @@ Two of the metrics below matter more than they look:
 
 Long/narrow schema on purpose: adding a metric is a config edit, not a schema
 migration, and the model layer pivots what it needs in SQL.
+
+Idempotency. Each run DELETEs the point_time range it is about to write before
+loading it. Without that, running every 5 minutes with a 1-hour window would
+write every point twelve times and fact_goodput would report twelve times the
+real chip-hours and cost -- silently, with no error anywhere. Append-plus-
+deduping-view was the alternative; delete-then-load keeps the raw table exact
+and avoids a window function over a growing table on every read.
 """
 
 import argparse
@@ -98,7 +105,7 @@ def fetch_series(token, project, metric_type, resource_type,
         url = f"{base}&pageToken={token_next}"
 
 
-def to_rows(series_list, metric_type):
+def to_rows(series_list, metric_type, ingested_at):
     """Flatten timeSeries into one row per point."""
     rows = []
     for s in series_list:
@@ -118,13 +125,29 @@ def to_rows(series_list, metric_type):
                 "resource_type": s.get("resource", {}).get("type"),
                 "resource_labels": resource_labels,
                 "metric_labels": metric_labels,
+                "ingested_at": ingested_at,
             })
     return rows
 
 
+def clear_window(project, dataset, start, end):
+    """Delete the point_time range we are about to rewrite, so re-runs are exact."""
+    sql = (f"DELETE FROM `{project}.{dataset}.metric_samples` "
+           f"WHERE point_time >= TIMESTAMP('{start}') "
+           f"AND point_time < TIMESTAMP('{end}')")
+    result = subprocess.run(
+        ["bq", f"--project_id={project}", "query", "--use_legacy_sql=false", sql],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        # first run: the table does not exist yet, which is not an error
+        if "Not found" in result.stderr or "not found" in result.stderr:
+            return
+        sys.exit(f"failed to clear window:\n{result.stderr}")
+
+
 def bq_load(project, dataset, rows):
     if not rows:
-        print("  nothing to load")
+        print("  nothing to load", flush=True)
         return
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         for row in rows:
@@ -138,13 +161,14 @@ def bq_load(project, dataset, rows):
         "--clustering_fields=metric_type",
         f"{dataset}.metric_samples", path,
         ("metric_type:STRING,point_time:TIMESTAMP,value:FLOAT,"
-         "resource_type:STRING,resource_labels:JSON,metric_labels:JSON"),
+         "resource_type:STRING,resource_labels:JSON,metric_labels:JSON,"
+         "ingested_at:TIMESTAMP"),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(path)
     if result.returncode != 0:
         sys.exit(f"bq load failed:\n{result.stderr}")
-    print(f"  loaded {len(rows)} rows")
+    print(f"  loaded {len(rows)} rows", flush=True)
 
 
 def main():
@@ -160,10 +184,16 @@ def main():
     token = access_token()
     end_dt = dt.datetime.now(dt.timezone.utc)
     start_dt = end_dt - dt.timedelta(hours=args.hours)
+    ingested_at = end_dt.isoformat()
+    iso = lambda d: d.isoformat().replace("+00:00", "Z")
+
+    # One DELETE for the whole window across all metrics, before any load.
+    print(f"clearing {iso(start_dt)} .. {iso(end_dt)}", flush=True)
+    clear_window(args.project, args.dataset, iso(start_dt), iso(end_dt))
 
     total = 0
     for metric_type, resource_type, alignment, aligner in METRICS:
-        print(f"{metric_type} ({aligner} @ {alignment}s)")
+        print(f"{metric_type} ({aligner} @ {alignment}s)", flush=True)
         rows = []
         cursor = start_dt
         while cursor < end_dt:
@@ -173,12 +203,12 @@ def main():
                 cursor.isoformat().replace("+00:00", "Z"),
                 chunk_end.isoformat().replace("+00:00", "Z"),
                 alignment, aligner)
-            rows.extend(to_rows(series, metric_type))
+            rows.extend(to_rows(series, metric_type, ingested_at))
             cursor = chunk_end
-        print(f"  {len(rows)} points")
+        print(f"  {len(rows)} points", flush=True)
         bq_load(args.project, args.dataset, rows)
         total += len(rows)
-    print(f"total {total} points")
+    print(f"total {total} points", flush=True)
 
 
 if __name__ == "__main__":

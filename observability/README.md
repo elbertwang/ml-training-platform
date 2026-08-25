@@ -249,197 +249,219 @@ severity 分布（1 天）：
 
 ```
 ┌─ 收集 ────────────────────────────────────────────────────────────────┐
-│                                                                        │
 │  GKE Pod 日志 ─┐                                                       │
 │  K8s Events   ─┤                                                       │
 │  节点/系统日志 ─┼─▶ Cloud Logging ─┬─▶ [exclusion filter] 丢弃噪声      │
 │  autoscaler   ─┤    _Default 30天  │     (待决策，省 ~$5.1K/月)         │
-│  serial console┤    (US)           │                                   │
-│  ml_diagnostic─┘                   ├─▶ Log Analytics ─▶ defaultLink    │
-│  Audit Log ────────────────────────┤     (已开, $0)     (已存在, US)   │
-│                                    │                                   │
+│  ml_diagnostic─┤    (US)           ├─▶ Log Analytics ─▶ defaultLink    │
+│  Audit Log ────┘                   │     ($0，全保真)     (US)          │
 │                                    └─▶ sink `mlobs-selective`          │
 │                                          精选 ~0.2% ─▶ mlobs_raw.<log_id>│
-│                                                                        │
-│  ┌── 只有 API、没有日志流的源 ──┐                                       │
-│  │ ML Diagnostics REST          │─▶ mldiag_poller.py  ─▶ mlobs_raw     │
-│  │ Cloud Monitoring 时间序列    │─▶ metrics_exporter.py ─▶ mlobs_raw   │
-│  │ GKE Operations API      (TODO)│                                     │
-│  │ K8s Job/Kueue CR 快照   (TODO)│                                     │
-│  └──────────────────────────────┘                                      │
+│  ML Diagnostics REST ─▶ mldiag_poller.py    ─▶ mlobs_raw.mldiag_*      │
+│  Cloud Monitoring    ─▶ metrics_exporter.py ─▶ mlobs_raw.metric_samples│
+│  （一次性）defaultLink ─▶ backfill_pod_labels.sh ─▶ pod_labels_backfill │
 └────────────────────────────────────────────────────────────────────────┘
                                     │
-┌─ 处理 ──────────────────────────────▼──────────────────────────────────┐
-│  纯 SQL 建模（US 多区域，与 defaultLink 同 location）                    │
-│                                                                         │
-│    defaultLink._AllLogs ──┐  （只读 log_id / severity 可裁剪的切片）      │
-│    mlobs_raw.mldiag_*   ──┼──▶  mlobs_core                              │
-│    mlobs_raw.metric_samples┘      dim_mlrun · dim_tpu_price             │
-│    mlobs_raw.<sink tables>─┘      fact_mlrun_event · fact_event ★       │
-│                                   fact_goodput                          │
-│                                   v_job_timeline · v_incident_timeline  │
-│                                   v_job_error_burst                     │
-└─────────────────────────────────────┬───────────────────────────────────┘
-                                      │
-┌─ 展示（原生控制台 + 深链接）──────────▼───────────────────────────────────┐
-│  Cloud Monitoring Dashboard「Job 总览」← 实时，按 job_key 过滤   (TODO)  │
-│         └─▶ 深链接 ─▶ Logs Explorer / Cluster Director / Looker         │
-│  Looker Studio「跨 job 分析」← Goodput / 成本 / exp 对比         (TODO)  │
-│  Alert Policy ─▶ 通知渠道                                        (TODO)  │
+┌─ 处理（纯 SQL，与 defaultLink 同 location）─▼──────────────────────────┐
+│  v_sink_logs      按 INFORMATION_SCHEMA 动态发现的 sink 表统一视图      │
+│        ↓                                                                │
+│  dim_pod  ★骨架   pod → job_key / attempt_uid，取自 GKE label，不猜     │
+│        ↓                                                                │
+│  dim_job_attempt  PK=attempt_uid（一个 Job 对象 = 一次尝试）            │
+│  dim_job          PK=job_key（job 系列，1:N attempt）                   │
+│  dim_mlrun        ML Diagnostics，降为 enrichment（LEFT JOIN）          │
+│        ↓                                                                │
+│  fact_event   统一事件流：mldiag+k8s_event+app_error+autoscaler         │
+│               +log_rate+tpu_idle，物化，CLUSTER BY job_key              │
+│  fact_metric  指标 ⨝ dim_pod，CLUSTER BY job_key                        │
+│  fact_goodput 每次 attempt 的 chip-hours / goodput / 成本               │
+│  job_hub      每个 job 一行 + 深链接，物化                              │
+└────────────────────────────────────┬───────────────────────────────────┘
+                                     │
+┌─ 展示 ───────────────────────────────▼─────────────────────────────────┐
+│  TVF: job_overview / job_timeline / job_metrics / job_attempts (job_key)│
+│        └─▶ Looker Studio 参数化报表 = 每个 job 一个 URL                 │
+│        └─▶ 深链接 ─▶ Logs Explorer（全量日志）/ Cluster Director        │
+│  Cloud Monitoring Dashboard + Alert Policy                      (TODO)  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-★ `fact_event` 是统一事件流，RCA 时间线的底座。
+### 5.2 为什么 `dim_pod` 是骨架，而不是 ML Diagnostics
 
-### 5.2 建模层技术选型
+Cloud Monitoring 的时间序列只带 `pod_name`，要把指标关联到 job 就必须有映射。
+三种做法只有一种可靠：
 
-| | **Dataform / 纯 SQL**（已选） | Pub/Sub + Cloud Run 流式富化 | 全靠 log-based metrics |
-|---|---|---|---|
-| 延迟 | 5–15 分钟 | 秒级 | 秒级 |
-| 能做 Goodput / 成本 / 跨 job 对比 | ✅ | ✅ | ❌ 无 join 能力 |
-| 工程量 / 运维面 | 小，无状态，git 版本化 | 大：服务、重试、幂等、背压 | 极小 |
+| 做法 | 结果 |
+|---|---|
+| 正则解析 pod 名 | ❌ 实测把 **1,292 个 pod** 错分到裸 `falcon-job`。falcon 有两种 pod 形态（带/不带 completion index），为 Deployment 写的分支把 10 字符的 job id 当成了 replicaset hash |
+| 以 ML Diagnostics 为骨架 | ⚠️ 覆盖率实测 97.5–100%，但依赖 poller 新鲜度，且 2.5% 会漏 |
+| **读 GKE label** | ✅ `logging.gke.io/top_level_controller_name` 在训练命名空间覆盖率 **100%** |
 
-选纯 SQL 的理由：训练监控的决策周期是分钟级。真正需要秒级的（TPU 掉了、loss NaN）
-已由 Cloud Monitoring 告警覆盖，不需要经过 BQ。为秒级去写一套流式服务，
-是拿运维复杂度换用不上的延迟。
+正则只作为兜底（`job_key_from_pod_fallback`），且**匹配不上时返回 NULL** ——
+「不知道」比「猜错」好。
 
-### 5.3 三条收集路径，各自不可替代
+### 5.3 为什么要两个粒度
+
+| 键 | 含义 | 不这么做会怎样 |
+|---|---|---|
+| `job_key` | 人所说的那个 job（JobSet 族取 JobSet 名，不是子 Job）| 用子 Job 名会和 MLDiag 的 workload 名对不上 |
+| `attempt_uid` | 一个 Job 对象 = 一次尝试（`batch.kubernetes.io/controller-uid`）| 同名复用会被合并：`henry-hlo-test` 7 周内跑了 **101 次**，`l3p-remat-...-r2-worker-0` 一天重启 **11 次** |
+
+非 Job 工作负载（Deployment/DaemonSet）没有 controller_uid，回落到 controller 名 ——
+它们本来就只有「一次尝试」。
+
+### 5.4 三条收集路径，各自不可替代
 
 | 路径 | 承载 | 为什么不能用其它路径代替 |
 |---|---|---|
-| `defaultLink`（Log Analytics） | 全量，30 天 | 免费且全保真，但重复扫描贵，且受 bucket 保留期限制 |
-| sink `mlobs-selective` | ERROR+、`completed step`、k8s event、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜；~180 万行/天 |
+| `defaultLink`（Log Analytics） | 全量，30 天 | 免费全保真，但重复扫描贵（`labels` 列 303 GB/天），且受 bucket 保留期限制 |
+| sink `mlobs-selective` | ERROR+、`completed step`、k8s event、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜。实测读 `labels` 只要 **813 MB**，比 defaultLink 便宜 **373 倍** |
 | `metrics_exporter.py` | TPU 利用率、HBM、日志速率、中断 | 这些是指标不是日志。`log_entry_count` 尤其关键 —— 零成本检测日志风暴，从日志里找同样的东西要扫占 75% volume 的 WARNING 层 |
-| `mldiag_poller.py` | ML run、monitored event、analyzer 判定 | 只有 REST，`gcloud` 无 `mldiagnostics` 命令组 |
+| `mldiag_poller.py` | ML run、monitored event、analyzer 判定 | 只有 REST，`gcloud` 无 `mldiagnostics` 命令组。支持多 region（playground 的 run 分布在 3 个 region） |
 
 **`severity=WARNING` 刻意不入 sink**：932M 行/天，几乎全是那两次 gcsfuse 风暴。
 
-### 5.4 组件边界
+### 5.5 组件边界
 
-| 单元 | 职责 | 接口 |
-|---|---|---|
-| `collect/create_log_sink.sh` | 声明式管理精选 sink | gcloud |
-| `collect/mldiag_poller.py` | 拉 MLDiag REST → **原样落库，不做任何转换** | BQ 表，按 (name, ingested_at) 幂等 |
-| `collect/metrics_exporter.py` | 拉 Monitoring 时间序列 → 长窄表 | BQ 表 |
-| `model/*.sql` | 从 raw + linked dataset 建 `mlobs_core` | BQ 表/视图 |
-| `deploy.sh` | 幂等编排以上全部 | — |
-
-**关键设计原则**：poller 只负责「把 API 响应原样落库」，所有解析和关联都在 SQL 层。
-API 变了只改 SQL，历史原始数据还在，可以重放。
+| 单元 | 职责 |
+|---|---|
+| `collect/create_log_sink.sh` | 声明式管理精选 sink + 授权 writer identity |
+| `collect/mldiag_poller.py` | MLDiag REST → **原样落库**，多 region，幂等靠下游按 `(name, 最新 ingested_at)` 去重 |
+| `collect/metrics_exporter.py` | Monitoring → 长窄表，**先 DELETE 窗口再 load**，重跑不会重复累加 |
+| `collect/backfill_pod_labels.sh` | 一次性：sink 建立之前的 pod→job 映射，从 defaultLink 物化 |
+| `model/build_v_sink_logs.py` | 从 INFORMATION_SCHEMA 发现 sink 表，生成统一视图 |
+| `model/*.sql` | 纯 SQL 建模，**不带项目前缀**，靠 `bq --project_id` 解析 |
+| `deploy.sh` / `refresh.sh` | 安装 / 增量刷新 |
 
 ---
 
 ## 6. MVP 现状
 
-分支 `observability-mvp`，commit `4cc2de0`。**全部只读 + 新增，不改任何现有配置** ——
-摄入、`_Default` bucket、11 个 dashboard、7 条告警原样未动。
+**已部署到两个环境**，同一份代码：
 
-### 6.1 已建成
+| 环境 | 状态 |
+|---|---|
+| `tpu-launchpad-playground`（测试）| ✅ 干净重装验证通过，全链路跑通 |
+| `tpu-for-training`（生产）| ✅ 采集 + 建模已部署（架构修正后需重跑 `deploy.sh`）|
 
-| 层 | 组件 | 实测结果 |
+**没动任何现有东西** —— 摄入、`_Default` bucket、11 个 dashboard、7 条告警原样未动。
+
+### 6.1 采集层实测
+
+| 组件 | 实测 |
+|---|---|
+| `mldiag_poller.py` | 生产 13,400 run + 4,131 event，0 失败，~4 分钟；测试 102 run + 230 event 跨 3 个 region |
+| `metrics_exporter.py` | 12 小时 45.8 万点，5m42s |
+| `create_log_sink.sh` | 生产 ~180 万行/天 |
+| `backfill_pod_labels.sh` | 测试环境 7 天 = 158 万行，扫描 228 GB ≈ $1.30（一次性）|
+
+### 6.2 延迟预算（实测）
+
+| 环节 | 实测 |
+|---|---|
+| 应用写日志 → Cloud Logging | p50 **2s** / p95 4–5s / p99 4–10s / max 19s |
+| Cloud Logging → **BigQuery sink** | **2–5 秒** |
+| 数据完全稳定（无迟到行） | 5 分钟内（固定窗口观察 4 分钟，迟到 **0 行**）|
+| Log Analytics / `defaultLink` | 11 秒 |
+| Cloud Monitoring 指标完整可见 | **~3–4 分钟** |
+| Looker Studio BQ 缓存 | **默认 12 小时 —— 必须手动改成 15 分钟** |
+
+sink **不是**瓶颈，是全链路最快的一环。文档里那句「sink 有时间限制」指的是
+**不回溯**（只导出创建之后的日志），不是延迟。
+
+### 6.3 展示层每次刷新的扫描量
+
+| TVF | 扫描量 | 优化前 |
 |---|---|---|
-| 采集 | `mldiag_poller.py` | 13,400 run + 4,131 event 回填，**0 失败**，~4 分钟 |
-| 采集 | `metrics_exporter.py` | 12 小时 **457,794** 个点，5m42s |
-| 采集 | `create_log_sink.sh` | ~180 万行/天，**无 `export_errors`（零 schema 冲突）** |
-| 建模 | `dim_mlrun` | 13,400 行，按 name 取最新 ingested_at 去重 |
-| 建模 | `fact_mlrun_event` | 4,127 事件，analyzer 判定已展开 |
-| 建模 | `fact_event` | **760 万行 / 3 天**，11 秒构建 |
-| 建模 | `fact_goodput` | 89 job / 12 小时 |
-| 建模 | `v_incident_timeline` | 统一时间线（含日志速率、TPU 空转） |
-| 编排 | `deploy.sh` | 全幂等，已验证重跑 |
+| `job_overview(job_key)` | 0.03 MB | 46.9 MB |
+| `job_timeline(job_key)` | 0.63 MB | 46.3 MB |
+| `job_attempts(job_key)` | 0.00 MB | 46.6 MB |
+| `job_metrics(job_key)` | 1.68 MB | 45.6 MB |
+| **一次页面加载合计** | **~2.3 MB** | ~185 MB |
 
-`fact_event` 构成与 job 关联质量：
+### 6.4 测试环境的实际产出
 
-| source | 行数 | 底层日志行 | 能对上已知 ML run 的行占比 |
-|---|---|---|---|
-| app_error | 6,959,744 | 10,611,286 | **94.8%** |
-| k8s_event | 644,624 | 644,624 | 32.4%（其余是系统 pod / 节点级事件，本就非 job 级，保留） |
-| mldiag | 596 | 596 | 100% |
-
-### 6.2 验证一：RCA —— 一次真实事故的完整还原
-
-`v_incident_timeline`，job `falcon-job-jaytje07es`，2026-08-24：
+`vllm-tpu`，一个页面上同时看到三个源：
 
 ```
-03:37   64 个 pod 启动，gke-gcsfuse-sidecar 容器创建
-03:42   日志风暴  152,717,258 行 / 5 分钟，跨 64 个 pod（~160 万行/pod）
-03:47   日志风暴  155,546,110 行 / 5 分钟
+job_overview:  8 × tpu-v6e-slice   goodput 0.0%   error_signatures 365
+               min_sample_coverage 0.009  ← 低于 0.5，est_usd 是外推不是实测
+
+job_timeline:
+  08-25 03:00  app_error  440 条   (APIServer pid=<n>) ...
+  08-25 03:00  k8s_event   12 次   Back-off restarting failed container vllm-tpu
+  08-25 03:00  tpu_idle     8 次   tensorcore at 0.0% on chip ...-2
+  08-24 18:00  tpu_idle    20 次   tensorcore at 0.0% ...   （持续 7 天）
+```
+
+**8 颗 v6e 芯片被一个崩溃循环的服务占着，tensorcore 全程 0.0%。**
+这就是聚合平台要发现的东西 —— 单看任何一个源都得不出这个结论。
+
+### 6.5 生产环境此前的产出（架构修正前的口径，需重跑）
+
+一次真实事故，`falcon-job-jaytje07es`，2026-08-24：
+
+```
+03:37   64 pods 启动，gke-gcsfuse-sidecar 容器创建
+03:42   日志风暴  152,717,258 行 / 5 分钟（~160 万行/pod）
 03:52   ML Diagnostics 开出 PERFORMANCE_DEGRADATION —— 9 个 analyzer 全 NOT_DETECTED
-03:52 ────────── 256 颗 TPU7x 芯片 tensorcore 持续 0.0% ────────── 05:37
-05:09   falcon-agent 心跳失败
+03:52 ────── 256 颗 TPU7x 芯片 tensorcore 持续 0.0% ────── 05:37
 05:35   容器停止
 ```
 
-**256 颗芯片空转 1 小时 45 分钟。** ML Diagnostics 检测到了降级，
-但它的 9 个 analyzer 全部返回 NOT_DETECTED，靠它自己说不出原因；
-把日志速率指标放到同一条时间线上，根因一眼可见。
+全量 4,127 个 monitored event 中，PERFORMANCE_DEGRADATION 有 4,113 个，
+**只有 184 个（4.5%）有 analyzer 命中**。历史上只有 `HBM Capacity Analyzer` 和
+`NodepoolInterruptionAnalyzer` 真正命中过。
 
-这不是个例。全量 4,127 个 monitored event 中：
-
-| 事件类型 | 数量 | 有 analyzer 命中 | **可操作率** | 平均时长 |
-|---|---|---|---|---|
-| PERFORMANCE_DEGRADATION | 4,113 | 184 | **4.5%** | 89 分钟 |
-| ORCHESTRATOR_INTERRUPTION | 14 | 14 | 100% | 19 分钟 |
-
-历史上只有 `HBM Capacity Analyzer`（184 次）和 `NodepoolInterruptionAnalyzer`（14 次）
-真正命中过。**不能只依赖 ML Diagnostics 的判定** —— 这正是聚合平台的价值。
-
-### 6.3 验证二：Goodput 与成本
-
-12 小时窗口，89 个 job，5,507 chip-hours：
-
-| Goodput 区间 | Job 数 | chip-hours | 估算金额 |
-|---|---|---|---|
-| **0%（完全空转）** | **25** | 593 | $7,116 |
-| 0–25% | 7 | 1,424 | $17,084 |
-| 25–50% | 10 | 815 | $9,776 |
-| 50–75% | 16 | 315 | $3,780 |
-| 75–100% | 31 | 2,361 | $28,332 |
-
-**集群 Goodput 52.3%**，估算浪费 $31,552 / 12 小时。
-最浪费的两个 job：
-
-| job | 芯片 | chip-h | goodput | avg tensorcore | 估算浪费 |
-|---|---|---|---|---|---|
-| `falcon-job-y4bcmzn5lq` | 256 | 554.7 | 11.5% | 4.3% | $5,888 |
-| `falcon-job-jaytje07es` | 256 | 512.0 | 8.3% | 4.5% | $5,632 |
-
-> 金额受 [Caveats](#11-caveats) 里的价格单位不确定性影响（可能高 4 倍）。
-> **但 52.3% 的 goodput 和 25 个 0% 的 job 是与价格无关的事实。**
-
-### 6.4 目录结构
+### 6.6 目录结构
 
 ```
 observability/
-├── README.md                      本文档
-├── deploy.sh                      幂等编排：dataset + sink + 全部 model SQL
+├── README.md                       本文档
+├── deploy.sh                       安装：dataset + sink + 全部 model
+├── refresh.sh                      增量刷新（放进 Scheduler）
 ├── collect/
-│   ├── mldiag_poller.py           ML Diagnostics REST → mlobs_raw.mldiag_{runs,events}
-│   ├── metrics_exporter.py        Cloud Monitoring    → mlobs_raw.metric_samples
-│   └── create_log_sink.sh         精选 Log Router sink → mlobs_raw
-└── model/
-    ├── 00_functions.sql           api_ts(), job_key_from_pod()
-    ├── 01_dim_mlrun.sql           每个 ML Diagnostics run 一行
-    ├── 02_fact_mlrun_event.sql    monitored event + 展开的 analyzer 判定
-    ├── 03_fact_event.sql          统一事件流（mldiag + k8s event + app error）
-    ├── 04_job_timeline.sql        v_job_timeline, v_job_error_burst
-    ├── 05_fact_goodput.sql        per-job chip-hours / goodput / 成本
-    ├── 06_dim_tpu_price.sql       TPU 价格维表
-    └── 07_v_incident_timeline.sql 时间线 + 日志速率 + TPU 空转
+│   ├── create_log_sink.sh          精选 Log Router sink
+│   ├── mldiag_poller.py            MLDiag REST → mlobs_raw.mldiag_*（多 region）
+│   ├── metrics_exporter.py         Monitoring → metric_samples（幂等）
+│   └── backfill_pod_labels.sh      一次性：sink 之前的 pod→job 映射
+├── model/
+│   ├── build_v_sink_logs.py        动态发现 sink 表，生成统一视图
+│   ├── 00_functions.sql            api_ts(), job_key_from_pod_fallback()
+│   ├── 01_dim_pod.sql              ★ 骨架：pod → job / attempt
+│   ├── 02_dim_mlrun.sql            MLDiag run + 事件（enrichment）
+│   ├── 03_dim_job.sql              dim_job_attempt + dim_job
+│   ├── 04_fact_event.sql           统一事件流（6 个源）
+│   ├── 05_dim_tpu_price.sql        TPU 价格维表
+│   ├── 06_fact_goodput.sql         fact_metric + fact_goodput
+│   └── 07_views.sql                job_hub + 4 个 TVF + 深链接
+└── serve/
+    └── LOOKER_STUDIO.md            一站式 job 页面的接入步骤
 ```
 
 ---
 
 ## 7. 实测推翻的设计假设
 
-MVP 过程中有四个假设被真实数据推翻，都已修正到代码里。记录下来避免重犯：
+每一条都是被真实数据推翻的，都已修正到代码里。记下来避免重犯。
 
 | # | 原假设 | 实测 | 修正 |
 |---|---|---|---|
-| 1 | 按 payload 长度估算日志成本 | 计费口径是 payload 的 **5 倍**，metadata 占 80% | 一律用 `billing/bytes_ingested` 指标，不用 payload 长度估算 |
-| 2 | linked dataset 上可以随便建模 | 碰 `labels` 就是 **303 GB/天**；只有 `log_id` / `severity` 能裁剪 | 建模层只读可裁剪切片，其余走精选 sink |
-| 3 | 建模 dataset 放 `us-central1` 就行 | `defaultLink` 在 **US 多区域**，BQ **不能跨 location 联表** | 全部重建到 US 多区域 |
-| 4 | 日志风暴要靠 sink WARNING 级日志来发现 | `logging.googleapis.com/log_entry_count` 是**免费系统指标**且带 pod 标签，完整记录了风暴 | 日志「量」走指标，日志「内容」走 ERROR 级 sink。避开了占 75% volume 的 WARNING 层 |
+| 1 | 按 payload 长度估算日志成本 | 计费口径是 payload 的 **5 倍**，metadata 占 80% | 用 `billing/bytes_ingested` 指标，不用 payload 估 |
+| 2 | linked dataset 上可以随便建模 | 碰 `labels` 就是 **303 GB/天**；只有 `log_id`/`severity` 能裁剪 | 建模只读可裁剪切片 |
+| 3 | 建模 dataset 放 us-central1 | `defaultLink` 在 **US 多区域**，BQ **不能跨 location 联表** | 全部重建到 US |
+| 4 | 日志风暴要靠 sink WARNING 级日志发现 | `log_entry_count` 是**免费系统指标**且带 pod 标签 | 日志「量」走指标，「内容」走 ERROR 级 sink |
+| 5 | 建了 sink 就不会再扫 defaultLink | 模型层还在扫，**单次重建 75.1 GB = $0.43**，每 15 分钟一次 = **$1,240/月** | `fact_event` 只读 sink 表，实测 **813 MB**，便宜 373 倍 |
+| 6 | 可以用正则从 pod 名推 job | **1,292 个 pod** 被错分成裸 `falcon-job`（falcon 有两种命名形态）| 改用 GKE label，正则只兜底且不确定时返回 NULL |
+| 7 | `job_key` 是唯一主键 | `henry-hlo-test` 7 周内 **101 次**同名运行 | 引入 `attempt_uid`（controller_uid），双粒度 |
+| 8 | JobSet 的 `top_level_controller_name` 就是 job 名 | 它指向子 Job `<jobset>-worker-0`，和 MLDiag 的 JobSet 名**对不上** | `COALESCE(jobset_name, controller_name)` |
+| 9 | 指标 exporter 可以直接追加 | 无去重键，每 5 分钟跑 1 小时窗口会**写 12 遍**，goodput 静默翻 12 倍 | 先 DELETE 窗口再 load |
+| 10 | goodput 的 chip_hours 可信 | `SUM(chips)×5/60` 假设采样无缺口，实测 coverage 低至 **0.009** | 同时给 observed 和 wallclock 两个口径 + `sample_coverage` |
+| 11 | TVF 传参就能裁剪 | 视图里的聚合和跨聚簇 join 挡住了下推，实测 **45.6 MB** | 物化 `job_hub` / `fact_goodput` / `fact_metric`，降到 **2.3 MB** |
+| 12 | sink 表和 linked dataset 字段名一样 | sink 是 **camelCase**（`textPayload`），linked 是 **snake_case** | 发现器两种拼写都认 —— 修之前 2,967 行事件 summary 全空 |
+| 13 | linked dataset 的 label key 和 sink 一样 | sink 清洗成下划线，linked 保留原始的点和斜杠 | 回填脚本显式做 key 归一化 —— 修之前回填 **0 行** |
+| 14 | 所有项目都能用 physical 存储计费 | 有 flat-rate commitment 的项目直接拒绝 | 自动降级到 LOGICAL 并告警 |
+| 15 | `controller_uid` 所有 pod 都有 | 只有 Job 拥有的 pod 有，Deployment/DaemonSet 没有 | 回落到 controller 名 |
 
 ---
 
@@ -448,63 +470,50 @@ MVP 过程中有四个假设被真实数据推翻，都已修正到代码里。�
 | # | 事项 | 影响 | 为什么我没直接做 |
 |---|---|---|---|
 | 1 | **`sidecar-log-collector` exclusion filter** | 省约 **$5,000/月** | 改生产日志路由，被排除的日志将永久丢失 |
-| 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | 需要 billing 账号权限；项目里目前没有 export |
+| 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | 需要 billing 权限；两个项目都没有 export |
 | 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效** | 改现有生产告警 |
-| 4 | 是否把修正后的架构写成正式 spec | 流程 | 你说先跑 MVP |
+| 4 | **Cluster Director 深链接路径** | 一站式页面上这个按钮只到项目级 | 单个 run 的控制台 URL 没有公开文档，我没实测过，不编造 |
 
-### 关于 #3 的细节
+### 关于 #3
 
-现有 log-based metric `maxtext_completed_step` 的 filter：
-
-```
-resource.labels.cluster_name="tpu-training-antgroup"
-resource.labels.pod_name=~"-worker-"          ← 问题在这里
-jsonPayload.message:"completed step"
-```
-
-它匹配 `default` 命名空间下 `<run>-worker-N` 的 MaxText 族（7 天 5,951 条时间序列，
-确实有数据），但 falcon pod 名是 `falcon-job-<id>-<idx>-<hash>`，**没有 `-worker-`**。
-而 falcon 日志里是有 `completed step` 行的（315,329 条/天，全集群）：
-
-```
-completed step: N, seconds: X, TFLOP/s/device: Y, Tokens/s/device: Z,
-total_weights: T, loss: L, lm_loss: LM, lr: R, global_batch_size: B, ...
-```
-
-所以基于该指标的「Training Stalled (No Step for 20min)」告警对当前主力工作负载失效。
+`maxtext_completed_step` 的 filter 要求 `pod_name=~"-worker-"`，匹配 `default`
+命名空间下 `<run>-worker-N` 的 MaxText 族（7 天 5,951 条时间序列，确实有数据），
+但 falcon pod 名是 `falcon-job-<id>-<idx>-<hash>`，**没有 `-worker-`**。
+而 falcon 日志里是有 `completed step` 行的（全集群 315,329 条/天）。
 
 ---
 
 ## 9. 路线图
 
-**P0 — 治理与止损**（待你决策）
+**P0 — 治理与止损**（待决策）
 - [ ] `sidecar-log-collector` exclusion filter（-$5K/月）
-- [ ] 日志风暴告警：`log_entry_count` > 阈值（本次事故 2 小时 $622）
-- [ ] 开 Billing Export 到 BQ，核实 TPU 价格单位
+- [ ] 日志风暴告警（本次事故 2 小时 $622）
+- [ ] Billing Export → BQ，核实 TPU 价格单位
 - [ ] 修 `maxtext_completed_step` 覆盖 falcon-jobs
 
-**P1 — 采集补齐**
+**P1 — 展示层落地**
+- [ ] 按 `serve/LOOKER_STUDIO.md` 建报表，拿到每个 job 的 URL
+- [ ] 把 `REPORT_ID` 写进 `dim_config`，在 `job_hub` 里生成 job 页面链接列
+- [ ] 实测 Cluster Director 单 run 的 URL 路径
+
+**P2 — 采集补齐**
 - [ ] GKE Operations API poller
 - [ ] K8s Job / Kueue CR 状态快照 poller
 - [ ] serial console、checkpoint I/O、XProf 产物索引
 - [ ] `ml_diagnostic_workload_performance` 10 秒粒度指标建模
       （join key 已确认：日志的 `resource.labels.node_id` **就是** ML run ID）
-
-**P2 — 实体层完善**
-- [ ] `dim_job`：从 falcon label 建 job ↔ exp ↔ owner 归属
-- [ ] `dim_experiment`：按 `falcon_io/exp-id` 归组，支持跨 run 对比
 - [ ] `fact_step`：解析 `completed step` 行，得到 loss / TFLOPS / step time 时序
 
 **P3 — 生产化**
+- [ ] Cloud Run Job + Scheduler 跑 `refresh.sh`（当前是本地脚本）
 - [ ] Dataform 接管建模（依赖图 + 数据断言）
-- [ ] Cloud Run Job + Scheduler 跑 poller（当前是本地脚本）
-- [ ] `fact_event` 增量调度（当前手动重建窗口）
+- [ ] **BQ → Cloud Monitoring 自定义指标的回写路径** —— 没有它，goodput 和成本
+      类告警做不出来，因为 Monitoring 只能对指标告警，不能对 BQ 表告警
+- [ ] sink `export_errors` / `sink_error` 监控
 
-**P4 — 展示层**
-- [ ] Cloud Monitoring Dashboard「Job 总览」+ 深链接
-- [ ] Looker Studio「跨 job 分析」（Goodput / 成本 / exp 对比）
-- [ ] Alert Policy：日志风暴、goodput 过低、训练停滞（覆盖全部三个工作负载族）
-- [ ] BQ Conversational Analytics agent（同事的 `log-to-bq-render-demo` 已验证可行）
+**P4 — 分析增强**
+- [ ] `dim_experiment`：按 `falcon_io/exp-id` 归组，跨 run 对比
+- [ ] BQ Conversational Analytics agent（同事的 demo 已验证可行）
 
 ---
 
@@ -513,38 +522,39 @@ total_weights: T, loss: L, lm_loss: LM, lr: R, global_batch_size: B, ...
 ```bash
 export CLOUDSDK_AUTH_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
 
-# 首次：dataset + sink + 全部 model SQL（幂等）
-./deploy.sh
+# 安装（幂等，可重复跑）
+PROJECT_ID=tpu-launchpad-playground ./deploy.sh
 
 # 首次回填
-collect/mldiag_poller.py --backfill            # ~13.4k run / ~4.1k event，~4 分钟
-collect/metrics_exporter.py --hours 12         # ~46 万点，~6 分钟
+collect/mldiag_poller.py --project <P> --locations us-central1[,...] --backfill
+collect/metrics_exporter.py --project <P> --hours 12
+DAYS=7 PROJECT_ID=<P> collect/backfill_pod_labels.sh   # sink 建立前的 pod→job 映射
 
-# 后续增量（未来放进 Cloud Run Job + Scheduler）
-collect/mldiag_poller.py --since-hours 6
-collect/metrics_exporter.py --hours 1
-bq query --use_legacy_sql=false < model/03_fact_event.sql
+# 增量（放进 Cloud Scheduler，建议 5–15 分钟）
+PROJECT_ID=<P> MLDIAG_LOCATIONS=us-central1 ./refresh.sh
 ```
 
 ### 常用查询
 
 ```sql
--- 某个 job 的完整事故时间线
-SELECT * FROM `tpu-for-training.mlobs_core.v_incident_timeline`
-WHERE job_key = 'falcon-job-xxxx' ORDER BY event_time;
+-- 某个 job 的完整时间线
+SELECT * FROM `<P>.mlobs_core.job_timeline`('falcon-job-xxxx');
 
--- 最浪费的 job
-SELECT job_key, peak_chips, ROUND(goodput_ratio*100,1) goodput_pct, est_usd_wasted
-FROM `tpu-for-training.mlobs_core.fact_goodput`
+-- 最浪费的 job（注意先看 min_sample_coverage）
+SELECT job_key, peak_chips, goodput_pct, est_usd, est_usd_observed, min_sample_coverage
+FROM `<P>.mlobs_core.job_hub`
 WHERE chip_hours > 5 ORDER BY est_usd_wasted DESC LIMIT 20;
 
+-- 同名 job 跑了几次
+SELECT job_key, attempts FROM `<P>.mlobs_core.dim_job`
+ORDER BY attempts DESC LIMIT 10;
+
 -- 日志风暴排行（含估算成本）
-SELECT * FROM `tpu-for-training.mlobs_core.v_job_error_burst`
-ORDER BY lines DESC LIMIT 20;
+SELECT * FROM `<P>.mlobs_core.v_job_error_burst` ORDER BY lines DESC LIMIT 20;
 
 -- analyzer 到底命中过什么
 SELECT d.analyzer, COUNT(*) n
-FROM `tpu-for-training.mlobs_core.fact_mlrun_event`, UNNEST(detected) d
+FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d
 GROUP BY 1 ORDER BY n DESC;
 ```
 
@@ -559,17 +569,19 @@ GROUP BY 1 ORDER BY n DESC;
 
 - **TPU 价格单位未核实。** Cloud Billing Catalog 的 SKU
   `TPU7x running in Americas` 是 `$12.00/hour`，但**没有说明是每芯片还是每主机**。
-  我们假设是 per chip-hour（与 v6e SKU $2.70 对应其公开的每芯片价格一致）。
-  一台 `tpu7x-standard-4t` 有 4 颗芯片 —— **如果 SKU 是按主机计，
-  所有金额高了 4 倍**。项目里没有 Billing Export 可对账。
+  假设是 per chip-hour（与 v6e SKU $2.70 对应其公开的每芯片价格一致）。
+  一台 `tpu7x-standard-4t` 有 4 颗芯片 —— **如果按主机计，所有金额高了 4 倍**。
 - **挂牌价，未计承诺使用/预留折扣。**
+- **`min_sample_coverage` 低于 0.5 时，`est_usd` 是外推不是实测。** 这时候看
+  `est_usd_observed`。测试环境里 `vllm-tpu` 的 coverage 是 0.009，两者差 112 倍。
 - **Goodput 是代理指标。** 定义是「5 分钟均值 tensorcore > 10% 的时间占比」，
-  不代表训练是否有效 —— 一个发散的 run 跑满 100% tensorcore 也算满分 goodput。
-- **12 小时样本。** 全集群数字来自 2026-08-24 的一个 12 小时窗口。
-  该项目日志量日间波动可达 2 倍。
-- **ML Diagnostics 历史只有约 2 个月**，不是 5 个月：13,400 个 run 中只有 3 个
-  早于 2026-07-01；monitored event 老化得更快。
+  不代表训练是否有效 —— 一个发散的 run 跑满 100% tensorcore 也算满分。
+- **生产环境的集群级数字来自 2026-08-24 的一个 12 小时窗口**，且是架构修正前的
+  口径。该项目日志量日间波动可达 2 倍。修正后需要重跑才能引用。
+- **ML Diagnostics 历史只有约 2 个月**：13,400 个 run 中只有 3 个早于 2026-07-01；
+  monitored event 老化更快。
 - **`tpu.googleapis.com/instance/interruption_count` 在采样窗口内返回 0 个点** ——
-  采集链路已接好但未经验证。
+  链路已接好但未经验证。
 - **`fact_event` 的 app_error 只覆盖 ERROR 及以上**，WARNING 层刻意排除。
-  WARNING 层的异常靠 `log_entry_count` 指标发现，不靠日志内容。
+- **测试环境用 LOGICAL 存储计费**（项目有 flat-rate commitment，physical 被拒），
+  存储成本高于生产环境的规划口径。

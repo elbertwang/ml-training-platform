@@ -6,13 +6,14 @@ flattening or joining -- all of that happens in SQL on top of `mlobs_raw`.
 When the API shape changes, only the SQL needs updating and the raw history
 can be replayed.
 
-Tables written (append-only, deduped downstream by (name, etag)):
-  mlobs_raw.mldiag_runs    name, ingested_at, payload
-  mlobs_raw.mldiag_events  name, run_name, ingested_at, payload
+Tables written (append-only; the model dedupes on (name, latest ingested_at)):
+  mlobs_raw.mldiag_runs    name, location, ingested_at, payload
+  mlobs_raw.mldiag_events  name, run_name, location, ingested_at, payload
 
 Usage:
-  ./mldiag_poller.py --backfill                 # every run + its events
-  ./mldiag_poller.py --since-hours 6            # incremental: recent + ACTIVE runs
+  ./mldiag_poller.py --backfill                        # every run + its events
+  ./mldiag_poller.py --since-hours 6                   # recent + ACTIVE runs
+  ./mldiag_poller.py --locations us-central1,us-east5  # multi-region projects
 """
 
 import argparse
@@ -28,7 +29,10 @@ import urllib.request
 
 API_ROOT = "https://hypercomputecluster.googleapis.com/v1alpha"
 DEFAULT_PROJECT = os.environ.get("MLOBS_PROJECT", "tpu-for-training")
-DEFAULT_LOCATION = os.environ.get("MLOBS_LOCATION", "us-central1")
+# Runs are per-location and a project can have them in several: the playground
+# project has runs in us-central1, europe-west4 and us-east5. Polling only one
+# silently loses the rest.
+DEFAULT_LOCATIONS = os.environ.get("MLOBS_LOCATIONS", "us-central1").split(",")
 DEFAULT_DATASET = os.environ.get("MLOBS_RAW_DATASET", "mlobs_raw")
 
 # The API returns 200 + {} for a run that does not exist in this location,
@@ -138,7 +142,8 @@ def bq_load(project: str, dataset: str, table: str, rows: list, schema: str) -> 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", default=DEFAULT_PROJECT)
-    ap.add_argument("--location", default=DEFAULT_LOCATION)
+    ap.add_argument("--locations", default=",".join(DEFAULT_LOCATIONS),
+                    help="comma-separated locations to poll")
     ap.add_argument("--dataset", default=DEFAULT_DATASET)
     ap.add_argument("--backfill", action="store_true",
                     help="fetch events for every run, not just recent ones")
@@ -147,18 +152,32 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=24)
     args = ap.parse_args()
 
-    api = Api(access_token(), args.project, args.location)
+    token = access_token()
+    locations = [x.strip() for x in args.locations.split(",") if x.strip()]
     now = dt.datetime.now(dt.timezone.utc)
     ingested_at = now.isoformat()
 
-    print(f"[{ingested_at}] listing runs in {args.project}/{args.location} ...")
-    runs = api.list_runs()
-    print(f"  {len(runs)} runs")
+    print(f"[{ingested_at}] listing runs in {args.project} "
+          f"across {', '.join(locations)} ...", flush=True)
+    runs, apis = [], {}
+    for loc in locations:
+        apis[loc] = Api(token, args.project, loc)
+        found = apis[loc].list_runs()
+        # stamp the location on each run: the sub-collection call needs the same
+        # host, and an event query against the wrong location returns 200 {}
+        # rather than 404, which is indistinguishable from "no events"
+        for r in found:
+            r["_location"] = loc
+        runs.extend(found)
+        print(f"  {loc}: {len(found)} runs", flush=True)
+    print(f"  {len(runs)} runs total", flush=True)
 
     bq_load(args.project, args.dataset, "mldiag_runs",
-            [{"name": r["name"], "ingested_at": ingested_at, "payload": r}
+            [{"name": r["name"], "location": r["_location"],
+              "ingested_at": ingested_at,
+              "payload": {k: v for k, v in r.items() if k != "_location"}}
              for r in runs],
-            "name:STRING,ingested_at:TIMESTAMP,payload:JSON")
+            "name:STRING,location:STRING,ingested_at:TIMESTAMP,payload:JSON")
 
     # An ACTIVE run can still open new events, and a run that just finished may
     # have events written slightly after its endTime -- so poll both.
@@ -173,11 +192,12 @@ def main() -> None:
             return stamp is not None and stamp >= cutoff
         targets = [r for r in runs if recent(r)]
     print(f"polling monitoredEvents for {len(targets)} runs "
-          f"(concurrency {args.concurrency}) ...")
+          f"(concurrency {args.concurrency}) ...", flush=True)
 
     event_rows, failures = [], 0
     with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
-        futures = {pool.submit(api.list_events, r["name"]): r for r in targets}
+        futures = {pool.submit(apis[r["_location"]].list_events, r["name"]): r
+                   for r in targets}
         for done in concurrent.futures.as_completed(futures):
             run = futures[done]
             try:
@@ -185,6 +205,7 @@ def main() -> None:
                     event_rows.append({
                         "name": ev["name"],
                         "run_name": run["name"],
+                        "location": run["_location"],
                         "ingested_at": ingested_at,
                         "payload": ev,
                     })
@@ -192,9 +213,10 @@ def main() -> None:
                 failures += 1
                 print(f"  ! {run.get('displayName')}: {exc}", file=sys.stderr)
 
-    print(f"  {len(event_rows)} events, {failures} run(s) failed")
+    print(f"  {len(event_rows)} events, {failures} run(s) failed", flush=True)
     bq_load(args.project, args.dataset, "mldiag_events", event_rows,
-            "name:STRING,run_name:STRING,ingested_at:TIMESTAMP,payload:JSON")
+            "name:STRING,run_name:STRING,location:STRING,"
+            "ingested_at:TIMESTAMP,payload:JSON")
 
     if failures:
         sys.exit(f"{failures} run(s) failed to poll -- see stderr above")
