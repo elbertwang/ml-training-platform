@@ -24,6 +24,7 @@
 9. [路线图](#9-路线图)
 10. [运行方式](#10-运行方式)
 11. [Caveats](#11-caveats)
+12. [指标分布盘点与 Grafana 架构 review](#12-指标分布盘点与-grafana-架构-review)
 
 ---
 
@@ -278,11 +279,17 @@ severity 分布（1 天）：
 │  job_hub      每个 job 一行 + 深链接，物化                              │
 └────────────────────────────────────┬───────────────────────────────────┘
                                      │
-┌─ 展示 ───────────────────────────────▼─────────────────────────────────┐
-│  TVF: job_overview / job_timeline / job_metrics / job_attempts (job_key)│
-│        └─▶ Looker Studio 参数化报表 = 每个 job 一个 URL                 │
-│        └─▶ 深链接 ─▶ Logs Explorer（全量日志）/ Cluster Director        │
-│  Cloud Monitoring Dashboard + Alert Policy                      (TODO)  │
+┌─ 展示：Grafana on Cloud Run（IAP 认证）─▼──────────────────────────────┐
+│                                                                         │
+│  数据源 1: BigQuery ──▶ TVF job_overview / job_timeline /               │
+│                         job_metrics / job_attempts  (传 job_key 才裁剪) │
+│  数据源 2: Cloud Monitoring ──▶ 实时 TPU / HBM / 日志速率               │
+│              （pod 范围由 BQ 的 dim_pod 提供，不靠名字前缀猜）           │
+│                                                                         │
+│  一个 job 一个 URL:  /d/mlobs-job?var-job_key=<job>                     │
+│  深链接 ─▶ Logs Explorer（全量日志）/ Log Analytics / Cluster Director  │
+│                                                                         │
+│  Looker Studio  ← 保留作对外分享面（只能读 BQ）                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -315,7 +322,7 @@ Cloud Monitoring 的时间序列只带 `pod_name`，要把指标关联到 job �
 | 路径 | 承载 | 为什么不能用其它路径代替 |
 |---|---|---|
 | `defaultLink`（Log Analytics） | 全量，30 天 | 免费全保真，但重复扫描贵（`labels` 列 303 GB/天），且受 bucket 保留期限制 |
-| sink `mlobs-selective` | ERROR+、`completed step`、k8s event、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜。实测读 `labels` 只要 **813 MB**，比 defaultLink 便宜 **373 倍** |
+| sink `mlobs-selective` | ERROR+、`completed step`、**k8s event**、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜。实测读 `labels` 只要 **813 MB**，比 defaultLink 便宜 **373 倍**。**k8s event 是 `dim_pod` 的可靠骨架** —— sink 只收 ERROR+ 和 `completed step`，健康安静的 job 两样都不产生，只有 event 是每个 pod 必有的 |
 | `metrics_exporter.py` | TPU 利用率、HBM、日志速率、中断 | 这些是指标不是日志。`log_entry_count` 尤其关键 —— 零成本检测日志风暴，从日志里找同样的东西要扫占 75% volume 的 WARNING 层 |
 | `mldiag_poller.py` | ML run、monitored event、analyzer 判定 | 只有 REST，`gcloud` 无 `mldiagnostics` 命令组。支持多 region（playground 的 run 分布在 3 个 region） |
 
@@ -341,8 +348,11 @@ Cloud Monitoring 的时间序列只带 `pod_name`，要把指标关联到 job �
 
 | 环境 | 状态 |
 |---|---|
-| `tpu-launchpad-playground`（测试）| ✅ 干净重装验证通过，全链路跑通 |
-| `tpu-for-training`（生产）| ✅ 采集 + 建模已部署（架构修正后需重跑 `deploy.sh`）|
+| `tpu-launchpad-playground`（测试）| ✅ 干净重装验证通过；采集 + 建模 + **Grafana 展示层**全链路跑通 |
+| `tpu-for-training`（生产）| ✅ 采集 + 建模已部署并跑在修正后的模型上；展示层未部署 |
+
+展示层是 **Grafana on Cloud Run + IAP**，两个数据源（BigQuery + Cloud Monitoring）。
+部署和设计见 [`serve/README.md`](serve/README.md)。
 
 **没动任何现有东西** —— 摄入、`_Default` bucket、11 个 dashboard、7 条告警原样未动。
 
@@ -353,7 +363,17 @@ Cloud Monitoring 的时间序列只带 `pod_name`，要把指标关联到 job �
 | `mldiag_poller.py` | 生产 13,400 run + 4,131 event，0 失败，~4 分钟；测试 102 run + 230 event 跨 3 个 region |
 | `metrics_exporter.py` | 12 小时 45.8 万点，5m42s |
 | `create_log_sink.sh` | 生产 ~180 万行/天 |
-| `backfill_pod_labels.sh` | 测试环境 7 天 = 158 万行，扫描 228 GB ≈ $1.30（一次性）|
+| `backfill_pod_labels.sh` | 测试环境 7 天 = 189 万行，扫描 239 GB ≈ $1.36（一次性）|
+
+**把 k8s event 加进 `dim_pod` 之后的覆盖率变化**（同一份数据，只改了骨架来源）：
+
+| | 之前 | 之后 |
+|---|---|---|
+| 测试环境 jobset | **0 个可见** | 9 job / 54 attempt / 149 pod |
+| 生产 falcon job | 589 | **1,540** |
+| 生产 jobset | 65 | **201**（319 attempt） |
+
+原因见 §7 第 16 条。
 
 ### 6.2 延迟预算（实测）
 
@@ -462,6 +482,10 @@ observability/
 | 13 | linked dataset 的 label key 和 sink 一样 | sink 清洗成下划线，linked 保留原始的点和斜杠 | 回填脚本显式做 key 归一化 —— 修之前回填 **0 行** |
 | 14 | 所有项目都能用 physical 存储计费 | 有 flat-rate commitment 的项目直接拒绝 | 自动降级到 LOGICAL 并告警 |
 | 15 | `controller_uid` 所有 pod 都有 | 只有 Job 拥有的 pod 有，Deployment/DaemonSet 没有 | 回落到 controller 名 |
+| 16 | 容器日志足以当实体骨架 | sink 只收 ERROR+ 和 `completed step`，**健康安静的 job 两样都不产生**。`k3run-r`（16 颗 tpu7x、在跑、有指标、有 MLDiag 事件）完全不可见 | `dim_pod` 也读 **k8s event** —— 每个 pod 必有。生产可见 job 数 589→1,540 |
+| 17 | 多源 union 用 `ANY_VALUE` 取标签没问题 | 同一 pod 的标签在某些源有、某些源没有，`ANY_VALUE` 可能返回 NULL | 改用 `MAX()`，跳过 NULL 且确定 |
+| 18 | GMP 里有训练指标 | 生产 GMP 60 个指标**全是基础设施**，训练指标 0 个 | 见 §12 |
+| 19 | 接 GMP 必须在集群里跑 datasource syncer | Grafana 自带 Cloud Monitoring 数据源，而 GMP 的数据本来就存在 Cloud Monitoring 里（`prometheus.googleapis.com/*`） | 零集群改动。syncer 只有要原生 PromQL 时才需要 |
 
 ---
 
@@ -491,10 +515,12 @@ observability/
 - [ ] Billing Export → BQ，核实 TPU 价格单位
 - [ ] 修 `maxtext_completed_step` 覆盖 falcon-jobs
 
-**P1 — 展示层落地**
-- [ ] 按 `serve/LOOKER_STUDIO.md` 建报表，拿到每个 job 的 URL
-- [ ] 把 `REPORT_ID` 写进 `dim_config`，在 `job_hub` 里生成 job 页面链接列
+**P1 — 展示层**
+- [x] Grafana on Cloud Run + IAP，BigQuery + Cloud Monitoring 双数据源
+- [x] 一个 job 一个 URL（`?var-job_key=`）
+- [ ] 部署到生产 `tpu-for-training`
 - [ ] 实测 Cluster Director 单 run 的 URL 路径
+- [ ] （可选）Looker Studio 报表作对外分享面，见 `serve/LOOKER_STUDIO.md`
 
 **P2 — 采集补齐**
 - [ ] GKE Operations API poller
@@ -505,10 +531,11 @@ observability/
 - [ ] `fact_step`：解析 `completed step` 行，得到 loss / TFLOPS / step time 时序
 
 **P3 — 生产化**
-- [ ] Cloud Run Job + Scheduler 跑 `refresh.sh`（当前是本地脚本）
+- [ ] **Cloud Run Job + Scheduler 跑 `refresh.sh`** —— 最高优先级，不做的话整套是快照
+- [ ] 收窄 exporter：删 `memory_used` / `duty_cycle`（见 §12.3）
 - [ ] Dataform 接管建模（依赖图 + 数据断言）
-- [ ] **BQ → Cloud Monitoring 自定义指标的回写路径** —— 没有它，goodput 和成本
-      类告警做不出来，因为 Monitoring 只能对指标告警，不能对 BQ 表告警
+- [ ] ~~BQ → Cloud Monitoring 自定义指标回写~~ —— **不需要了**，Grafana 的 BQ 插件
+      自带 alerting，可直接对 BQ 查询告警（见 §12.5，需验证 `min-instances=1`）
 - [ ] sink `export_errors` / `sink_error` 监控
 
 **P4 — 分析增强**
@@ -585,3 +612,109 @@ GROUP BY 1 ORDER BY n DESC;
 - **`fact_event` 的 app_error 只覆盖 ERROR 及以上**，WARNING 层刻意排除。
 - **测试环境用 LOGICAL 存储计费**（项目有 flat-rate commitment，physical 被拒），
   存储成本高于生产环境的规划口径。
+
+---
+
+## 12. 指标分布盘点与 Grafana 架构 review
+
+2026-08-25 实测。做这次盘点是因为「一部分指标在 GMP、一部分在 BQ」这个前提需要先证实
+——**结果和预期不符**。
+
+### 12.1 生产环境 `tpu-for-training` 的指标到底在哪
+
+| 来源 | 描述符数 | 内容 | 状态 |
+|---|---|---|---|
+| `kubernetes.io/*` | 2000+ | GKE 系统、容器、**TPU 加速器**（tensorcore / HBM / duty_cycle） | ✅ 活跃 |
+| `tpu.googleapis.com/*` | 19 | TPU runtime：ICI、multislice 传输延迟、`instance/interruption_count` | ✅ 活跃（部分无数据） |
+| **`prometheus.googleapis.com/*`（GMP）** | **60** | kube-state · cAdvisor · kubelet · scrape —— **训练/TPU 指标 0 个** | ✅ 活跃 |
+| `custom.googleapis.com/maxtext/*` | **758** | loss / MFU / step_time（45 个）+ 每层 Router 诊断（713 个） | ❌ **2026-08-02 后停写** |
+| `custom.googleapis.com/tpu_finance/*` | 9 | jobrun_mfu · month_reservation_utilization · duty_cycle | ❌ **2026-07-29 后停写** |
+| `custom.googleapis.com/ling3\|training/*` | 4 | tpu_by_job · autorepair_downtime_seconds | ❌ 30 天内无数据 |
+| BQ `mlobs_raw.metric_samples` | 4 有数据 | 我们导出的 | ✅ |
+
+**三个和预期不同的结论：**
+
+1. **GMP 里没有任何训练指标。** 60 个全是基础设施。所以「GMP vs BQ」这个划分对训练
+   可观测性不成立 —— GMP 目前的贡献是零。
+2. **项目里已经有人做过和本平台重叠的工作**：`tpu_finance/jobrun_mfu`、
+   `month_reservation_utilization`、`training/autorepair_downtime_seconds` ——
+   就是 goodput / 成本 / MTTR。但全部停写了。接手前值得先找当时的人问一句。
+3. **当前 falcon 工作负载没有任何活的训练指标。** loss / MFU / step_time 只存在于
+   日志的 `completed step` 行里（全集群 31.5 万条/天）。好消息是这些行**已经在
+   sink 里**（33.5 万行 / 1,437 pod 已落库），`fact_step` 可以直接从 sink 建，
+   不需要碰 defaultLink。
+
+### 12.2 保留期决定了什么必须进 BigQuery
+
+Cloud Monitoring 的保留和降采样（官方文档核实）：
+
+| 指标族 | 总保留 | 原分辨率窗口 | 之后 |
+|---|---|---|---|
+| `kubernetes.io/*`、`custom.googleapis.com/*` | 24 个月 | **6 周** | 降到 10 分钟 |
+| `prometheus.googleapis.com/*`（GMP） | 24 个月 | **7 天** | 1 分钟（5 周）→ 10 分钟 |
+| **log-based metrics** | **仅 6 周** | — | — |
+
+这直接给出判据：
+
+- goodput 用 5 分钟桶。**超过 6 周，Cloud Monitoring 只剩 10 分钟粒度** → 想做季度
+  级 goodput 趋势，BQ 副本是必需的，不是冗余。
+- 现有 4 个 log-based metric（`maxtext_completed_step` 等）**只有 6 周历史**，
+  再往前查不到。
+
+### 12.3 Review：有了 Grafana 之后，指标该怎么分层
+
+结论是 **BQ 导出要收窄，不是取消**。两种需求性质不同：
+
+| 需求 | 走哪条路 | 为什么 |
+|---|---|---|
+| **实时看** | Grafana → Cloud Monitoring 数据源，**不复制** | 3–4 分钟延迟，比我们导出器的调度还快，且零成本 |
+| **按 job 聚合 / 算成本 / 长期趋势** | exporter → BQ | Cloud Monitoring **无法和 BQ 联表**；goodput 必须 join `dim_pod` 才知道哪个 pod 属于哪个 job。且 6 周后降采样 |
+
+**具体调整（已识别，未实施）：**
+
+| 指标 | 现在 | 应该 | 理由 |
+|---|---|---|---|
+| `tensorcore_utilization` | 导出到 BQ | **保留** | goodput 的计算输入，必须 join |
+| `log_entry_count` | 导出到 BQ | **保留** | 日志风暴事件要进 `fact_event` 时间线 |
+| `memory_used` | 导出到 BQ（5.5 万行） | **删掉** | 模型里**没有任何地方用到**，Grafana 已直读 |
+| `duty_cycle` | 导出到 BQ（5.5 万行） | **删掉** | 同上 |
+| `instance/interruption_count` | 导出到 BQ（0 行） | 保留但标注未验证 | 抢占归因需要，但采样窗口内一直为空 |
+
+### 12.4 Review：GMP 那条链路要不要单独接
+
+两个选项，取决于你要不要**原生 PromQL**：
+
+| | **A. 只用 Cloud Monitoring 数据源**（现状） | **B. 再加 Prometheus 数据源 + syncer** |
+|---|---|---|
+| 能读 GMP 指标 | ✅（`prometheus.googleapis.com/*`） | ✅ |
+| 原生 PromQL | 部分（CM 数据源支持 PromQL 查询类型） | ✅ 完整 |
+| 复用社区 k8s dashboard | ❌ 指标名和数据源类型都对不上 | ✅ |
+| 额外组件 | 无 | **集群里一个 CronJob**，每 10 分钟刷 OAuth token；它挂了查询就停 |
+| 集群改动 | 无 | 有 |
+
+**建议先留在 A。** 理由：这个项目的 GMP 只有 60 个基础设施指标，为它上一个集群内的
+有状态组件不划算。等到确实要复用社区的 kube-state dashboard，或者有人要写复杂
+PromQL 时，再上 B。
+
+### 12.5 Review：Grafana 补上了一个之前的架构断点
+
+原先架构 review 里列过一条缺口：**「BQ 表驱动不了 Cloud Monitoring 告警」**，
+当时的方案是加一条 `Scheduled Query → 写自定义指标 → Alert Policy` 的回写链路。
+
+**Grafana 的 BigQuery 插件自带 alerting**，可以直接对 BQ 查询结果告警。这条回写链路
+不需要了 —— goodput 过低、日志风暴、训练停滞都可以直接在 Grafana 里配。
+
+代价：告警依赖 Grafana 存活（Cloud Run 缩到 0 时告警评估怎么办需要验证 —— Grafana
+的 unified alerting 需要常驻进程，**很可能要把 `min-instances` 设成 1**）。这一条
+未验证，落地前要测。
+
+### 12.6 综合建议的下一步顺序
+
+1. **`refresh.sh` 进 Cloud Scheduler** —— 不做的话整套东西是快照，会慢慢变旧
+2. **`fact_step` 从 sink 建**（`completed step` 行已在库里）—— 算法工程师最想要的
+   loss / MFU / step time 曲线
+3. **收窄 exporter**（删 `memory_used` / `duty_cycle`）
+4. **验证 Grafana 告警**（含 `min-instances=1` 的必要性），然后配前三条告警
+5. 找当时做 `tpu_finance/*` 的人对一下口径，避免重复造
+6. 清理 758 个已废弃的 `maxtext/*` 描述符，并且**不要重复「每层一个指标」这个反模式**
+   （应该一个指标 + `layer` 标签）
