@@ -48,15 +48,30 @@ DEFAULT_DATASET = os.environ.get("MLOBS_RAW_DATASET", "mlobs_raw")
 
 # (metric_type, resource_type filter or None, alignment seconds, aligner)
 # ALIGN_RATE/ALIGN_SUM for counters, ALIGN_MEAN for gauges.
+# Only export what the *model* needs. Anything that is merely displayed is read
+# live from Cloud Monitoring by Grafana instead -- Monitoring API requests are
+# free, so copying a metric that nothing joins against buys nothing.
+#
+# A metric belongs here when it meets at least one of:
+#   * it must join to job identity (dim_pod) -- Cloud Monitoring cannot join to
+#     BigQuery, and goodput/cost are per-job by definition;
+#   * it must survive at original resolution beyond Cloud Monitoring's
+#     fine-grained window (6 weeks for kubernetes.io/*, after which everything
+#     is downsampled to 10 minutes -- which would destroy 5-minute goodput
+#     buckets on any quarter-scale trend);
+#   * it has to sit in the same table as logs and events for the timeline.
+#
+# memory_used and duty_cycle were exported for a while and read by nothing; they
+# are now displayed straight from Cloud Monitoring and no longer copied.
 METRICS = [
+    # goodput input; joins to dim_pod
     ("kubernetes.io/container/accelerator/tensorcore_utilization",
      "k8s_container", 300, "ALIGN_MEAN"),
-    ("kubernetes.io/container/accelerator/memory_used",
-     "k8s_container", 300, "ALIGN_MEAN"),
-    ("kubernetes.io/container/accelerator/duty_cycle",
-     "k8s_container", 300, "ALIGN_MEAN"),
+    # log-storm events on the fact_event timeline; joins to dim_pod
     ("logging.googleapis.com/log_entry_count",
      "k8s_container", 300, "ALIGN_SUM"),
+    # preemption attribution. Wired up but unproven -- returned zero points in
+    # every window sampled so far.
     ("tpu.googleapis.com/instance/interruption_count",
      None, 300, "ALIGN_SUM"),
 ]

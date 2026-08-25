@@ -539,6 +539,12 @@ observability/
 - [ ] sink `export_errors` / `sink_error` 监控
 
 **P4 — 分析增强**
+- [ ] `fact_step`：从 sink 的 `completed step` 行建 loss / MFU / step time
+      （吸收已废弃的 `maxtext/*`、`tpu_finance/jobrun_mfu`）
+- [ ] 预留利用率：接 Compute reservations API（吸收 `tpu_finance/month_reservation_utilization`，
+      当前无任何数据源覆盖）
+- [ ] 自动修复 MTTR：从 `dim_job_attempt` + `fact_event` 推导
+      （吸收 `training/autorepair_downtime_seconds`）
 - [ ] `dim_experiment`：按 `falcon_io/exp-id` 归组，跨 run 对比
 - [ ] BQ Conversational Analytics agent（同事的 demo 已验证可行）
 
@@ -679,6 +685,85 @@ Cloud Monitoring 的保留和降采样（官方文档核实）：
 | `memory_used` | 导出到 BQ（5.5 万行） | **删掉** | 模型里**没有任何地方用到**，Grafana 已直读 |
 | `duty_cycle` | 导出到 BQ（5.5 万行） | **删掉** | 同上 |
 | `instance/interruption_count` | 导出到 BQ（0 行） | 保留但标注未验证 | 抢占归因需要，但采样窗口内一直为空 |
+
+### 12.3b 指标放 BigQuery 到底划不划算 —— 算给你看
+
+**价格事实**（Cloud Billing Catalog API 核实，2026-08-25）：
+
+| SKU | 价格 |
+|---|---|
+| `Monitoring API Requests` | **不计价**（SKU 原文：「Sku is not being priced by default」） |
+| `Time series billed count` | 每月前 **100 万条**免费，之后 **$0.50 / 百万条** |
+| BQ 存储 Physical | Active $0.040 / Long-Term $0.020 per GiB·月 |
+| BQ Analysis | $6.25/TiB |
+
+**实测量**（生产 `tpu-for-training`）：
+
+| | |
+|---|---|
+| `metric_samples` 写入 | **~100 万行/天** |
+| 单行体积 | **217 字节** logical（457,794 行 = 99.4 MB） |
+| 月度 | 6.5 GB logical ≈ **1.3 GB physical** |
+
+**逐项对比（月度）：**
+
+| 成本项 | 直读 Cloud Monitoring | 复制到 BigQuery |
+|---|---|---|
+| API 请求 | $0 | $0 |
+| Time series 计数 | 随 面板数 × 观看人数 × 刷新率 增长 | **固定**：导出器每 5 分钟一次，与观看人数无关 |
+| BQ 存储 | $0 | 第 12 个月约 **$0.4** |
+| **BQ 重建扫描** | $0 | **全量重建 $88 / 增量 6h 窗口 $0.01** |
+| 能 join 到 job 身份 | ❌ | ✅ |
+| 6 周后仍有原分辨率 | ❌ 降到 10 分钟 | ✅ |
+
+> ⚠️ `Time series billed count` 的确切计费口径（是否就是读取返回的序列数）我没有从
+> 文档确认，标为待核实。但两条路的量级都在 $10/月以内，不是决策因素。
+
+**结论：划算，但成本完全不在存储，在重建方式。**
+
+实测三个数字说明一切：
+
+| `fact_metric` 重建方式 | 单次扫描 | 15 分钟刷新的月成本 |
+|---|---|---|
+| 全量 `CREATE OR REPLACE`（30 天数据） | ~4.9 GB | **~$88** |
+| 增量，3 天窗口 | 60.5 MB | ~$1.1 |
+| **增量，6 小时窗口**（现已采用） | **0.4–3 MB** | **~$0.01** |
+
+存储 6.5 GB/月 logical 的钱（第 12 个月 $0.4）相比之下可以忽略。**这和之前
+`fact_event` 扫 `defaultLink` 是同一类错误**：管道设计对了，重建方式错了，成本
+差三个数量级。
+
+**决策规则：**
+
+| 放哪 | 条件 | 当前属于这一类的 |
+|---|---|---|
+| **直读 Cloud Monitoring** | 只用于看，不参与任何 SQL join，且只看 6 周内 | `memory_used`、`duty_cycle`，以及未来所有「再加个图」的需求 |
+| **导出到 BigQuery** | 满足任一：① 要 join `dim_pod` 才有意义（goodput / 成本 / 按 owner·exp 归因）② 要超过 6 周的原分辨率 ③ 要和日志事件同表做时间线 | `tensorcore_utilization`、`log_entry_count`、`instance/interruption_count` |
+
+exporter 已按此收窄：从 5 个指标减到 3 个，`memory_used` 和 `duty_cycle` 不再复制
+（各 5.5 万行/12h，模型里无人读取），改由 Grafana 直读。
+
+### 12.3c 遗留自定义指标：废弃还是合并
+
+你确认这些可以废弃。**先说一个反直觉的点：删掉它们省不了钱。** Metric Volume 按
+**写入字节**计费，停写的描述符成本为 $0。唯一收益是 Metrics Explorer 里不再列出
+771 个死选项。删除不可逆且会带走历史数据。
+
+`collect/deprecate_legacy_metrics.sh` 提供了这个操作，**默认 dry-run**，且会先检查
+样本指标 7 天内确实无数据才允许删。是否执行由你决定 —— 我没有执行。
+
+真正值得做的是**吸收能力**：
+
+| 遗留指标 | 能力 | 我们的对应 |
+|---|---|---|
+| `maxtext/perf_mfu`、`perf_step_time_seconds`、`learning_loss`、`learning_grad_norm` | 训练指标 | → **`fact_step`**，从已在 sink 里的 `completed step` 行建。这些行还带 `Config param peak_tflops_per_device`，正是 MFU 的分母 |
+| `maxtext/learning_is_nan`、`is_inf` | NaN 检测 | → 同上，`completed step` 行可判 |
+| `tpu_finance/jobrun_mfu`、`jobstat_mfu` | 按 job 的 MFU | → 同上 |
+| `tpu_finance/month_reservation_utilization` | **预留利用率** | ❌ **真正的缺口**。需要 Compute API 的 reservation 容量，现有任何数据源都没有。已加入路线图 |
+| `training/autorepair_downtime_seconds`、`autorepair_rollback_steps` | 自动修复 MTTR | ⚠️ 原料齐了（`dim_job_attempt` + `fact_event` 里的 node/pod 事件），但还没建指标。已加入路线图 |
+
+**教训一条：不要重复 `maxtext/*` 那个反模式** —— 758 个描述符里 713 个是
+`Router_bias_mean_layer_0..N`，每层一个指标。正确做法是一个指标 + `layer` 标签。
 
 ### 12.4 Review：GMP 那条链路要不要单独接
 

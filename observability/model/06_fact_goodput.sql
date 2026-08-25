@@ -35,10 +35,48 @@
 -- scanned the whole table (45.6 MB in the playground, far worse in production).
 -- Joining to dim_pod once at build time and clustering the result by job_key
 -- fixes it for every consumer, and lets fact_goodput drop a join.
-CREATE OR REPLACE TABLE mlobs_core.fact_metric
+--
+-- **Incremental, not CREATE OR REPLACE.** A full rebuild scans all of
+-- metric_samples: 81.4 MB for half a day of production data, so ~4.9 GB once
+-- 30 days have accumulated, and at a 15-minute cadence that is ~470 GB/day,
+-- about $88/month -- growing linearly with retention. Storage for the same data
+-- is under $1/month. The cost of keeping metrics in BigQuery is entirely in how
+-- you rebuild, which is the same mistake fact_event made against defaultLink.
+-- Six hours, matching the poller's incremental window. Measured scan per
+-- rebuild: 0.4 MB for 1h, 2-3 MB for 6h, versus 81.4 MB for a full rebuild of
+-- half a day's data. Widen it manually after an outage; the DELETE+INSERT is
+-- idempotent over whatever range you choose.
+--
+-- Caveat: a row's job_key is resolved from dim_pod at insert time and is not
+-- revisited once it falls out of the window. In practice logs land 2-5 seconds
+-- after they are written while metrics lag 3-4 minutes, so a pod is essentially
+-- always in dim_pod before its first sample arrives -- but a pod that somehow
+-- logged nothing for six hours would keep a NULL job_key on those rows.
+DECLARE metric_window_start TIMESTAMP DEFAULT
+  TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR);
+DECLARE metric_window_end TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+
+CREATE TABLE IF NOT EXISTS mlobs_core.fact_metric
+(
+  point_time     TIMESTAMP NOT NULL,
+  metric_type    STRING,
+  value          FLOAT64,
+  job_key        STRING,
+  attempt_uid    STRING,
+  pod_name       STRING,
+  namespace_name STRING,
+  cluster_name   STRING,
+  chip_id        STRING,
+  tpu_model      STRING,
+  container_name STRING
+)
 PARTITION BY DATE(point_time)
-CLUSTER BY job_key, metric_type
-AS
+CLUSTER BY job_key, metric_type;
+
+DELETE FROM mlobs_core.fact_metric
+WHERE point_time >= metric_window_start AND point_time < metric_window_end;
+
+INSERT INTO mlobs_core.fact_metric
 SELECT
   s.point_time,
   s.metric_type,
@@ -48,12 +86,13 @@ SELECT
   p.pod_name,
   p.namespace_name,
   p.cluster_name,
-  JSON_VALUE(s.metric_labels, '$.accelerator_id') AS chip_id,
-  JSON_VALUE(s.metric_labels, '$.model')          AS tpu_model,
+  JSON_VALUE(s.metric_labels, '$.accelerator_id')   AS chip_id,
+  JSON_VALUE(s.metric_labels, '$.model')            AS tpu_model,
   JSON_VALUE(s.resource_labels, '$.container_name') AS container_name
 FROM mlobs_raw.metric_samples s
 JOIN mlobs_core.dim_pod p
-  ON p.pod_name = JSON_VALUE(s.resource_labels, '$.pod_name');
+  ON p.pod_name = JSON_VALUE(s.resource_labels, '$.pod_name')
+WHERE s.point_time >= metric_window_start AND s.point_time < metric_window_end;
 
 
 -- Materialised for the same reason job_hub is: it aggregates the whole of

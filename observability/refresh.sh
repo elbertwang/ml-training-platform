@@ -8,9 +8,11 @@
 # because both resolve pods to jobs through it and a pod that first logged in
 # this cycle would otherwise have a NULL job_key baked into the facts.
 #
-# Cost per cycle is dominated by the fact_event rebuild window. Everything reads
-# the sink tables and metric_samples, never the linked dataset -- see
-# model/04_fact_event.sql for why that distinction is worth ~$1,200/month.
+# Cost per cycle is dominated by the two rebuild windows, and both are bounded
+# on purpose. Everything reads the sink tables and metric_samples, never the
+# linked dataset -- see model/04_fact_event.sql for why that distinction is
+# worth ~$1,200/month, and model/06_fact_goodput.sql for why fact_metric is
+# incremental rather than CREATE OR REPLACE (~$88/month at 30-day retention).
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID must be set}"
