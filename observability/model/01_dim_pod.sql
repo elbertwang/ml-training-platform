@@ -18,6 +18,15 @@
 --                "henry-hlo-test" is 101 distinct runs over seven weeks -- so
 --                anything keyed on job_key alone silently merges them.
 --
+-- Sources are stdout, stderr AND `events`, which matters more than it looks.
+-- The sink deliberately keeps only ERROR+ and `completed step` lines, so a
+-- healthy job that logs neither produces nothing for the model to see -- the
+-- k3run-r JobSet in the playground project was running on TPUs, reporting
+-- metrics, and completely invisible here until events were added. Every pod
+-- gets Kubernetes events (scheduled, pulling, started) whatever it writes to
+-- stdout, and those events carry the same controller labels, so events are the
+-- reliable spine and container logs are the enrichment.
+--
 -- Reads v_sink_logs rather than the linked dataset. Selecting `labels` for the
 -- stdout/stderr branches scans ~813 MB of accumulated sink data; the same
 -- column on defaultLink is ~303 GB per day. Both `resource` and `labels` are
@@ -31,9 +40,17 @@ CLUSTER BY job_key, pod_name
 AS
 WITH src AS (
   -- live: everything the sink has delivered since it was created
-  SELECT timestamp, resource, labels
+  SELECT
+    timestamp,
+    -- an event about a pod may carry the pod only in involvedObject
+    CASE WHEN JSON_VALUE(resource, '$.labels.pod_name') IS NULL
+              AND JSON_VALUE(json_payload, '$.involvedObject.kind') = 'Pod'
+         THEN JSON_SET(resource, '$.labels.pod_name',
+                       JSON_VALUE(json_payload, '$.involvedObject.name'))
+         ELSE resource END AS resource,
+    labels
   FROM mlobs_core.v_sink_logs
-  WHERE log_id IN ('stdout', 'stderr')
+  WHERE log_id IN ('stdout', 'stderr', 'events')
     AND timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
   UNION ALL
   -- history: a sink is not retroactive, so pods that ran before it existed are
@@ -69,32 +86,35 @@ tagged AS (
 )
 SELECT
   pod_name,
-  ANY_VALUE(namespace_name) AS namespace_name,
-  ANY_VALUE(cluster_name)   AS cluster_name,
-  ANY_VALUE(location)       AS location,
+  MAX(namespace_name) AS namespace_name,
+  MAX(cluster_name)   AS cluster_name,
+  MAX(location)       AS location,
   -- JobSet first: it is what ML Diagnostics calls the workload
-  COALESCE(ANY_VALUE(jobset_name), ANY_VALUE(controller_name)) AS job_key,
-  ANY_VALUE(controller_name) AS child_job_name,
-  ANY_VALUE(controller_type) AS controller_type,
+  COALESCE(MAX(jobset_name), MAX(controller_name)) AS job_key,
+  MAX(controller_name) AS child_job_name,
+  MAX(controller_type) AS controller_type,
   CASE
-    WHEN ANY_VALUE(jobset_name) IS NOT NULL                        THEN 'jobset'
-    WHEN STARTS_WITH(ANY_VALUE(controller_name), 'falcon-job')     THEN 'falcon'
-    ELSE LOWER(COALESCE(ANY_VALUE(controller_type), 'unknown'))
+    WHEN MAX(jobset_name) IS NOT NULL                        THEN 'jobset'
+    WHEN STARTS_WITH(MAX(controller_name), 'falcon-job')     THEN 'falcon'
+    ELSE LOWER(COALESCE(MAX(controller_type), 'unknown'))
   END                        AS job_family,
+  -- MAX rather than ANY_VALUE throughout: with three log sources unioned, a
+  -- pod's labels are present in some rows and absent in others, and ANY_VALUE
+  -- may return the NULL.
   -- controller_uid exists only on Job-owned pods. Deployment/DaemonSet/
   -- StatefulSet pods have no notion of an attempt, so fall back to the
   -- controller name: those workloads then have exactly one "attempt", which is
   -- the right answer. Filtering on uid instead left dim_job_attempt empty.
-  COALESCE(ANY_VALUE(attempt_uid), ANY_VALUE(controller_name)) AS attempt_uid,
-  ANY_VALUE(attempt_uid) IS NOT NULL                           AS is_job_attempt,
-  SAFE_CAST(ANY_VALUE(completion_index) AS INT64)       AS completion_index,
-  SAFE_CAST(ANY_VALUE(jobset_restart_attempt) AS INT64) AS jobset_restart_attempt,
-  SAFE_CAST(ANY_VALUE(jobset_job_index) AS INT64)       AS jobset_job_index,
-  ANY_VALUE(owner)             AS owner,
-  ANY_VALUE(exp_id)            AS exp_id,
-  ANY_VALUE(falcon_job_id)     AS falcon_job_id,
-  ANY_VALUE(falcon_cluster_id) AS falcon_cluster_id,
-  ANY_VALUE(node_name)         AS node_name,
+  COALESCE(MAX(attempt_uid), MAX(controller_name)) AS attempt_uid,
+  MAX(attempt_uid) IS NOT NULL                           AS is_job_attempt,
+  SAFE_CAST(MAX(completion_index) AS INT64)       AS completion_index,
+  SAFE_CAST(MAX(jobset_restart_attempt) AS INT64) AS jobset_restart_attempt,
+  SAFE_CAST(MAX(jobset_job_index) AS INT64)       AS jobset_job_index,
+  MAX(owner)             AS owner,
+  MAX(exp_id)            AS exp_id,
+  MAX(falcon_job_id)     AS falcon_job_id,
+  MAX(falcon_cluster_id) AS falcon_cluster_id,
+  MAX(node_name)         AS node_name,
   ARRAY_AGG(DISTINCT container_name IGNORE NULLS) AS containers,
   MIN(timestamp)               AS first_seen,
   MAX(timestamp)               AS last_seen

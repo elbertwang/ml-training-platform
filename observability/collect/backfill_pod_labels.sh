@@ -32,7 +32,13 @@ PARTITION BY DATE(timestamp)
 AS
 SELECT
   timestamp,
-  TO_JSON(resource) AS resource,
+  -- events name the pod only in involvedObject; normalise it into resource so
+  -- dim_pod has one place to look
+  CASE WHEN resource.labels.pod_name IS NULL
+            AND JSON_VALUE(json_payload, '\$.involvedObject.kind') = 'Pod'
+       THEN JSON_SET(TO_JSON(resource), '\$.labels.pod_name',
+                     JSON_VALUE(json_payload, '\$.involvedObject.name'))
+       ELSE TO_JSON(resource) END AS resource,
   TO_JSON(STRUCT(
     JSON_VALUE(labels, '\$.\"logging.gke.io/top_level_controller_name\"')          AS logging_gke_io_top_level_controller_name,
     JSON_VALUE(labels, '\$.\"logging.gke.io/top_level_controller_type\"')          AS logging_gke_io_top_level_controller_type,
@@ -51,7 +57,7 @@ SELECT
   )) AS labels
 FROM \`${PROJECT_ID}.defaultLink._AllLogs\`
 WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${DAYS} DAY)
-  AND log_id IN ('stdout', 'stderr')
+  AND log_id IN ('stdout', 'stderr', 'events')
   AND JSON_VALUE(labels, '\$.\"logging.gke.io/top_level_controller_name\"') IS NOT NULL
 "
 

@@ -1,0 +1,22 @@
+# Google Cloud Monitoring, bundled with Grafana (plugin id `stackdriver`) --
+# nothing to install.
+#
+# This is the simpler of the two ways to reach Prometheus data on GCP. Managed
+# Service for Prometheus stores its series in Cloud Monitoring under
+# `prometheus.googleapis.com/*`, so this datasource reads GMP-collected metrics
+# as well as the native kubernetes.io/* and tpu.googleapis.com/* ones. The
+# alternative -- Grafana's own Prometheus datasource pointed at the GMP endpoint
+# -- additionally needs a data source syncer CronJob running in the cluster,
+# because Grafana does not support OAuth2 service accounts on Prometheus
+# datasources. Going through Cloud Monitoring avoids that entirely.
+#
+# Same auth story as BigQuery: the Cloud Run service account via the metadata
+# server, no key file.
+apiVersion: 1
+datasources:
+  - name: Cloud Monitoring
+    type: stackdriver
+    uid: mlobs-cm
+    jsonData:
+      authenticationType: gce
+      defaultProject: ${MLOBS_PROJECT}

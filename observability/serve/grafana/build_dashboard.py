@@ -45,6 +45,36 @@ STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b"}
 # *variable* would be more flexible but adds a runtime resolution step that can
 # leave every panel unbound if it fails to auto-select.
 DS = {"type": "grafana-bigquery-datasource", "uid": "mlobs-bq"}
+DS_CM = {"type": "stackdriver", "uid": "mlobs-cm"}
+
+
+def cm_series(project, metric_type, aligner="ALIGN_MEAN",
+              reducer="REDUCE_MEAN", group_bys=None):
+    """A Cloud Monitoring query scoped to the selected job's pods.
+
+    Cloud Monitoring labels a series with pod_name and nothing else useful --
+    there is no job label. Rather than guess with a name prefix (which
+    over-matches: "vllm" is a prefix of both "vllm-tpu" and "vllm-qwen3-5-r"),
+    the pod list comes from BigQuery via the hidden `pods` variable, so the
+    model layer supplies identity and Cloud Monitoring supplies the live values.
+    `${pods:regex}` expands to an anchored alternation that RE2 accepts.
+    """
+    return {
+        "datasource": DS_CM,
+        "queryType": "timeSeriesList",
+        "refId": "A",
+        "timeSeriesList": {
+            "projectName": project,
+            "crossSeriesReducer": reducer,
+            "perSeriesAligner": aligner,
+            "alignmentPeriod": "cloud-monitoring-auto",
+            "groupBys": group_bys or [],
+            "filters": [
+                "metric.type", "=", metric_type,
+                "AND", "resource.label.pod_name", "=~", "${pods:regex}",
+            ],
+        },
+    }
 
 
 def sql(query):
@@ -291,7 +321,79 @@ GROUP BY time, container_name ORDER BY time""")],
     })
     y += 8
 
-    # ---- row 5: attempts ----------------------------------------------------
+    # ---- row 5: live metrics straight from Cloud Monitoring ----------------
+    #
+    # These duplicate the shape of the BigQuery metric panels above on purpose.
+    # The BigQuery ones are only as fresh as the last metrics_exporter run and
+    # are what feeds goodput and cost; these are ~3-4 minutes behind real time
+    # and are what you watch while something is happening. Cloud Monitoring is
+    # also where GMP's own scrapes land (as prometheus.googleapis.com/*), so
+    # this datasource reaches the cluster's Prometheus metrics too -- with no
+    # exporter and no data source syncer.
+    panels.append({"type": "row",
+                   "title": "实时指标 Live (Cloud Monitoring, ~3-4 min lag)",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels.append({
+        "type": "timeseries", "title": "TensorCore 利用率（实时，按 pod）",
+        "gridPos": {"x": 0, "y": y, "w": 12, "h": 8},
+        "datasource": DS_CM,
+        "targets": [cm_series(
+            project, "kubernetes.io/container/accelerator/tensorcore_utilization",
+            reducer="REDUCE_MEAN",
+            group_bys=["resource.label.pod_name"])],
+        "options": {"legend": {"displayMode": "list", "placement": "bottom",
+                               "showLegend": True},
+                    "tooltip": {"mode": "multi", "sort": "desc"}},
+        "fieldConfig": {"defaults": {
+            "unit": "percent", "min": 0, "max": 100,
+            "custom": {"drawStyle": "line", "lineWidth": 2,
+                       "fillOpacity": 0, "showPoints": "never"},
+        }, "overrides": []},
+    })
+
+    panels.append({
+        "type": "timeseries", "title": "HBM 已用（实时，按 pod）",
+        "gridPos": {"x": 12, "y": y, "w": 12, "h": 8},
+        "datasource": DS_CM,
+        "targets": [cm_series(
+            project, "kubernetes.io/container/accelerator/memory_used",
+            reducer="REDUCE_MEAN",
+            group_bys=["resource.label.pod_name"])],
+        "options": {"legend": {"displayMode": "list", "placement": "bottom",
+                               "showLegend": True},
+                    "tooltip": {"mode": "multi", "sort": "desc"}},
+        "fieldConfig": {"defaults": {
+            "unit": "bytes",
+            "custom": {"drawStyle": "line", "lineWidth": 2,
+                       "fillOpacity": 0, "showPoints": "never"},
+        }, "overrides": []},
+    })
+    y += 8
+
+    panels.append({
+        "type": "timeseries", "title": "日志速率（实时，按容器）",
+        "description": "日志风暴的实时视图。免费指标，不扫任何日志。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 7},
+        "datasource": DS_CM,
+        "targets": [cm_series(
+            project, "logging.googleapis.com/log_entry_count",
+            aligner="ALIGN_RATE", reducer="REDUCE_SUM",
+            group_bys=["resource.label.container_name"])],
+        "options": {"legend": {"displayMode": "list", "placement": "bottom",
+                               "showLegend": True},
+                    "tooltip": {"mode": "multi", "sort": "desc"}},
+        "fieldConfig": {"defaults": {
+            "unit": "reqps",
+            "custom": {"drawStyle": "line", "lineWidth": 2,
+                       "fillOpacity": 0, "showPoints": "never"},
+        }, "overrides": []},
+    })
+    y += 7
+
+    # ---- row 6: attempts ----------------------------------------------------
     panels.append({
         "type": "table", "title": "每次尝试 Attempts",
         "description": "同名 job 的每次运行一行。这就是模型要按 attempt 建的原因 —— "
@@ -351,6 +453,27 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
                           f"ORDER BY last_seen DESC LIMIT 1000",
                           "format": 1, "location": "US"},
                 "refresh": 1, "sort": 0, "includeAll": False, "multi": False,
+            },
+            {
+                # Hidden. Exists only to give the Cloud Monitoring panels an
+                # exact pod list -- see cm_series(). Refreshed on time-range
+                # change so a newly started pod appears without a reload.
+                "name": "pods", "type": "query", "label": "Pods",
+                "datasource": DS, "hide": 2,
+                # Scoped to the dashboard's time window. Without it the regex
+                # accumulates every pod the job ever had -- long-dead ones
+                # contribute nothing but bloat the Cloud Monitoring filter, and
+                # a job with hundreds of historical pods would eventually blow
+                # the filter length.
+                "query": {"rawQuery": True, "rawSql":
+                          f"SELECT pod_name FROM `{project}.mlobs_core.dim_pod` "
+                          f"WHERE job_key = '${{job_key}}' "
+                          f"AND last_seen  >= TIMESTAMP_MILLIS(${{__from}}) "
+                          f"AND first_seen <= TIMESTAMP_MILLIS(${{__to}}) "
+                          f"ORDER BY last_seen DESC LIMIT 300",
+                          "format": 1, "location": "US"},
+                "refresh": 2, "sort": 0, "includeAll": False, "multi": True,
+                "current": {},
             },
         ]},
         "panels": panels,
