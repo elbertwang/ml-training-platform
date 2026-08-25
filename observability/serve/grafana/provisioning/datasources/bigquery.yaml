@@ -1,0 +1,12 @@
+# The plugin authenticates as the Cloud Run service account via the metadata
+# server -- no key files anywhere. `gce` is the plugin's name for that mode.
+apiVersion: 1
+datasources:
+  - name: BigQuery
+    type: grafana-bigquery-datasource
+    uid: mlobs-bq
+    isDefault: true
+    jsonData:
+      authenticationType: gce
+      defaultProject: ${MLOBS_PROJECT}
+      processingLocation: US

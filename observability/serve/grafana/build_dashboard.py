@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Generate the per-job Grafana dashboard JSON.
+
+Written as code rather than hand-maintained JSON: the dashboard is ~700 lines of
+deeply nested objects where a single misplaced brace is invisible in review, and
+the panel definitions are highly repetitive.
+
+Design notes that are not obvious from the JSON:
+
+* Every panel queries a **table function**, never a view. Passing job_key into
+  `mlobs_core.job_timeline(...)` pushes the predicate down to `CLUSTER BY
+  job_key`; selecting from the view and filtering in Grafana does not. Measured
+  on the same data: 2.3 MB per dashboard load via the TVFs, ~185 MB without.
+* `$__timeFilter()` is applied on top of the TVF so the dashboard's time picker
+  also prunes by partition.
+* Series colours are fixed per source name, assigned in a documented order, so
+  a filter that removes a source never repaints the survivors. The six hues are
+  the first six slots of the validated categorical palette; the set passes the
+  adjacent-pair CVD and normal-vision gates in both light and dark mode.
+  Light-mode contrast for aqua/yellow/magenta is below 3:1, which is why the
+  timeline always ships its table view alongside the chart.
+* Goodput and sample coverage use *status* colours, which are reserved and
+  never reused for a series, and each carries a text label -- colour alone
+  never conveys the state.
+"""
+
+import argparse
+import json
+
+# Validated categorical palette, first six slots, fixed order.
+# Sources are listed alphabetically so the assignment is stable across edits.
+SOURCE_COLOURS = {
+    "app_error":  "#2a78d6",   # slot 1 blue
+    "autoscaler": "#eb6834",   # slot 2 orange
+    "k8s_event":  "#1baf7a",   # slot 3 aqua
+    "log_rate":   "#eda100",   # slot 4 yellow
+    "mldiag":     "#e87ba4",   # slot 5 magenta
+    "tpu_idle":   "#008300",   # slot 6 green
+}
+
+# Reserved status palette -- never used for a series.
+STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b"}
+
+# Fixed uid, matching provisioning/datasources/bigquery.yaml. A datasource
+# *variable* would be more flexible but adds a runtime resolution step that can
+# leave every panel unbound if it fails to auto-select.
+DS = {"type": "grafana-bigquery-datasource", "uid": "mlobs-bq"}
+
+
+def sql(query):
+    return {
+        "datasource": DS,
+        "rawQuery": True,
+        "rawSql": query,
+        "format": 1,          # table
+        "location": "US",
+        "refId": "A",
+    }
+
+
+def stat(overview_sql, title, x, y, w, h, field, unit=None, decimals=None,
+         steps=None, desc=None):
+    """A hero number. Not a chart -- a single value has no shape to plot."""
+    thresholds = {"mode": "absolute", "steps": steps or [
+        {"color": "text", "value": None}]}
+    return {
+        "type": "stat", "title": title, "description": desc,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "datasource": DS,
+        "targets": [sql(overview_sql)],
+        "options": {
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": f"/^{field}$/",
+                              "values": False},
+            "textMode": "auto", "colorMode": "value",
+            "graphMode": "none", "justifyMode": "auto",
+        },
+        "fieldConfig": {"defaults": {
+            "unit": unit, "decimals": decimals, "thresholds": thresholds,
+            "mappings": [],
+        }, "overrides": []},
+    }
+
+
+OVERVIEW_SQL_TEMPLATE = """SELECT
+  goodput_pct, peak_chips, chip_hours, est_usd, est_usd_observed,
+  est_usd_wasted, attempts, error_lines, error_signatures, mldiag_events,
+  min_sample_coverage, peak_nodes, tpu_model, run_phase, owner, exp_id,
+  namespace_name, cluster_name, job_family, logs_available
+FROM `{project}.mlobs_core.job_overview`('${{job_key}}')"""
+
+
+def build(project):
+    overview_sql = OVERVIEW_SQL_TEMPLATE.format(project=project)
+    panels = []
+    y = 0
+
+    # ---- row 1: the headline numbers ---------------------------------------
+    panels.append({"type": "row", "title": "概览 Overview", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels += [
+        stat(overview_sql, "Goodput", 0, y, 4, 4, "goodput_pct", unit="percent", decimals=1,
+             desc="5 分钟均值 tensorcore > 10% 的时间占比。代理指标：不代表训练有效，"
+                  "一个发散的 run 跑满 100% 也算满分。",
+             steps=[{"color": STATUS["critical"], "value": None},
+                    {"color": STATUS["warning"], "value": 25},
+                    {"color": STATUS["good"], "value": 60}]),
+        stat(overview_sql, "Peak chips", 4, y, 3, 4, "peak_chips"),
+        stat(overview_sql, "Chip-hours", 7, y, 3, 4, "chip_hours", decimals=1),
+        stat(overview_sql, "Est. cost (wallclock)", 10, y, 4, 4, "est_usd",
+             unit="currencyUSD", decimals=0,
+             desc="按墙钟时间 × 芯片数 × 挂牌价。价格单位（每芯片 vs 每主机）"
+                  "未经账单核实，可能高 4 倍。coverage 低时看 observed 那个数。"),
+        stat(overview_sql, "Est. cost (observed)", 14, y, 4, 4, "est_usd_observed",
+             unit="currencyUSD", decimals=0,
+             desc="只按实际有采样的时间算。这个数是实测，不是外推。"),
+        stat(overview_sql, "Sample coverage", 18, y, 3, 4, "min_sample_coverage", decimals=3,
+             desc="有指标样本的时间 / 总生命周期。低于 0.5 时上面的 wallclock 成本"
+                  "是外推，不是测量。",
+             steps=[{"color": STATUS["critical"], "value": None},
+                    {"color": STATUS["warning"], "value": 0.5},
+                    {"color": STATUS["good"], "value": 0.9}]),
+        stat(overview_sql, "Attempts", 21, y, 3, 4, "attempts",
+             desc="同名 job 跑过几次。生产环境里 henry-hlo-test 有 101 次。"),
+    ]
+    y += 4
+
+    # ---- row 2: identity + the deep links ----------------------------------
+    panels.append({
+        "type": "table", "title": "Job 元数据与深链接",
+        "description": "「查看全部日志」跳 Logs Explorer —— 全保真、免费、比自建表格好用。"
+                       "但日志只保留 30 天，logs_available=false 时点过去是空的。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 6},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  job_family, namespace_name, cluster_name, owner, exp_id, run_phase,
+  tpu_model, logs_available,
+  logs_explorer_url, log_analytics_url, monitoring_url, cluster_director_url
+FROM `{project}.mlobs_core.job_overview`('${{job_key}}')""")],
+        "options": {"showHeader": True},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left"}},
+            "overrides": [
+                {"matcher": {"id": "byRegexp", "options": ".*_url$"},
+                 "properties": [{"id": "custom.cellOptions",
+                                 "value": {"type": "auto"}},
+                                {"id": "links", "value": [
+                                    {"title": "打开", "url": "${__value.text}",
+                                     "targetBlank": True}]}]},
+            ],
+        },
+    })
+    y += 6
+
+    # ---- row 3: the timeline -----------------------------------------------
+    panels.append({"type": "row", "title": "事故时间线 Incident timeline",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    colour_overrides = [
+        {"matcher": {"id": "byName", "options": name},
+         "properties": [{"id": "color",
+                         "value": {"mode": "fixed", "fixedColor": hexv}}]}
+        for name, hexv in SOURCE_COLOURS.items()
+    ]
+
+    panels.append({
+        "type": "timeseries", "title": "事件密度（按来源）",
+        "description": "堆叠柱：每 5 分钟每个来源的事件数。看的是形状不是数值 —— "
+                       "哪个来源先动、哪些同时动。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  TIMESTAMP_TRUNC(event_time, MINUTE) AS time,
+  source,
+  SUM(occurrences) AS events
+FROM `{project}.mlobs_core.job_timeline`('${{job_key}}')
+WHERE $__timeFilter(event_time)
+GROUP BY time, source
+ORDER BY time""")],
+        "transformations": [
+            {"id": "partitionByValues",
+             "options": {"fields": ["source"], "keepFields": False}}],
+        "options": {
+            "legend": {"displayMode": "list", "placement": "bottom",
+                       "showLegend": True},
+            "tooltip": {"mode": "multi", "sort": "desc"},
+        },
+        "fieldConfig": {
+            "defaults": {
+                "custom": {
+                    "drawStyle": "bars", "stacking": {"mode": "normal"},
+                    "fillOpacity": 90, "lineWidth": 0,
+                    "gradientMode": "none",
+                    "axisSoftMin": 0,
+                },
+                "unit": "short",
+            },
+            "overrides": colour_overrides,
+        },
+    })
+    y += 8
+
+    panels.append({
+        "type": "table", "title": "事件明细",
+        "description": "时间线的表格视图。也是可访问性要求的那一份 —— "
+                       "浅色模式下 aqua/yellow/magenta 三个色低于 3:1 对比度，"
+                       "不能只靠颜色分辨来源。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 12},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  event_time, source, severity, event_type, occurrences, pod_name, summary
+FROM `{project}.mlobs_core.job_timeline`('${{job_key}}')
+WHERE $__timeFilter(event_time)
+ORDER BY event_time DESC
+LIMIT 2000""")],
+        "options": {"showHeader": True, "footer": {"show": False}},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": "summary"},
+                 "properties": [{"id": "custom.width", "value": 620}]},
+                {"matcher": {"id": "byName", "options": "source"},
+                 "properties": [
+                     {"id": "custom.cellOptions",
+                      "value": {"type": "color-text"}},
+                     {"id": "mappings", "value": [{"type": "value", "options": {
+                         name: {"color": hexv, "index": i}
+                         for i, (name, hexv) in enumerate(SOURCE_COLOURS.items())
+                     }}]}]},
+            ],
+        },
+    })
+    y += 12
+
+    # ---- row 4: metrics -----------------------------------------------------
+    panels.append({"type": "row", "title": "指标 Metrics", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    # Single series: the mean across the job's chips. No legend box -- the title
+    # names the series. Per-chip lines would be dozens of series on one axis.
+    panels.append({
+        "type": "timeseries", "title": "TensorCore 利用率（该 job 全部芯片均值）",
+        "gridPos": {"x": 0, "y": y, "w": 12, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  point_time AS time,
+  AVG(value) AS tensorcore_pct
+FROM `{project}.mlobs_core.job_metrics`('${{job_key}}')
+WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+  AND $__timeFilter(point_time)
+GROUP BY time ORDER BY time""")],
+        "options": {"legend": {"showLegend": False},
+                    "tooltip": {"mode": "single"}},
+        "fieldConfig": {"defaults": {
+            "unit": "percent", "min": 0, "max": 100,
+            "custom": {"drawStyle": "line", "lineWidth": 2,
+                       "fillOpacity": 10, "showPoints": "never"},
+            "color": {"mode": "fixed", "fixedColor": SOURCE_COLOURS["app_error"]},
+        }, "overrides": []},
+    })
+
+    panels.append({
+        "type": "timeseries", "title": "日志速率（条 / 5 分钟，按容器）",
+        "description": "日志风暴既是故障信号也是成本事件。来自免费的 "
+                       "logging.googleapis.com/log_entry_count 指标，不扫日志。",
+        "gridPos": {"x": 12, "y": y, "w": 12, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  point_time AS time,
+  container_name,
+  SUM(value) AS lines
+FROM `{project}.mlobs_core.job_metrics`('${{job_key}}')
+WHERE metric_type = 'logging.googleapis.com/log_entry_count'
+  AND $__timeFilter(point_time)
+GROUP BY time, container_name ORDER BY time""")],
+        "transformations": [
+            {"id": "partitionByValues",
+             "options": {"fields": ["container_name"], "keepFields": False}}],
+        "options": {"legend": {"displayMode": "list", "placement": "bottom",
+                               "showLegend": True},
+                    "tooltip": {"mode": "multi", "sort": "desc"}},
+        "fieldConfig": {"defaults": {
+            "unit": "short",
+            "custom": {"drawStyle": "line", "lineWidth": 2,
+                       "fillOpacity": 0, "showPoints": "never"},
+        }, "overrides": []},
+    })
+    y += 8
+
+    # ---- row 5: attempts ----------------------------------------------------
+    panels.append({
+        "type": "table", "title": "每次尝试 Attempts",
+        "description": "同名 job 的每次运行一行。这就是模型要按 attempt 建的原因 —— "
+                       "按名字聚合会把互不相关的运行合并。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  first_seen, last_seen, attempt_uid, peak_chips, pods, nodes,
+  ROUND(goodput_ratio * 100, 1) AS goodput_pct,
+  observed_chip_hours, wallclock_chip_hours, sample_coverage,
+  startup_lag_s, est_usd, est_usd_observed, run_phase
+FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
+        "options": {"showHeader": True},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": "goodput_pct"},
+                 "properties": [
+                     {"id": "unit", "value": "percent"},
+                     {"id": "custom.cellOptions",
+                      "value": {"type": "color-text"}},
+                     {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                         {"color": STATUS["critical"], "value": None},
+                         {"color": STATUS["warning"], "value": 25},
+                         {"color": STATUS["good"], "value": 60}]}}]},
+                {"matcher": {"id": "byName", "options": "sample_coverage"},
+                 "properties": [
+                     {"id": "custom.cellOptions",
+                      "value": {"type": "color-text"}},
+                     {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                         {"color": STATUS["critical"], "value": None},
+                         {"color": STATUS["warning"], "value": 0.5},
+                         {"color": STATUS["good"], "value": 0.9}]}}]},
+            ],
+        },
+    })
+
+    return {
+        "uid": "mlobs-job",
+        "title": "ML Training — Job 总览",
+        "description": "每个 job 一个 URL：在 URL 后面加 ?var-job_key=<job>",
+        "tags": ["mlobs"],
+        "timezone": "utc",
+        "editable": True,
+        "schemaVersion": 39,
+        "refresh": "1m",
+        "time": {"from": "now-24h", "to": "now"},
+        "templating": {"list": [
+            {
+                # The whole point of the dashboard: one URL per job, set with
+                # ?var-job_key=<job>. Grafana treats this as first-class, so no
+                # extra "allow URL parameter" toggle is needed.
+                "name": "job_key", "type": "query", "label": "Job",
+                "datasource": DS,
+                "query": {"rawQuery": True, "rawSql":
+                          f"SELECT job_key FROM `{project}.mlobs_core.job_hub` "
+                          f"ORDER BY last_seen DESC LIMIT 1000",
+                          "format": 1, "location": "US"},
+                "refresh": 1, "sort": 0, "includeAll": False, "multi": False,
+            },
+        ]},
+        "panels": panels,
+    }
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--out", default="dashboards/job.json")
+    args = ap.parse_args()
+    with open(args.out, "w") as fh:
+        json.dump(build(args.project), fh, indent=2, ensure_ascii=False)
+    print(f"wrote {args.out}")

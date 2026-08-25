@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: mlobs
+    type: file
+    disableDeletion: false
+    # Editable in the UI for experimentation, but the file is the source of
+    # truth: every restart re-applies dashboards/ from the image.
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
