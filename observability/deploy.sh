@@ -96,6 +96,25 @@ bqq "CREATE TABLE IF NOT EXISTS mlobs_raw.metric_samples (
        ingested_at TIMESTAMP)
      PARTITION BY DATE(point_time) CLUSTER BY metric_type" >/dev/null
 
+# fact_event is created with CREATE TABLE IF NOT EXISTS and then filled
+# incrementally, so a model change that adds a column (attempt_uid, say) leaves
+# an old table in place and the INSERT fails on column count. It is fully
+# derivable from the sink, so dropping it on schema drift is safe and cheaper
+# than an ALTER dance. History outside the rebuild window is lost, which is why
+# only derived tables are treated this way.
+EXPECTED_FACT_EVENT_COLS=$(grep -oE '^  [a-z_]+ +(TIMESTAMP|STRING|INT64)' \
+  "${HERE}/model/04_fact_event.sql" | awk '{print $1}' | sort | tr '\n' ',')
+ACTUAL_FACT_EVENT_COLS=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
+  --format=csv "SELECT STRING_AGG(column_name, ',' ORDER BY column_name)
+                FROM mlobs_core.INFORMATION_SCHEMA.COLUMNS
+                WHERE table_name = 'fact_event'" 2>/dev/null | tail -1)
+if [[ -n "$ACTUAL_FACT_EVENT_COLS" && "$ACTUAL_FACT_EVENT_COLS" != "NULL" ]]; then
+  if [[ "${EXPECTED_FACT_EVENT_COLS%,}" != "$(tr ',' '\n' <<<"$ACTUAL_FACT_EVENT_COLS" | sort | tr '\n' ',' | sed 's/,$//')," ]]; then
+    echo "  fact_event schema drifted; dropping so it rebuilds"
+    bq --project_id="$PROJECT_ID" rm -f -t "${PROJECT_ID}:mlobs_core.fact_event" >/dev/null
+  fi
+fi
+
 echo "=== Discovering sink log tables ==="
 python3 "${HERE}/model/build_v_sink_logs.py" --project "$PROJECT_ID"
 

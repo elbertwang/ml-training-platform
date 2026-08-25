@@ -129,6 +129,10 @@ def bq_load(project: str, dataset: str, table: str, rows: list, schema: str) -> 
         "--time_partitioning_field=ingested_at",
         "--time_partitioning_type=DAY",
         "--clustering_fields=name",
+        # Tables created by an earlier version of this script lack columns the
+        # current one writes (e.g. `location`, added for multi-region polling).
+        # Without this, bq load fails against them instead of evolving them.
+        "--schema_update_option=ALLOW_FIELD_ADDITION",
         f"{dataset}.{table}", path, schema,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
