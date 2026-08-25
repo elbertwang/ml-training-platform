@@ -25,6 +25,7 @@
 10. [运行方式](#10-运行方式)
 11. [Caveats](#11-caveats)
 12. [指标分布盘点与 Grafana 架构 review](#12-指标分布盘点与-grafana-架构-review)
+13. [指标分级与漏斗：新增指标该放在哪一层](#13-指标分级与漏斗新增指标该放在哪一层)
 
 ---
 
@@ -759,7 +760,7 @@ exporter 已按此收窄：从 5 个指标减到 3 个，`memory_used` 和 `duty
 | `maxtext/perf_mfu`、`perf_step_time_seconds`、`learning_loss`、`learning_grad_norm` | 训练指标 | → **`fact_step`**，从已在 sink 里的 `completed step` 行建。这些行还带 `Config param peak_tflops_per_device`，正是 MFU 的分母 |
 | `maxtext/learning_is_nan`、`is_inf` | NaN 检测 | → 同上，`completed step` 行可判 |
 | `tpu_finance/jobrun_mfu`、`jobstat_mfu` | 按 job 的 MFU | → 同上 |
-| `tpu_finance/month_reservation_utilization` | **预留利用率** | ❌ **真正的缺口**。需要 Compute API 的 reservation 容量，现有任何数据源都没有。已加入路线图 |
+| `tpu_finance/month_reservation_utilization` | **预留利用率** | ⚠️ 我最初写「无数据源」是**错的** —— 能力地图跑出来发现 `compute.googleapis.com/instance/tpu/{scheduled,utilized}_chips` 带 `reservation_id` 标签，各 282 条序列，就是现成的分母和分子。见 §13.5 |
 | `training/autorepair_downtime_seconds`、`autorepair_rollback_steps` | 自动修复 MTTR | ⚠️ 原料齐了（`dim_job_attempt` + `fact_event` 里的 node/pod 事件），但还没建指标。已加入路线图 |
 
 **教训一条：不要重复 `maxtext/*` 那个反模式** —— 758 个描述符里 713 个是
@@ -803,3 +804,153 @@ PromQL 时，再上 B。
 5. 找当时做 `tpu_finance/*` 的人对一下口径，避免重复造
 6. 清理 758 个已废弃的 `maxtext/*` 描述符，并且**不要重复「每层一个指标」这个反模式**
    （应该一个指标 + `layer` 标签）
+
+---
+
+## 13. 指标分级与漏斗：新增指标该放在哪一层
+
+第 12 节回答了「现有指标在哪」。这一节回答**「以后要加一个指标，该放在哪」** ——
+一个可以照着走的判定流程，而不是每次重新讨论。
+
+### 13.1 漏斗：从 9,594 到 209
+
+`tools/build_capability_map.py` 对生产项目实测（探测窗口 7 天）：
+
+```
+Cloud Monitoring 全局目录          9,594 个描述符
+        │  按监控资源类型过滤（k8s_*、tpu_worker、gce_instance …）
+        ▼
+本项目可能有的                     4,896 个
+        │  逐个探测最近 7 天是否真有数据
+        ▼
+本项目实际有数据                     209 个   ← 这才是能力地图
+        │
+        └─ L1 平台 143 · L2 采集 53 · 未分类 13
+           合计 2,889,815 条时间序列
+```
+
+**只看描述符会得出完全错误的结论** —— 全局目录里有 AWS EC2、CloudSQL、AlloyDB、
+Apigee，这个项目一个都不产生。所以能力地图必须生成，不能手写。
+
+生成结果在 [`docs/capability-map-prod.md`](docs/capability-map-prod.md)
+（`.json` 是同一份数据的机器可读版）。重新生成：
+
+```bash
+tools/build_capability_map.py --project <P> --probe-days 7 \
+  --out docs/capability-map-<env>.md --json-out docs/capability-map-<env>.json
+```
+
+> 基数注意：`kubernetes.io/container/accelerator/tensorcore_utilization` 7 天内有
+> **98,984 条序列** —— 不是因为有 9.9 万个容器，而是 pod 名不断变化，每个新 pod 就是
+> 一条新序列。有 15 个指标的读数贴近 API 单次返回上限，那些数字是**下界**。
+> 这解释了为什么 Grafana 面板必须按 pod 过滤，不能整指标拉。
+
+### 13.2 五层模型
+
+你提的是三层（GCP 原生 / ML run / 算出来的）。实测下来需要拆成五层，因为
+**「原始信号」和「运行元数据」的性质和成本都跟时序指标完全不同**。
+
+| 层 | 是什么 | 例子 | 采集成本 | 保留 | 存哪 |
+|---|---|---|---|---|---|
+| **L0 原始信号** | 非结构化，不是指标，但是很多指标的原料 | Pod 日志、K8s events、serial console | **摄入 $0.50/GiB —— 全平台最贵的一项**（1,631 GiB/天） | 30 天（可调） | Log Analytics 全量 + 精选 sink |
+| **L1 平台指标** | GCP 白送，我们什么都不用做 | `kubernetes.io/*`（143 个里的大头）、`tpu.googleapis.com/*`、`compute.googleapis.com/instance/tpu/*` | **$0** | 6 周原分辨率 → 10 分钟，共 24 月 | Cloud Monitoring 原地 |
+| **L2 采集指标** | 要跑采集器或改代码 | GMP `prometheus.googleapis.com/*`（35）、工作负载自报 `custom.googleapis.com/*` | GMP **$0.06/百万样本**；自定义 **$0.258/MiB** | 7 天原分辨率（GMP）→ 1 分钟 → 10 分钟 | Cloud Monitoring 原地 |
+| **L3 运行元数据** | **不是时序，是实体** —— 提供「身份」和「判定」 | ML Diagnostics run/event/analyzer、K8s Job 对象、GKE Operations | REST 轮询，几乎免费 | 取决于源（MLDiag 约 2 月） | poller → BQ `mlobs_raw` → `dim_*` |
+| **L4 派生指标** | 本平台 ETL 算出来的，**别处不存在** | goodput、chip-hours、每 job 成本、启停时间、占用卡数、attempts、MTTR | BQ 扫描，增量后约 $0.01/月 | **永久** | BQ `fact_*` / `job_hub` |
+
+**L3 单独成层的理由**：ML Diagnostics 的 run / analyzer 判定不是时间序列，是带生命周期
+的对象。把它当指标处理会丢掉 `workloadDetails.gke.id` 这种 join key —— 而整个 L4 都
+依赖它。
+
+### 13.3 决策漏斗：新指标放哪
+
+按顺序过闸，第一个命中的就是答案。
+
+```
+新指标需求
+  │
+  ├─① 能力地图里已经有了吗？
+  │     docs/capability-map-prod.md 里搜一下
+  │     有 → 直接用，不要新建任何东西                          → L1/L2
+  │
+  ├─② 它其实是「实体属性」而不是时序吗？
+  │     owner、模型名、超参、TPU 型号、提交时间
+  │     是 → 进 dim_*，它不是指标                              → L3
+  │
+  ├─③ GCP 能免费产生吗？
+  │     TPU/容器/节点/网络/存储 的任何硬件或调度层信号
+  │     能 → 用 L1，零成本零维护                                → L1
+  │
+  ├─④ 必须由训练进程自己报吗？（loss、MFU、step_time、自定义业务量）
+  │     是 → L2，且必须遵守两条：
+  │          a. 走 GMP（Prometheus 端点），不要 custom.googleapis.com
+  │             —— 4.32 亿样本/月：GMP 约 $26，自定义指标约 $3,150
+  │          b. 一个指标 + 标签，绝不每个维度一个指标
+  │             —— 反面教材：maxtext 的 713 个 Router_bias_mean_layer_N
+  │
+  ├─⑤ 需要 join 到 job 身份 / 跨源关联 / 超过 6 周原分辨率 / 算钱？
+  │     是 → L4，在 BigQuery 里算                               → L4
+  │
+  └─⑥ 只是想在面板上多一条曲线？
+        不新建任何东西，Grafana 直读 L1/L2                       → 不落地
+```
+
+**④ 里那条价格对比的口径**：GMP 按样本计费（$0.06/百万，量大降到 $0.024），自定义指标
+按字节计费（前 150 MiB 免费，之后 $0.258/MiB）。上面的 $3,150 假设每样本约 30 字节，
+这个假设未经实测核实 —— 但两者相差两个数量级这个结论不依赖精确取值。
+
+### 13.4 用你的例子走一遍
+
+> 「历史所有 job 的启动时间、停止时间、占用卡数」
+
+| 闸 | 判定 |
+|---|---|
+| ① 现成的？ | ❌ 没有任何单一指标能回答 |
+| ② 实体属性？ | 部分是 —— job 身份来自 L3 |
+| ③ GCP 免费产生？ | 部分 —— 占用卡数来自 L1 `accelerator/*`，但**没有 job 标签** |
+| ⑤ 需要 join？ | ✅ **命中** —— 必须把 L0 的 pod→job 映射、L1 的芯片指标、L3 的 attempt 身份拼起来 |
+
+**结论：L4。而且已经建好了。**
+
+```sql
+SELECT a.job_key, a.first_seen AS started, a.last_seen AS stopped,
+       a.observed_duration_s/3600 AS hours, a.pods, a.nodes,
+       g.peak_chips, a.owner
+FROM mlobs_core.dim_job_attempt a
+LEFT JOIN mlobs_core.fact_goodput g USING (attempt_uid)
+ORDER BY a.first_seen DESC
+```
+
+实测覆盖 **1,951 次 attempt / 1,832 个 job，其中 1,779 个有 owner 归属**。
+
+两个已知短板，都不是模型问题：
+- `peak_chips` 当前多为 NULL —— 生产的 `metrics_exporter` 没有接调度，
+  `fact_metric` 的 6 小时窗口内没有新样本。接上 Cloud Scheduler 即可。
+- 历史只回溯到回填窗口（生产做了 2 天），上限是 Log Analytics 的 30 天保留。
+
+### 13.5 一处更正：预留利用率是有数据源的
+
+第 12.3c 节说 `tpu_finance/month_reservation_utilization` 是「真正的缺口，现有任何
+数据源都没有」。**这是错的。** 能力地图跑出来发现：
+
+```
+compute.googleapis.com/instance/tpu/scheduled_chips   282 条序列
+compute.googleapis.com/instance/tpu/utilized_chips    282 条序列
+compute.googleapis.com/instance/tpu/active_chips      282 条序列
+   标签: accelerator_type, reservation_id, provisioning_model
+```
+
+带 **`reservation_id`**，而且 `scheduled_chips` / `utilized_chips` 正好就是预留利用率
+的分母和分子。这是 L1（免费），不需要任何新采集 —— 只要在 L4 里按 `reservation_id`
+聚合即可。另外 `instance/tpu/chip_state`、`infra_health` 也在，是硬件健康的现成信号，
+目前完全没用上。
+
+### 13.6 按这个框架看，现在缺什么
+
+| 缺口 | 该在哪层 | 现状 |
+|---|---|---|
+| loss / MFU / step_time 时序 | L4（从 L0 的 `completed step` 行 ETL）| 数据已在 sink（33.5 万行/天），未建 `fact_step` |
+| 预留利用率 | L4（聚合 L1 的 `*_chips`） | **数据源现成**，未建 |
+| TPU 硬件健康 | L1 直读 + L4 关联 | `chip_state` / `infra_health` 未用 |
+| 自动修复 MTTR | L4（`dim_job_attempt` + `fact_event`） | 原料齐，未建 |
+| 排队等待时长 | L4（需要 L3 补 Kueue Workload 对象） | poller 未做 |
