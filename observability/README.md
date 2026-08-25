@@ -760,7 +760,7 @@ exporter 已按此收窄：从 5 个指标减到 3 个，`memory_used` 和 `duty
 | `maxtext/perf_mfu`、`perf_step_time_seconds`、`learning_loss`、`learning_grad_norm` | 训练指标 | → **`fact_step`**，从已在 sink 里的 `completed step` 行建。这些行还带 `Config param peak_tflops_per_device`，正是 MFU 的分母 |
 | `maxtext/learning_is_nan`、`is_inf` | NaN 检测 | → 同上，`completed step` 行可判 |
 | `tpu_finance/jobrun_mfu`、`jobstat_mfu` | 按 job 的 MFU | → 同上 |
-| `tpu_finance/month_reservation_utilization` | **预留利用率** | ⚠️ 我最初写「无数据源」是**错的** —— 能力地图跑出来发现 `compute.googleapis.com/instance/tpu/{scheduled,utilized}_chips` 带 `reservation_id` 标签，各 282 条序列，就是现成的分母和分子。见 §13.5 |
+| `tpu_finance/month_reservation_utilization` | **预留利用率** | ❌ 缺口。`compute.googleapis.com/instance/tpu/{scheduled,utilized}_chips` 带 `reservation_id`，但只挂在 `gce_instance` 上，**没有 cluster/namespace/pod**，接不进 `dim_pod`。它能算集群级预留利用率，但**算不到 job**。见 §13.5 |
 | `training/autorepair_downtime_seconds`、`autorepair_rollback_steps` | 自动修复 MTTR | ⚠️ 原料齐了（`dim_job_attempt` + `fact_event` 里的 node/pod 事件），但还没建指标。已加入路线图 |
 
 **教训一条：不要重复 `maxtext/*` 那个反模式** —— 758 个描述符里 713 个是
@@ -814,19 +814,22 @@ PromQL 时，再上 B。
 
 ### 13.1 漏斗：从 9,594 到 209
 
-`tools/build_capability_map.py` 对生产项目实测（探测窗口 7 天）：
+`tools/build_capability_map.py` 对生产项目实测（探测窗口 1 天）：
 
 ```
 Cloud Monitoring 全局目录          9,594 个描述符
-        │  按监控资源类型过滤（k8s_*、tpu_worker、gce_instance …）
+        │  按指标类型前缀过滤，并排除 kubernetes.io/anthos/*
+        │  （anthos 占 kubernetes.io 3,486 个里的 3,360 个，与本项目无关）
         ▼
-本项目可能有的                     4,896 个
-        │  逐个探测最近 7 天是否真有数据
+本项目可能有的                     1,012 个
+        │  逐个探测最近 1 天是否真有数据
         ▼
-本项目实际有数据                     209 个   ← 这才是能力地图
+本项目实际有数据                     167 个   ← 这才是能力地图
         │
-        └─ L1 平台 143 · L2 采集 53 · 未分类 13
-           合计 2,889,815 条时间序列
+        └─ L1 平台 109（kubernetes.io 89 · logging 12 · container 8）
+           L2 采集  58（GMP 53 · 自定义 5）
+           合计 1,757,628 条时间序列
+           另有 16 个探测未决，工具会在输出里显式标 INCOMPLETE
 ```
 
 **只看描述符会得出完全错误的结论** —— 全局目录里有 AWS EC2、CloudSQL、AlloyDB、
@@ -840,9 +843,9 @@ tools/build_capability_map.py --project <P> --probe-days 7 \
   --out docs/capability-map-<env>.md --json-out docs/capability-map-<env>.json
 ```
 
-> 基数注意：`kubernetes.io/container/accelerator/tensorcore_utilization` 7 天内有
-> **98,984 条序列** —— 不是因为有 9.9 万个容器，而是 pod 名不断变化，每个新 pod 就是
-> 一条新序列。有 15 个指标的读数贴近 API 单次返回上限，那些数字是**下界**。
+> 基数注意：`kubernetes.io/container/accelerator/tensorcore_utilization` **一天内**
+> 就有 **17,768 条序列** —— 不是因为有 1.7 万个容器，而是 pod 名不断变化，每个新
+> pod 就是一条新序列。基数最高的是 `gcsfusecsi/fs_ops_latencies`（59,726）。
 > 这解释了为什么 Grafana 面板必须按 pod 过滤，不能整指标拉。
 
 ### 13.2 五层模型
@@ -853,7 +856,7 @@ tools/build_capability_map.py --project <P> --probe-days 7 \
 | 层 | 是什么 | 例子 | 采集成本 | 保留 | 存哪 |
 |---|---|---|---|---|---|
 | **L0 原始信号** | 非结构化，不是指标，但是很多指标的原料 | Pod 日志、K8s events、serial console | **摄入 $0.50/GiB —— 全平台最贵的一项**（1,631 GiB/天） | 30 天（可调） | Log Analytics 全量 + 精选 sink |
-| **L1 平台指标** | GCP 白送，我们什么都不用做 | `kubernetes.io/*`（143 个里的大头）、`tpu.googleapis.com/*`、`compute.googleapis.com/instance/tpu/*` | **$0** | 6 周原分辨率 → 10 分钟，共 24 月 | Cloud Monitoring 原地 |
+| **L1 平台指标** | GCP 白送，我们什么都不用做 | **`kubernetes.io/*`** —— GKE TPU 的全部信号都在这里 | **$0** | 6 周原分辨率 → 10 分钟，共 24 月 | Cloud Monitoring 原地 |
 | **L2 采集指标** | 要跑采集器或改代码 | GMP `prometheus.googleapis.com/*`（35）、工作负载自报 `custom.googleapis.com/*` | GMP **$0.06/百万样本**；自定义 **$0.258/MiB** | 7 天原分辨率（GMP）→ 1 分钟 → 10 分钟 | Cloud Monitoring 原地 |
 | **L3 运行元数据** | **不是时序，是实体** —— 提供「身份」和「判定」 | ML Diagnostics run/event/analyzer、K8s Job 对象、GKE Operations | REST 轮询，几乎免费 | 取决于源（MLDiag 约 2 月） | poller → BQ `mlobs_raw` → `dim_*` |
 | **L4 派生指标** | 本平台 ETL 算出来的，**别处不存在** | goodput、chip-hours、每 job 成本、启停时间、占用卡数、attempts、MTTR | BQ 扫描，增量后约 $0.01/月 | **永久** | BQ `fact_*` / `job_hub` |
@@ -928,29 +931,108 @@ ORDER BY a.first_seen DESC
   `fact_metric` 的 6 小时窗口内没有新样本。接上 Cloud Scheduler 即可。
 - 历史只回溯到回填窗口（生产做了 2 天），上限是 Log Analytics 的 30 天保留。
 
-### 13.5 一处更正：预留利用率是有数据源的
+### 13.5 两处更正
 
-第 12.3c 节说 `tpu_finance/month_reservation_utilization` 是「真正的缺口，现有任何
-数据源都没有」。**这是错的。** 能力地图跑出来发现：
+**（一）`compute.googleapis.com/instance/tpu/*` 不是我们要的东西。**
+
+我先是说预留利用率「没有任何数据源」，然后看到 `instance/tpu/{scheduled,utilized,
+active}_chips` 带 `reservation_id` 标签，就改口说「数据源现成」。**两次都不准确。**
+
+实测这一族的资源标签：
 
 ```
-compute.googleapis.com/instance/tpu/scheduled_chips   282 条序列
-compute.googleapis.com/instance/tpu/utilized_chips    282 条序列
-compute.googleapis.com/instance/tpu/active_chips      282 条序列
-   标签: accelerator_type, reservation_id, provisioning_model
+resource.type   = gce_instance
+resource.labels = instance_id / project_id / zone     ← 只有这三个
 ```
 
-带 **`reservation_id`**，而且 `scheduled_chips` / `utilized_chips` 正好就是预留利用率
-的分母和分子。这是 L1（免费），不需要任何新采集 —— 只要在 L4 里按 `reservation_id`
-聚合即可。另外 `instance/tpu/chip_state`、`infra_health` 也在，是硬件健康的现成信号，
-目前完全没用上。
+**没有 cluster、namespace、pod、node 名。** 接不进 `dim_pod`，也就归不到 job。
+而且序列里混着 europe-west4-a 的实例，不在我们的 GKE 集群里。它是 **VM 粒度**，
+能回答「这个预留整体用了多少」，回答不了「哪个 job 用了预留」。
 
-### 13.6 按这个框架看，现在缺什么
+同理 `tpu.googleapis.com/*` 是 Cloud TPU VM 的表面（资源类型 `tpu_worker` /
+`GceTpuWorker`），我们的 TPU 是 GKE 托管的，所以那一族在这个项目里几乎是空的 ——
+`instance/interruption_count` 全项目只有 **2 条序列**。这解释了为什么 exporter 从它
+那里一直拉到 0 个点。**已从 exporter 移除**；抢占归因改由 `fact_event` 里的
+Kubernetes 事件承担。
+
+**结论：GKE TPU 的信号全部在 `kubernetes.io/*` 下。** 能力地图的候选集已按此收窄。
+
+**（二）能力地图工具本身返工了三次，值得记下来。**
+
+| 症状 | 根因 |
+|---|---|
+| 两次运行分别给出 209 和 48 个指标 | 探测失败（HTTP 错误）被当成「无数据」，结果不可复现 |
+| 1,560 个探测持续失败 | 对 CUMULATIVE/INT64 用 `ALIGN_COUNT` 会返回 **400**，且 400 重试无用 |
+| 改成按描述符 kind 选对齐函数后仍失败 | `metricDescriptors.list` 对很多条目**不返回 `metricKind`/`valueType`**，没东西可判断 |
+| 改成依次尝试 3 种对齐函数后**全部**失败 | 请求量翻 3 倍打爆读配额；而且我的补丁因字符串不匹配**静默没生效**，调用方按 4 元组解包旧的 3 元组返回值 |
+
+最终做法：候选集按**指标类型前缀**收窄（不是按资源类型），对齐函数依次尝试，
+探测错误与「无数据」严格区分并单独重试，仍失败的会在输出里显式标 `INCOMPLETE`。
+
+教训：**探测类工具必须把「查不到」和「查失败」分开**，否则输出看起来永远是合理的。
+
+### 13.6 能力地图找出来的：我们重复造了轮子
+
+这是做能力地图最大的收获，也说明「先盘点再开发」这个顺序不能反。
+
+**（一）GKE 原生就有 JobSet 的 goodput。**
+
+```
+kubernetes.io/jobset/proxy_runtime_goodput    实测 0.88 / 0.30 / 0.80 / 0.79 …
+kubernetes.io/jobset/scheduling_goodput       实测 0.89 / 0.84 / 0.88
+kubernetes.io/jobset/uptime
+kubernetes.io/jobset/startup_duration         实测 55s / 119s
+kubernetes.io/node_pool/accelerator/startup_duration
+
+resource.type   = k8s_entity
+resource.labels = entity_type=jobset, entity_name=<JobSet 名>, cluster_name, namespace
+```
+
+`entity_name` **就是我们的 `job_key`**。也就是说 JobSet 族的 goodput、启动耗时、
+运行时长，GCP 已经按 job 算好了，L1，免费。
+
+我们的 `fact_goodput` 是用 tensorcore 利用率拼的代理指标 —— 在不知道这个的情况下
+是合理的，知道之后就该改。
+
+**但它不能全部替代**，两个限制：
+- **只覆盖 JobSet。** 生产里 falcon 族是 1,540 个 job（普通 Job，不是 JobSet），
+  jobset 族只有 201 个。falcon 的 goodput 仍然只能自己算。
+- **不带成本。** 芯片数 × 时长 × 单价还是得在 L4 拼。
+
+**下一步应该是：JobSet 族直接用原生指标，falcon 族保留我们的代理算法，
+并且用原生指标校准代理算法的偏差。**
+
+**（二）gcsfuse 有 18 个原生指标，我们是从日志里查的那次事故。**
+
+```
+kubernetes.io/gcsfusecsi/file_cache_read_count     4,723 序列  标签含 cache_hit
+kubernetes.io/gcsfusecsi/fs_ops_error_count        7,059 序列  标签含 fs_error_category
+kubernetes.io/gcsfusecsi/fs_ops_latencies         59,726 序列
+kubernetes.io/gcsfusecsi/gcs_request_latencies    28,403 序列
+```
+
+8-24 那次事故（64 个 pod 的 gcsfuse 文件缓存失败循环、5 分钟 1.5 亿行日志），
+我们是靠日志速率指标 + 错误签名定位的。**`file_cache_read_count{cache_hit}` 和
+`fs_ops_error_count{fs_error_category}` 本来可以直接告警**，不用等日志风暴发生。
+
+**（三）JobSet 状态在 GMP 里已经有了。**
+
+```
+prometheus.googleapis.com/kube_jobset_{active,failed,ready,succeeded,suspended}_replicas
+prometheus.googleapis.com/kube_jobset_status_condition
+prometheus.googleapis.com/kube_jobset_restarts
+```
+
+路线图里「L3 补 K8s CR 状态 poller」这一条，对 JobSet 而言**不需要写 poller** ——
+kube-state-metrics 已经通过 GMP 采上来了。falcon 的普通 Job 仍需自己处理。
+
+### 13.7 按这个框架看，现在缺什么
+
 
 | 缺口 | 该在哪层 | 现状 |
 |---|---|---|
 | loss / MFU / step_time 时序 | L4（从 L0 的 `completed step` 行 ETL）| 数据已在 sink（33.5 万行/天），未建 `fact_step` |
-| 预留利用率 | L4（聚合 L1 的 `*_chips`） | **数据源现成**，未建 |
-| TPU 硬件健康 | L1 直读 + L4 关联 | `chip_state` / `infra_health` 未用 |
+| 预留利用率（按 job） | — | ❌ **无解**。唯一带 `reservation_id` 的指标是 VM 粒度，归不到 job。集群级可以算，per-job 不行 |
+| TPU 硬件健康 | L1 直读 | `chip_state` / `infra_health` 未用，但同样是 VM 粒度，只能做集群级视图 |
 | 自动修复 MTTR | L4（`dim_job_attempt` + `fact_event`） | 原料齐，未建 |
 | 排队等待时长 | L4（需要 L3 补 Kueue Workload 对象） | poller 未做 |

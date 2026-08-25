@@ -70,11 +70,13 @@ METRICS = [
     # log-storm events on the fact_event timeline; joins to dim_pod
     ("logging.googleapis.com/log_entry_count",
      "k8s_container", 300, "ALIGN_SUM"),
-    # preemption attribution. Wired up but unproven -- returned zero points in
-    # every window sampled so far.
-    ("tpu.googleapis.com/instance/interruption_count",
-     None, 300, "ALIGN_SUM"),
 ]
+
+# Removed: tpu.googleapis.com/instance/interruption_count. It always returned
+# zero points, and the capability map explains why -- it is scoped to
+# tpu_worker / GceTpuWorker, the Cloud TPU VM surface, and has 2 series in the
+# entire project. Our TPUs are GKE-managed, so preemption attribution has to
+# come from Kubernetes events instead, which fact_event already collects.
 
 
 def access_token() -> str:

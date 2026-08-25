@@ -38,13 +38,44 @@ import urllib.request
 
 API = "https://monitoring.googleapis.com/v3"
 
-# Resource types this platform cares about. Everything else in the global
-# catalogue is noise for a TPU-training project.
-RESOURCE_ALLOWLIST = {
-    "k8s_container", "k8s_pod", "k8s_node", "k8s_cluster",
-    "tpu_worker", "gce_instance", "generic_node", "generic_task",
-    "prometheus_target", "gke_container", "k8s_scale",
-}
+# The metric families this platform can actually use.
+#
+# The test is not "is it about TPUs" but "can it be attributed to a job".
+# dim_pod keys on pod_name, so a metric is only usable here if it carries
+# Kubernetes scope. Two families are deliberately excluded:
+#
+#   compute.googleapis.com/instance/tpu/{scheduled,utilized,active}_chips
+#       looked promising because of its reservation_id label, but the resource
+#       labels are only instance_id/project_id/zone -- no cluster, no namespace,
+#       no pod -- and it spans instances outside our clusters. VM grain, not
+#       workload grain.
+#   tpu.googleapis.com/* is the Cloud TPU VM surface. Our TPUs are GKE-managed,
+#       so these carry almost nothing: interruption_count has 2 series in the
+#       whole project, which is why the exporter kept pulling zero points.
+#
+# For GKE TPUs the equivalent signal all arrives under kubernetes.io/*.
+TYPE_PREFIXES = (
+    "kubernetes.io/",              # GKE: containers, pods, nodes, accelerators,
+                                   # jobset, gcsfusecsi
+    "prometheus.googleapis.com/",  # GMP scrapes
+    "custom.googleapis.com/",      # workload-reported
+    "logging.googleapis.com/",     # log volume + log-based metrics
+    "container.googleapis.com/",   # GKE control plane
+)
+
+# kubernetes.io/anthos/* is 3,360 of the 3,486 kubernetes.io descriptors in the
+# global catalogue and none of it applies to a GKE project. Leaving it in made
+# the candidate set 4,372, which cannot be probed within the Monitoring read
+# quota -- runs stalled and were killed at ~4,000. Excluding it brings the set
+# to roughly 1,000, which probes in a couple of minutes.
+TYPE_EXCLUDE = ("kubernetes.io/anthos/",)
+
+# Only with --all-resources: VM- and Cloud-TPU-scoped families that cannot be
+# attributed to a job. Useful for a capacity/finance view, not for this one.
+ALL_RESOURCE_PREFIXES = (
+    "compute.googleapis.com/", "tpu.googleapis.com/",
+    "agent.googleapis.com/", "networking.googleapis.com/",
+)
 
 # prefix -> (tier, human label)
 TIERS = {
@@ -66,17 +97,25 @@ def token():
         check=True, capture_output=True, text=True).stdout.strip()
 
 
-def get(url, tok, retries=4):
+def get(url, tok, retries=3):
+    """Retries are deliberately shallow.
+
+    Six retries with 20-second backoff, multiplied by trying several aligners
+    per metric, meant a handful of rate-limited probes could hold the whole run
+    open for hours -- two runs were killed by their timeout with a dozen
+    candidates left. A probe is cheap to repeat by re-running the tool; a run
+    that never finishes is not.
+    """
     import time
     for attempt in range(retries):
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
         try:
-            with urllib.request.urlopen(req, timeout=90) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
                 raise RuntimeError(f"HTTP {e.code}: {e.read()[:200]}")
-            time.sleep(2 ** attempt)
+            time.sleep(min(2 ** attempt, 4))
         except (urllib.error.URLError, TimeoutError):
             if attempt == retries - 1:
                 raise
@@ -96,6 +135,19 @@ def list_descriptors(project, tok):
             return out
 
 
+# Cloud Monitoring rejects an aligner that does not match the metric's kind with
+# a permanent 400 -- no amount of retrying helps. Using one aligner for
+# everything failed on 1,560 of 4,406 candidates ("cannot be applied to metrics
+# with kind CUMULATIVE and value type INT64") and, because those errors were
+# read as "no data", silently removed a third of the catalogue from the map.
+#
+# Choosing per descriptor does not work either: metricDescriptors.list omits
+# metricKind and valueType on many entries, so there is nothing to branch on.
+# Trying the three aligner families in order is cheap (one extra call only for
+# metrics the first choice rejects) and needs no descriptor metadata at all.
+ALIGNERS = ("ALIGN_MEAN", "ALIGN_RATE", "ALIGN_DELTA")
+
+
 def tier_of(metric_type):
     for pfx, (tier, label) in TIERS.items():
         if metric_type.startswith(pfx):
@@ -103,7 +155,7 @@ def tier_of(metric_type):
     return "L?", "其它"
 
 
-def probe(project, tok, metric_type, start, end):
+def probe(project, tok, metric_type, start, end, aligner=None):
     """Cheap has-data check.
 
     Uses crossSeriesReducer so the response is one series regardless of the
@@ -113,33 +165,40 @@ def probe(project, tok, metric_type, start, end):
     series_count(); an earlier version reported this reduced count as the
     cardinality and every metric looked like it had exactly one series.
     """
-    params = urllib.parse.urlencode([
-        ("filter", f'metric.type="{metric_type}"'),
-        ("interval.startTime", start), ("interval.endTime", end),
-        ("aggregation.alignmentPeriod", "86400s"),
-        ("aggregation.perSeriesAligner", "ALIGN_COUNT"),
-        ("aggregation.crossSeriesReducer", "REDUCE_SUM"),
-    ])
-    try:
-        d = get(f"{API}/projects/{project}/timeSeries?{params}", tok)
-    except RuntimeError:
-        return 0, None
-    ts = d.get("timeSeries", [])
-    pts = [p["interval"]["endTime"][:10] for s in ts for p in s.get("points", [])]
-    return len(ts), (max(pts) if pts else None)
+    # A failed probe is NOT "no data". Conflating them made the map
+    # non-deterministic: one run reported 209 metrics and the next 48, silently
+    # dropping metrics that demonstrably have data. Errors are returned as such.
+    for a in (ALIGNERS if aligner is None else (aligner,)):
+        params = urllib.parse.urlencode([
+            ("filter", f'metric.type="{metric_type}"'),
+            ("interval.startTime", start), ("interval.endTime", end),
+            ("aggregation.alignmentPeriod", "86400s"),
+            ("aggregation.perSeriesAligner", a),
+            ("aggregation.crossSeriesReducer", "REDUCE_SUM"),
+        ])
+        try:
+            d = get(f"{API}/projects/{project}/timeSeries?{params}", tok)
+        except Exception:
+            continue          # usually a 400 for the wrong aligner family
+        ts = d.get("timeSeries", [])
+        pts = [p["interval"]["endTime"][:10]
+               for s in ts for p in s.get("points", [])]
+        return ("ok" if ts else "empty", len(ts),
+                (max(pts) if pts else None), a)
+    return "error", 0, None, None
 
 
-def series_count(project, tok, metric_type, start, end):
+def series_count(project, tok, metric_type, start, end, aligner):
     """Distinct time series, which is the cardinality that drives cost."""
     params = urllib.parse.urlencode([
         ("filter", f'metric.type="{metric_type}"'),
         ("interval.startTime", start), ("interval.endTime", end),
         ("aggregation.alignmentPeriod", "86400s"),
-        ("aggregation.perSeriesAligner", "ALIGN_COUNT"),
+        ("aggregation.perSeriesAligner", aligner),
     ])
     try:
         d = get(f"{API}/projects/{project}/timeSeries?{params}", tok)
-    except RuntimeError:
+    except Exception:
         return 0
     return len(d.get("timeSeries", []))
 
@@ -148,9 +207,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True)
     ap.add_argument("--probe-days", type=int, default=7)
-    ap.add_argument("--concurrency", type=int, default=24)
+    # Monitoring read quota is per-minute; 32 threads over thousands of probes
+    # trips it and used to corrupt the result silently.
+    ap.add_argument("--concurrency", type=int, default=12)
     ap.add_argument("--out", default="capability-map.md")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--all-resources", action="store_true",
+                    help="also probe VM- and Cloud-TPU-scoped metrics, which "
+                         "cannot be attributed to a job (see ALL_RESOURCE_PREFIXES)")
     args = ap.parse_args()
 
     tok = token()
@@ -162,33 +226,60 @@ def main():
     all_md = list_descriptors(args.project, tok)
     print(f"  {len(all_md)} in the global catalogue", flush=True)
 
-    candidates = [
-        m for m in all_md
-        if (set(m.get("monitoredResourceTypes", [])) & RESOURCE_ALLOWLIST)
-        or m["type"].startswith(("custom.googleapis.com/",
-                                 "prometheus.googleapis.com/",
-                                 "tpu.googleapis.com/"))
-    ]
+    # Select by metric-type PREFIX, not by monitored resource type.
+    #
+    # Filtering on monitoredResourceTypes still left 4,406 of the 9,594-entry
+    # global catalogue, and probing that many trips the Monitoring read quota --
+    # which then surfaces as "no data" and silently corrupts the map. For a
+    # TPU-on-GKE platform the relevant surface is small and known by prefix;
+    # everything outside it either does not exist in this project or cannot be
+    # attributed to a job.
+    prefixes = TYPE_PREFIXES
+    if args.all_resources:
+        prefixes = prefixes + ALL_RESOURCE_PREFIXES
+    candidates = [m for m in all_md
+                  if m["type"].startswith(prefixes)
+                  and not m["type"].startswith(TYPE_EXCLUDE)]
     print(f"  {len(candidates)} plausible for a TPU-on-GKE project", flush=True)
 
     print(f"probing {args.probe_days}d of data (concurrency {args.concurrency}) ...",
           flush=True)
+
+    def probe_all(items, conc):
+        hits, errs = [], []
+        with concurrent.futures.ThreadPoolExecutor(conc) as pool:
+            futs = {pool.submit(probe, args.project, tok, m["type"],
+                                iso(start), iso(end),
+                                None): m
+                    for m in items}
+            done = 0
+            for f in concurrent.futures.as_completed(futs):
+                m = futs[f]
+                done += 1
+                if done % 500 == 0:
+                    print(f"  {done}/{len(items)}", flush=True)
+                try:
+                    status, n, last, used = f.result()
+                except Exception:
+                    status, n, last, used = "error", 0, None, None
+                if status == "error":
+                    errs.append(m)
+                elif status == "ok":
+                    hits.append((m, n, last, used))
+        return hits, errs
+
+    hits, errs = probe_all(candidates, args.concurrency)
+    if errs:
+        print(f"  {len(errs)} probes failed; re-probing serially ...", flush=True)
+        more, still = probe_all(errs, 4)
+        hits += more
+        if still:
+            print(f"  WARNING: {len(still)} probes still failing -- the map is "
+                  f"INCOMPLETE for: {', '.join(m['type'] for m in still[:5])}"
+                  f"{' …' if len(still) > 5 else ''}", flush=True)
+
     rows = []
-    with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
-        futs = {pool.submit(probe, args.project, tok, m["type"], iso(start), iso(end)): m
-                for m in candidates}
-        done = 0
-        for f in concurrent.futures.as_completed(futs):
-            m = futs[f]
-            done += 1
-            if done % 200 == 0:
-                print(f"  {done}/{len(candidates)}", flush=True)
-            try:
-                n_series, last = f.result()
-            except Exception:
-                n_series, last = 0, None
-            if not n_series:
-                continue
+    for m, n_series, last, used_aligner in hits:
             tier, label = tier_of(m["type"])
             rows.append({
                 "metric_type": m["type"],
@@ -201,6 +292,7 @@ def main():
                 "labels": ",".join(l["key"] for l in m.get("labels", [])),
                 "series_7d": n_series,
                 "last_day": last,
+                "aligner": used_aligner,
             })
 
     print(f"  {len(rows)} metrics have data", flush=True)
@@ -210,7 +302,9 @@ def main():
     print("counting series ...", flush=True)
     with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
         futs = {pool.submit(series_count, args.project, tok, r["metric_type"],
-                            iso(start), iso(end)): r for r in rows}
+                            iso(start), iso(end),
+                            r.get("aligner") or "ALIGN_MEAN"): r
+                for r in rows}
         for f in concurrent.futures.as_completed(futs):
             try:
                 futs[f]["series_7d"] = f.result()
