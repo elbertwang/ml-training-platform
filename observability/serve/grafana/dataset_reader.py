@@ -38,15 +38,17 @@ def main():
     ap.add_argument("--before", required=True, help="`bq show` output from before the update")
     ap.add_argument("--out", help="where to write the update body (patch mode)")
     ap.add_argument("--sa", required=True)
+    ap.add_argument("--role", default="READER", choices=("READER", "WRITER"),
+                    help="READER is roles/bigquery.dataViewer, WRITER is dataEditor")
     args = ap.parse_args()
 
     before = json.load(open(args.before)).get("access", [])
-    want = ("READER", args.sa)
+    want = (args.role, args.sa)
 
     if args.mode == "patch":
         access = list(before)
         if want not in {entry_key(a) for a in access}:
-            access.append({"role": "READER", "userByEmail": args.sa})
+            access.append({"role": args.role, "userByEmail": args.sa})
         # Only the mutable field. Passing the whole `bq show` payload back makes
         # bq reject output-only members such as etag, id and selfLink.
         json.dump({"access": access}, open(args.out, "w"))
@@ -57,7 +59,7 @@ def main():
     if lost:
         sys.exit(f"ABORT: dataset access entries disappeared: {sorted(lost)}")
     if want not in {entry_key(a) for a in after}:
-        sys.exit("ABORT: the READER grant did not take effect")
+        sys.exit(f"ABORT: the {args.role} grant did not take effect")
 
 
 if __name__ == "__main__":

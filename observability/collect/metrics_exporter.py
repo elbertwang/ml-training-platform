@@ -80,6 +80,13 @@ METRICS = [
 
 
 def access_token() -> str:
+    """ADC token. CLOUDSDK_AUTH_ACCESS_TOKEN wins when set -- inside the Cloud
+    Run refresh job the entrypoint exports one metadata-server token for the
+    whole run, which avoids a ~1.3s gcloud call and matches what bq already
+    reads."""
+    env = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+    if env:
+        return env
     return subprocess.run(
         ["gcloud", "auth", "application-default", "print-access-token"],
         check=True, capture_output=True, text=True,

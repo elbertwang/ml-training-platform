@@ -57,7 +57,16 @@ def parse_ts(stamp: str):
 
 
 def access_token() -> str:
-    """ADC token. On CAA-restricted VMs this is the only path that works."""
+    """ADC token. On CAA-restricted VMs this is the only path that works.
+
+    CLOUDSDK_AUTH_ACCESS_TOKEN wins when set: inside the Cloud Run refresh job
+    the entrypoint fetches one token from the metadata server and exports it,
+    which is both cheaper than shelling out to gcloud per call (~1.3s each) and
+    the same variable the rest of the pipeline already honours.
+    """
+    env = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+    if env:
+        return env
     return subprocess.run(
         ["gcloud", "auth", "application-default", "print-access-token"],
         check=True, capture_output=True, text=True,
