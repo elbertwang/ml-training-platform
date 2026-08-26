@@ -1,0 +1,29 @@
+# Google Cloud Logging (plugin id `googlecloud-logging-datasource`, Apache-2.0,
+# published by GoogleCloudPlatform). Installed in the Dockerfile.
+#
+# This carries the "raw text" layer of every job page. The split with BigQuery
+# is documented in docs/log-routing.md; the short version is that a human reads
+# text here and a program computes over facts in BigQuery, and the two are the
+# top and bottom half of the same dashboard driven by the same $job variable.
+#
+# Two measured limits worth knowing before building a panel on this:
+#   * the plugin passes Grafana's MaxDataPoints straight through as the log
+#     entry limit (pkg/plugin/plugin.go), capped at 1000 per page, so the number
+#     of lines returned literally depends on how wide the panel is. Never build
+#     a count, a ratio, or anything completeness-sensitive on it.
+#   * Grafana Alerting is not supported by the plugin at all. Alerts go through
+#     BigQuery, or through a log-based metric read via Cloud Monitoring.
+#
+# It does interpolate dashboard template variables into the LQL string
+# (applyTemplateVariables covers queryText), so `$job` and `$pod` work inline.
+#
+# Same auth story as the other two datasources: the Cloud Run service account
+# via the metadata server, no key file. `gce` is the plugin's name for that.
+apiVersion: 1
+datasources:
+  - name: Cloud Logging
+    type: googlecloud-logging-datasource
+    uid: mlobs-logs
+    jsonData:
+      authenticationType: gce
+      defaultProject: ${MLOBS_PROJECT}

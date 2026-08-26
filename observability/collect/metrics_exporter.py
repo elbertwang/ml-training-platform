@@ -184,7 +184,9 @@ def bq_load(project, dataset, rows):
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(path)
     if result.returncode != 0:
-        sys.exit(f"bq load failed:\n{result.stderr}")
+        # bq reports load errors on stdout, not stderr, so printing only stderr
+        # yields an empty message and hides the real cause.
+        sys.exit(f"bq load failed:\n{result.stdout}\n{result.stderr}")
     print(f"  loaded {len(rows)} rows", flush=True)
 
 

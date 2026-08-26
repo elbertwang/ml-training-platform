@@ -96,6 +96,15 @@ bqq "CREATE TABLE IF NOT EXISTS mlobs_raw.metric_samples (
        ingested_at TIMESTAMP)
      PARTITION BY DATE(point_time) CLUSTER BY metric_type" >/dev/null
 
+# CREATE TABLE IF NOT EXISTS is a no-op once the table exists, so a project
+# whose table was first created by an older metrics_exporter.py keeps that old
+# schema forever and every subsequent `bq load` fails with "Cannot add fields".
+# tpu-for-training hit exactly this: the table predated `ingested_at`. Adding
+# the column is purely additive -- existing rows get NULL -- so reconcile it
+# here rather than making the operator notice a load failure.
+bqq "ALTER TABLE mlobs_raw.metric_samples
+     ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMP" >/dev/null
+
 # fact_event is created with CREATE TABLE IF NOT EXISTS and then filled
 # incrementally, so a model change that adds a column (attempt_uid, say) leaves
 # an old table in place and the INSERT fails on column count. It is fully

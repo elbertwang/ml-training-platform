@@ -46,6 +46,7 @@ STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b"}
 # leave every panel unbound if it fails to auto-select.
 DS = {"type": "grafana-bigquery-datasource", "uid": "mlobs-bq"}
 DS_CM = {"type": "stackdriver", "uid": "mlobs-cm"}
+DS_LOG = {"type": "googlecloud-logging-datasource", "uid": "mlobs-logs"}
 
 
 def cm_series(project, metric_type, aligner="ALIGN_MEAN",
@@ -74,6 +75,35 @@ def cm_series(project, metric_type, aligner="ALIGN_MEAN",
                 "AND", "resource.label.pod_name", "=~", "${pods:regex}",
             ],
         },
+    }
+
+
+def logs(project, lql):
+    """A Cloud Logging query. The raw-text half of the page.
+
+    This datasource deliberately does NOT go through BigQuery. The split is
+    documented in docs/log-routing.md: a human reads text here, a program
+    computes over facts in BigQuery, and neither substitutes for the other.
+    Keeping raw text out of the sink is what stops the model from paying to
+    re-scan lines nobody aggregates.
+
+    Two limits the panels below are built around:
+      * the plugin passes Grafana's MaxDataPoints through as the entry limit
+        (capped at 1000), so the line count depends on panel width. Never put a
+        count or a ratio on one of these panels -- that is fact_event's job.
+      * the plugin cannot alert at all; alerts go through BigQuery.
+
+    Scoping is by pod (or node) name rather than by a job label, because the
+    label spelling differs between job families -- JobSet pods carry
+    jobset-name, falcon pods do not -- while `dim_pod` already knows the exact
+    membership. `${pods:regex}` expands to an anchored alternation RE2 accepts,
+    the same mechanism cm_series() uses.
+    """
+    return {
+        "datasource": DS_LOG,
+        "refId": "A",
+        "projectId": project,
+        "queryText": lql,
     }
 
 
@@ -393,6 +423,70 @@ GROUP BY time, container_name ORDER BY time""")],
     })
     y += 7
 
+    # ---- row 6: raw logs (Cloud Logging, not BigQuery) ----------------------
+    # The "read the text" layer. Everything above this row is BigQuery telling
+    # you *that* something happened and how it ranks; these three panels are
+    # Cloud Logging showing *what it said*, live and unfiltered, with no sink
+    # and no modelling in between. Ordered by the intent map in
+    # docs/channel-map.md section 2: training output, then errors, then the
+    # node/driver layer.
+    panels.append({"type": "row",
+                   "title": "原始日志 Raw logs (Cloud Logging, 实时)",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    log_opts = {"showTime": True, "wrapLogMessage": True,
+                "sortOrder": "Descending", "enableLogDetails": True}
+
+    # L-pod. jax-tpu is the JobSet container name, task the falcon one; a job is
+    # only ever one family, so naming both keeps one panel working for both.
+    panels.append({
+        "type": "logs", "title": "训练主输出（jax-tpu / task 容器）",
+        "description": "MaxText 的 stdout/stderr 原文。条数受面板宽度限制 —— "
+                       "要计数或排序请看上面 BigQuery 的面板。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
+        "datasource": DS_LOG, "options": log_opts,
+        "targets": [logs(project, 'resource.type="k8s_container"\n'
+                                  'resource.labels.pod_name=~"^${pods:regex}$"\n'
+                                  'resource.labels.container_name=("jax-tpu" OR "task")')],
+    })
+    y += 10
+
+    panels.append({
+        "type": "logs", "title": "错误（该 job 全部容器，severity>=ERROR）",
+        "description": "未经 sink 过滤、未按签名折叠的原文。"
+                       "折叠计数看「事件明细」。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
+        "datasource": DS_LOG, "options": log_opts,
+        "targets": [logs(project, 'resource.type="k8s_container"\n'
+                                  'resource.labels.pod_name=~"^${pods:regex}$"\n'
+                                  'severity>=ERROR')],
+    })
+    y += 10
+
+    # L-node. Scoped by node, not pod: these containers run in kube-system on
+    # the job's nodes. The attribution is "on this job's node", NOT "caused by
+    # this job" -- see docs/channel-map.md section 3.2. sidecar-log-collector is
+    # where the TPU driver's own tpu_driver.INFO output surfaces, including the
+    # compile timings that have no metric equivalent anywhere.
+    panels.append({
+        "type": "logs",
+        "title": "TPU 驱动与节点层（该 job 的节点，kube-system）",
+        "description": "tpu-device-plugin / sidecar-log-collector(TPU 驱动日志) / "
+                       "vbar-control-agent。归属语义是「这个 job 的节点上发生的」，"
+                       "不是「这个 job 造成的」。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
+        "datasource": DS_LOG, "options": log_opts,
+        "targets": [logs(project,
+                         'resource.type="k8s_container"\n'
+                         'resource.labels.namespace_name="kube-system"\n'
+                         'labels."compute.googleapis.com/resource_name"=~"^${nodes:regex}$"\n'
+                         'resource.labels.container_name=("tpu-device-plugin" OR '
+                         '"sidecar-log-collector" OR "vbar-control-agent")')],
+    })
+    y += 10
+
     # ---- row 6: attempts ----------------------------------------------------
     panels.append({
         "type": "table", "title": "每次尝试 Attempts",
@@ -471,6 +565,23 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
                           f"AND last_seen  >= TIMESTAMP_MILLIS(${{__from}}) "
                           f"AND first_seen <= TIMESTAMP_MILLIS(${{__to}}) "
                           f"ORDER BY last_seen DESC LIMIT 300",
+                          "format": 1, "location": "US"},
+                "refresh": 2, "sort": 0, "includeAll": False, "multi": True,
+                "current": {},
+            },
+            {
+                # Hidden, same shape as `pods`. The kube-system containers that
+                # carry the TPU driver and board-control logs are not the job's
+                # own pods -- they are per-node daemons -- so the raw-log panel
+                # for that layer has to scope by node instead.
+                "name": "nodes", "type": "query", "label": "Nodes",
+                "datasource": DS, "hide": 2,
+                "query": {"rawQuery": True, "rawSql":
+                          f"SELECT DISTINCT node_name FROM `{project}.mlobs_core.dim_pod` "
+                          f"WHERE job_key = '${{job_key}}' AND node_name IS NOT NULL "
+                          f"AND last_seen  >= TIMESTAMP_MILLIS(${{__from}}) "
+                          f"AND first_seen <= TIMESTAMP_MILLIS(${{__to}}) "
+                          f"LIMIT 300",
                           "format": 1, "location": "US"},
                 "refresh": 2, "sort": 0, "includeAll": False, "multi": True,
                 "current": {},

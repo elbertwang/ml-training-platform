@@ -34,13 +34,46 @@ else
     --display-name="Grafana for ML observability" --quiet >/dev/null
   echo "  created"
 fi
-# jobUser lets it run queries; dataViewer lets it read mlobs_*. It never needs
-# write access -- every dashboard panel is a SELECT.
-for ROLE in roles/bigquery.jobUser roles/bigquery.dataViewer; do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:$SA" --role="$ROLE" --condition=None --quiet >/dev/null
+# Running a query is a project-level permission, so jobUser has to be granted
+# there. Reading data does not: an earlier version also granted
+# roles/bigquery.dataViewer project-wide, which in tpu-for-training would have
+# let the dashboard read every dataset in a customer's production project --
+# including `defaultLink`, i.e. all their logs. Grant read on the two datasets
+# the dashboards actually query instead. Never write: every panel is a SELECT.
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA" --role=roles/bigquery.jobUser \
+  --condition=None --quiet >/dev/null
+echo "  granted bigquery.jobUser (project)"
+
+for DS in mlobs_raw mlobs_core; do
+  # bq update --set_iam_policy has no add primitive, so read-modify-write.
+  POLICY=$(mktemp)
+  bq --project_id="$PROJECT_ID" get-iam-policy --format=prettyjson "${PROJECT_ID}:${DS}" > "$POLICY"
+  python3 - "$POLICY" "$SA" <<'PY'
+import json, sys
+path, sa = sys.argv[1], sys.argv[2]
+policy = json.load(open(path))
+member = f"serviceAccount:{sa}"
+for b in policy.setdefault("bindings", []):
+    if b["role"] == "roles/bigquery.dataViewer":
+        if member not in b.setdefault("members", []):
+            b["members"].append(member)
+        break
+else:
+    policy["bindings"].append({"role": "roles/bigquery.dataViewer", "members": [member]})
+json.dump(policy, open(path, "w"))
+PY
+  bq --project_id="$PROJECT_ID" set-iam-policy "${PROJECT_ID}:${DS}" "$POLICY" >/dev/null
+  rm -f "$POLICY"
+  echo "  granted bigquery.dataViewer on ${DS}"
 done
-echo "  granted bigquery.jobUser + bigquery.dataViewer"
+
+# The Cloud Logging datasource reads the _Default bucket directly. logging.viewer
+# is read-only over log entries and does not include private (Data Access) logs.
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA" --role=roles/logging.viewer \
+  --condition=None --quiet >/dev/null
+echo "  granted logging.viewer (project)"
 
 echo "=== Artifact Registry ==="
 gcloud artifacts repositories describe "$REPO" --location "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1 \

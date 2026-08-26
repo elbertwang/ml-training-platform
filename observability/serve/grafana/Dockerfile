@@ -7,6 +7,13 @@ USER root
 # download -- Cloud Run instances are ephemeral and may have no egress budget
 # for a cold-start download.
 RUN grafana cli plugins install grafana-bigquery-datasource
+# Google's Cloud Logging datasource (Apache-2.0, googlecloud-logging-datasource).
+# This is the "read the raw text" half of every job page; BigQuery is the
+# "compute over it" half. See docs/log-routing.md for why both are required and
+# neither substitutes for the other -- in particular this plugin caps results at
+# the panel's MaxDataPoints and cannot alert, so it is a viewer, not a source of
+# truth. Needs Grafana >= 11.2.0.
+RUN grafana cli plugins install googlecloud-logging-datasource
 USER grafana
 
 COPY provisioning/datasources /etc/grafana/provisioning/datasources
