@@ -26,7 +26,8 @@
 11. [Caveats](#11-caveats)
 12. [指标分布盘点与 Grafana 架构 review](#12-指标分布盘点与-grafana-架构-review)
 13. [指标分级与漏斗：新增指标该放在哪一层](#13-指标分级与漏斗新增指标该放在哪一层)
-    - [13.7 平台实际要用的 24 个指标](#137-漏斗的最后一层平台实际要用的-24-个)
+    - [13.2 前置原则：只依赖原生](#132-一条前置原则只依赖-gcp-与-kubernetes-原生)
+    - [13.9 平台实际要用的 24 个指标](#139-漏斗的最后一层平台实际要用的-24-个)
 
 ---
 
@@ -849,7 +850,25 @@ tools/build_capability_map.py --project <P> --probe-days 7 \
 > pod 就是一条新序列。基数最高的是 `gcsfusecsi/fs_ops_latencies`（59,726）。
 > 这解释了为什么 Grafana 面板必须按 pod 过滤，不能整指标拉。
 
-### 13.2 五层模型
+### 13.2 一条前置原则：只依赖 GCP 与 Kubernetes 原生
+
+分层之前先定一条边界，它决定了什么能进这套模型：
+
+> **信号只取自 GCP 原生和 Kubernetes 原生**：容器日志、K8s 事件与对象、
+> Cloud Monitoring 指标、ML Diagnostics API。**不接入任何客户自建系统的私有
+> 接口或内部指标。**
+
+原因是可移植性。`falcon-jobs` 的任务由蚂蚁自建的 kubemaker 调度器产出，如果模型
+依赖 kubemaker 的 API，换一个客户、或者 kubemaker 自己改版，整套东西就废了。
+而 pod、Job、事件、`kubernetes.io/*` 指标在任何 GKE 集群上都存在。
+
+**认它的标准 K8s 对象，不认它的私有接口** —— 所以 kubemaker 的任务照样通过
+pod label 进入 `dim_pod`（见 §13.6b），但它内部的调度队列、任务状态机我们不碰。
+
+同一条原则也解释了为什么 `dim_pod` 的骨架是 K8s event 而不是容器日志：
+事件是 Kubernetes 保证产生的，容器日志的内容取决于业务代码怎么写。
+
+### 13.3 五层模型
 
 你提的是三层（GCP 原生 / ML run / 算出来的）。实测下来需要拆成五层，因为
 **「原始信号」和「运行元数据」的性质和成本都跟时序指标完全不同**。
@@ -866,9 +885,9 @@ tools/build_capability_map.py --project <P> --probe-days 7 \
 的对象。把它当指标处理会丢掉 `workloadDetails.gke.id` 这种 join key —— 而整个 L4 都
 依赖它。
 
-### 13.3 决策漏斗：新指标放哪
+### 13.4 决策漏斗：新指标放哪
 
-按顺序过闸，第一个命中的就是答案。
+按顺序过闸，第一个命中的就是答案。前提是 §13.2 那条边界已经满足。
 
 ```
 新指标需求
@@ -903,7 +922,7 @@ tools/build_capability_map.py --project <P> --probe-days 7 \
 按字节计费（前 150 MiB 免费，之后 $0.258/MiB）。上面的 $3,150 假设每样本约 30 字节，
 这个假设未经实测核实 —— 但两者相差两个数量级这个结论不依赖精确取值。
 
-### 13.4 用你的例子走一遍
+### 13.5 用你的例子走一遍
 
 > 「历史所有 job 的启动时间、停止时间、占用卡数」
 
@@ -932,7 +951,7 @@ ORDER BY a.first_seen DESC
   `fact_metric` 的 6 小时窗口内没有新样本。接上 Cloud Scheduler 即可。
 - 历史只回溯到回填窗口（生产做了 2 天），上限是 Log Analytics 的 30 天保留。
 
-### 13.5 两处更正
+### 13.6 两处更正
 
 **（一）`compute.googleapis.com/instance/tpu/*` 不是我们要的东西。**
 
@@ -972,7 +991,7 @@ Kubernetes 事件承担。
 
 教训：**探测类工具必须把「查不到」和「查失败」分开**，否则输出看起来永远是合理的。
 
-### 13.6 能力地图找出来的：我们重复造了轮子
+### 13.7 能力地图找出来的：我们重复造了轮子
 
 这是做能力地图最大的收获，也说明「先盘点再开发」这个顺序不能反。
 
@@ -1002,6 +1021,7 @@ resource.labels = entity_type=jobset, entity_name=<JobSet 名>, cluster_name, na
 
 **下一步应该是：JobSet 族直接用原生指标，falcon 族保留我们的代理算法，
 并且用原生指标校准代理算法的偏差。**
+（覆盖率限制见 §13.8。）
 
 **（二）gcsfuse 有 18 个原生指标，我们是从日志里查的那次事故。**
 
@@ -1027,7 +1047,43 @@ prometheus.googleapis.com/kube_jobset_restarts
 路线图里「L3 补 K8s CR 状态 poller」这一条，对 JobSet 而言**不需要写 poller** ——
 kube-state-metrics 已经通过 GMP 采上来了。falcon 的普通 Job 仍需自己处理。
 
-### 13.7 漏斗的最后一层：平台实际要用的 24 个
+### 13.8 决策：falcon / kubemaker 不作为数据源
+
+`falcon-jobs` 里的任务由 **kubemaker** 产出 —— 蚂蚁自己部署的调度系统（类
+Kubeflow）。它有自己的控制面（pod 里能看到 `falcon-agent` 往外部端点发心跳）。
+
+**决策：不接入 kubemaker 的任何内部指标或 API。** 平台的信号基础只用 GCP 原生
+和 Kubernetes 原生：容器日志、K8s 事件、Cloud Monitoring 指标、ML Diagnostics。
+理由是第一性原理 —— 这些在任何 GKE 环境都存在，不依赖客户某一套调度器的实现，
+换个客户或者 kubemaker 改版都不受影响。
+
+kubemaker **作为工作负载来源**当然要认，我们已经通过 pod label
+（`falcon_io/job-id`、`exp-id`、`owner`）把它的任务纳入 `dim_pod`。区别在于：
+认它产出的**标准 K8s 对象**，不认它的**私有接口**。
+
+**但这个决策有一个必须说清楚的代价。**
+
+GKE 的原生训练指标挂在 `k8s_entity` 上，实测 `entity_type` **只有 `jobset`**：
+
+| | 生产 job 数 | 有原生 goodput |
+|---|---|---|
+| falcon（kubemaker 产出的普通 `Job`） | **1,540** | ❌ **0** |
+| jobset（JobSet） | 201 | ✅ |
+| job / deployment | 91 | ❌ |
+
+**85% 的任务拿不到 GKE 原生的 goodput / uptime / startup_duration**，因为
+kubemaker 提交的是普通 `Job` 而不是 `JobSet`。
+
+由此得到一条值得反馈给蚂蚁的建议，成本极低收益很大：
+
+> **如果 kubemaker 改成提交 JobSet 而不是普通 Job，这 1,540 个任务立刻白拿
+> GKE 原生的 goodput、运行时长、启动耗时，我们和他们都不用写一行代码。**
+> JobSet 是 GKE 上多机训练的标准载体，本来也更适合多 slice 场景。
+
+在那之前，falcon 族的 goodput 只能继续用我们的 tensorcore 代理算法（L4），
+并用 JobSet 族的 201 个任务来校准代理算法的偏差。
+
+### 13.9 漏斗的最后一层：平台实际要用的 24 个
 
 167 个有数据 → `kubernetes.io/*` 89 个 → **这个平台真正需要的 24 个**。
 
@@ -1074,7 +1130,7 @@ gcsfusecsi 12 · pod 7 · networking 5 · jobset 4 · node_daemon/node_pool/auto
 **这一层的意义**：新增图表或告警时先在这 24 个里找，找不到再走 §13.3 的漏斗。
 不要因为「GKE 有 89 个指标」就去逐个看。
 
-### 13.8 按这个框架看，现在缺什么
+### 13.10 按这个框架看，现在缺什么
 
 
 
