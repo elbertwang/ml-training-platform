@@ -8,11 +8,27 @@
 # a serverless service scales to zero, costs nothing idle, and can be deleted
 # without touching a cluster that other people share.
 #
-# Auth model: **IAP is the only authentication layer.** Grafana itself runs
-# anonymous with the Admin role. Two layers would both want the `Authorization`
-# header and fight over it, and a second password buys nothing when IAP already
-# proves a Google identity. Access is granted per user with
-# roles/iap.httpsResourceAccessor.
+# Auth model: **plain Cloud Run IAM.** The service is private
+# (--no-allow-unauthenticated) and viewers reach it through
+# `gcloud run services proxy`, authenticated by roles/run.invoker. Grafana
+# itself runs anonymous with the Admin role -- a second password buys nothing
+# once Google has already proved the identity, and two layers would both want
+# the `Authorization` header and fight over it.
+#
+# IAP would be nicer -- a plain shareable URL instead of a local proxy -- and
+# ENABLE_IAP=1 turns it on. It is NOT the default because it needs a
+# prerequisite this script cannot satisfy: the project must have a configured
+# OAuth consent screen, and the IAP OAuth Admin API that used to create one was
+# permanently shut down on 2026-03-19. Without it IAP fails with "Error code 9"
+# (failed OAuth redirect) and the consent screen has to be configured by hand in
+# the Cloud Console.
+#
+# The trap, learned the hard way in tpu-for-training: **enabling IAP breaks the
+# proxy too.** IAP intercepts every request to the service, including
+# IAM-authenticated ones, and rejects them with "Invalid IAP credentials:
+# Invalid JWT audience" because it expects an audience of the IAP OAuth client
+# that does not exist. So a half-configured IAP leaves no way in at all, which
+# is exactly what happened: both access paths failed for the same single cause.
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID must be set}"
@@ -22,6 +38,7 @@ REPO="${REPO:-mlobs}"
 SA_NAME="${SA_NAME:-mlobs-grafana}"
 SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/grafana:v1"
+ENABLE_IAP="${ENABLE_IAP:-0}"   # see the auth-model note above before turning this on
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${CLOUDSDK_AUTH_ACCESS_TOKEN:?export CLOUDSDK_AUTH_ACCESS_TOKEN=\$(gcloud auth application-default print-access-token)}"
@@ -85,56 +102,76 @@ gcloud builds submit "$HERE" --project "$PROJECT_ID" --region "$REGION" \
   --tag "$IMAGE" --quiet >/dev/null
 echo "  ${IMAGE}"
 
-echo "=== IAP prerequisites ==="
-# `--iap` provisions the IAP service agent itself, but on a project where IAP
-# has never run that provisioning races: the first deploy into tpu-for-training
-# printed "Setting IAP service agent...warning" followed by "Setting IAM policy
-# failed", left the service's invoker policy empty, and every browser hit came
-# back "You don't have access" despite a correct-looking IAP IAM policy.
-# Creating the identity up front and granting the invoker before deploying
-# makes the deploy step's own attempt a no-op instead of a race.
-gcloud beta services identity create --service=iap.googleapis.com \
-  --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
-IAP_SA="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
-echo "  ${IAP_SA}"
+IAP_FLAG="--no-iap"
+if [[ "$ENABLE_IAP" == "1" ]]; then
+  IAP_FLAG="--iap"
+  echo "=== IAP prerequisites ==="
+  # `--iap` provisions the IAP service agent itself, but on a project where IAP
+  # has never run that provisioning races: the first deploy into tpu-for-training
+  # printed "Setting IAP service agent...warning" followed by "Setting IAM policy
+  # failed", left the service's invoker policy empty, and every browser hit came
+  # back "You don't have access" despite a correct-looking IAP IAM policy.
+  # Creating the identity up front makes the deploy's own attempt a no-op.
+  gcloud beta services identity create --service=iap.googleapis.com \
+    --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+  PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+  IAP_SA="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
+  echo "  ${IAP_SA}"
+fi
 
 echo "=== Deploy ==="
 deploy_service() {
   gcloud beta run deploy "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --set-env-vars "MLOBS_PROJECT=${PROJECT_ID},GF_AUTH_ANONYMOUS_ENABLED=true,GF_AUTH_ANONYMOUS_ORG_ROLE=Admin,GF_AUTH_DISABLE_LOGIN_FORM=true,GF_AUTH_BASIC_ENABLED=false" \
-    --iap --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
+    "$IAP_FLAG" --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
     --min-instances 0 --max-instances 2 --timeout 300 --quiet >/dev/null
 }
 deploy_service
 
-# The service has to exist before its resource-level IAM can be set, so the
-# invoker grant lands after the first deploy -- and IAP only picks up a new
-# invoker on the next revision. Google's own docs say to redeploy if you
-# granted Invoker and still get permission denied. Do it automatically rather
-# than leaving a service that looks deployed but rejects every request.
-if gcloud run services get-iam-policy "$SERVICE" --project "$PROJECT_ID" \
-     --region "$REGION" --format="value(bindings.members)" 2>/dev/null \
-     | grep -q "$IAP_SA"; then
-  echo "  IAP agent already had run.invoker"
-else
-  # Needs roles/run.admin; roles/editor does NOT include run.services.setIamPolicy.
-  gcloud run services add-iam-policy-binding "$SERVICE" --project "$PROJECT_ID" \
-    --region "$REGION" --member="serviceAccount:${IAP_SA}" \
-    --role=roles/run.invoker --quiet >/dev/null
-  echo "  granted run.invoker to the IAP agent; redeploying so IAP picks it up"
-  deploy_service
+if [[ "$ENABLE_IAP" == "1" ]]; then
+  # The service must exist before its resource-level IAM can be set, so the
+  # invoker grant lands after the first deploy -- and IAP only picks up a new
+  # invoker on the next revision. Google's own docs say to redeploy if you
+  # granted Invoker and still get permission denied.
+  if gcloud run services get-iam-policy "$SERVICE" --project "$PROJECT_ID" \
+       --region "$REGION" --format="value(bindings.members)" 2>/dev/null \
+       | grep -q "$IAP_SA"; then
+    echo "  IAP agent already had run.invoker"
+  else
+    # Needs roles/run.admin; roles/editor does NOT include run.services.setIamPolicy.
+    gcloud run services add-iam-policy-binding "$SERVICE" --project "$PROJECT_ID" \
+      --region "$REGION" --member="serviceAccount:${IAP_SA}" \
+      --role=roles/run.invoker --quiet >/dev/null
+    echo "  granted run.invoker to the IAP agent; redeploying so IAP picks it up"
+    deploy_service
+  fi
 fi
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
       --region "$REGION" --format="value(status.url)")
 
 echo "=== Access ==="
-echo "  Grant each viewer:"
-echo "    gcloud beta iap web add-iam-policy-binding --project ${PROJECT_ID} \\"
-echo "      --resource-type=cloud-run --service=${SERVICE} --region=${REGION} \\"
-echo "      --member=user:SOMEONE@example.com --role=roles/iap.httpsResourceAccessor"
-echo
-echo "  Dashboard:      ${URL}/d/mlobs-job"
-echo "  One job's page: ${URL}/d/mlobs-job?var-job_key=<JOB>"
+if [[ "$ENABLE_IAP" == "1" ]]; then
+  echo "  Grant each viewer:"
+  echo "    gcloud beta iap web add-iam-policy-binding --project ${PROJECT_ID} \\"
+  echo "      --resource-type=cloud-run --service=${SERVICE} --region=${REGION} \\"
+  echo "      --member=user:SOMEONE@example.com --role=roles/iap.httpsResourceAccessor"
+  echo
+  echo "  Dashboard:      ${URL}/d/mlobs-job"
+  echo "  One job's page: ${URL}/d/mlobs-job?var-job_key=<JOB>"
+else
+  echo "  Grant each viewer:"
+  echo "    gcloud run services add-iam-policy-binding ${SERVICE} \\"
+  echo "      --project ${PROJECT_ID} --region ${REGION} \\"
+  echo "      --member=user:SOMEONE@example.com --role=roles/run.invoker"
+  echo
+  echo "  Each viewer then runs, on a machine where they have logged in to gcloud:"
+  echo "    gcloud run services proxy ${SERVICE} \\"
+  echo "      --project ${PROJECT_ID} --region ${REGION} --port 8080"
+  echo
+  echo "  Dashboard:      http://localhost:8080/d/mlobs-job"
+  echo "  One job's page: http://localhost:8080/d/mlobs-job?var-job_key=<JOB>"
+  echo
+  echo "  (${URL} rejects anonymous requests with 403 -- that is expected.)"
+fi

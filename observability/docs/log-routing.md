@@ -27,7 +27,7 @@
 
 | | **BigQuery** `grafana-bigquery-datasource` | **Cloud Logging** `googlecloud-logging-datasource` |
 |---|---|---|
-| 状态 | **已装** | **已装**（2026-08-26，`serve/grafana/Dockerfile`） |
+| 状态 | **已装** | **已装**（2026-08-26，`serve/grafana/Dockerfile`，生产实测取到实时训练输出） |
 | 许可 | Apache-2.0（Grafana Labs） | Apache-2.0（GoogleCloudPlatform），v1.7.0，24 stars，2026-08-17 仍在更新 |
 | Grafana 版本要求 | 12.4.3 在支持范围内 | 需要 ≥ 11.2.0，我们是 12.4.3 ✓ |
 | 认证 | `gce`（Cloud Run SA，无密钥文件） | 同样支持 `gce` ✓ |

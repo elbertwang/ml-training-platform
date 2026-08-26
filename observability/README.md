@@ -453,16 +453,30 @@ observability/
 | 环境 | 采集 | 建模 | 展示 | 定时刷新 |
 |---|---|---|---|---|
 | `tpu-launchpad-playground` | ✅ | ✅ 干净重装验证通过 | ✅ Grafana | 未部署 |
-| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana + IAP | ✅ 每 30 分钟 |
+| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana（IAM + proxy） | ✅ 每 30 分钟 |
 
 ### 5.1 生产部署（2026-08-26）
 
 | 组件 | 名称 | 说明 |
 |---|---|---|
-| Grafana | Cloud Run `mlobs-grafana` | IAP 是唯一认证层；Grafana 本身匿名 Admin，两层认证会争 `Authorization` 头 |
+| Grafana | Cloud Run `mlobs-grafana` | **私有服务 + Cloud Run IAM**，通过 `gcloud run services proxy` 访问。Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
 | 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 C） |
 | 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
 | 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
+
+**访问方式**：服务私有（匿名请求返回 403），查看者用 `roles/run.invoker` 授权后本地起代理：
+
+```bash
+gcloud run services proxy mlobs-grafana \
+  --project tpu-for-training --region us-central1 --port 8080
+# → http://localhost:8080/d/mlobs-job
+```
+
+**为什么不是 IAP。** 原计划用 IAP，实际部署时发现它需要项目配置 OAuth 同意屏幕，
+而创建它的 IAP OAuth Admin API 已在 **2026-03-19 永久关停**，只能在 Console 手工配。
+没配的表现是 `Error code 9`（OAuth 重定向失败）。更麻烦的是：**IAP 一旦开启会拦截
+所有请求，包括 IAM 直连的**，报 `Invalid IAP credentials: Invalid JWT audience`
+—— 所以半配好的 IAP 会让两条路同时不通。`ENABLE_IAP=1` 可以开回去，前提是先配好同意屏幕。
 
 **权限是按最小面给的，并且实测验证过**（以各自 SA 身份在 Cloud Run 里实跑）：
 
@@ -731,9 +745,12 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 | `kubernetes.io/anthos/*` 占 kubernetes.io 3,486 个里的 3,360 个 | 不排除会让能力地图候选集爆到 4,406，探测打爆读配额 |
 | `compute.googleapis.com/instance/tpu/*` 是 `gce_instance` 粒度 | 只有 instance_id/zone，无 cluster/namespace/pod，归不到 job |
 | `tpu.googleapis.com/*` 是 Cloud TPU VM 表面 | GKE 托管的 TPU 在这里几乎没数据（`interruption_count` 全项目 2 条序列） |
-| Cloud Run 与 Grafana 都要 `Authorization` 头 | 两层认证必然冲突 —— IAP 唯一认证层，Grafana 跑匿名 |
-| 组织策略禁止 `allUsers` | Cloud Run 公开访问不可能，只能 IAP |
-| `gcloud run services proxy` 需要组件管理器 | 本 VM 上装不了，走 IAP 浏览器访问 |
+| Cloud Run 与 Grafana 都要 `Authorization` 头 | 两层认证必然冲突 —— 认证只放一层，Grafana 跑匿名 Admin |
+| 组织策略禁止 `allUsers` | Cloud Run 不可能公开访问，必须走认证 |
+| **IAP 需要 OAuth 同意屏幕，而创建它的 API 已于 2026-03-19 关停** | 没配就报 `Error code 9`（OAuth 重定向失败），只能在 Console 手工配 |
+| **IAP 开启后会拦截 IAM 直连请求** | 报 `Invalid IAP credentials: Invalid JWT audience` —— 半配好的 IAP 让浏览器和 proxy **两条路同时不通**，而且两边症状不同，很容易误判成两个问题 |
+| `gcloud run deploy --iap` 在首次启用 IAP 的项目上会竞态 | 输出里只是一行 `Setting IAP service agent...warning`，但结果是 invoker 策略为空、浏览器报 `You don't have access`，而 IAP 的 IAM 策略看起来完全正确 |
+| `gcloud run services proxy` 需要 `cloud-run-proxy` 组件 | apt 版 gcloud 用 `sudo apt-get install google-cloud-cli-cloud-run-proxy`；且用户 ADC 签不出 ID token（`unsupported credentials type`），要在 `gcloud auth login` 过的机器上跑 |
 
 ### 工具自身
 
