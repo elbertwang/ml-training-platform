@@ -126,6 +126,9 @@ severity 分布（1 天）：`WARNING` **9.33 亿（75%）** · `INFO` 2.97 亿 
 **只有 `log_id` 和 `severity` 能有效裁剪。** 建模层因此只读这两个可裁剪切片和
 sink，从不扫全量 payload。
 
+> 一个 job 到底能查到哪些日志渠道（实测 27 个日志 + 4 个 API），以及算法同学
+> 「我想知道 X 该看哪儿」的导航表，见 [`docs/channel-map.md`](docs/channel-map.md)。
+
 ### 2.4 保留与降采样
 
 | 数据 | 总保留 | 原分辨率窗口 | 之后 |
@@ -555,11 +558,12 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 | # | 事项 | 影响 | 状态 |
 |---|---|---|---|
-| 1 | **`sidecar-log-collector` exclusion filter** | 省约 **$5,000/月**。274M 行/天的 `Log collector starting, polling for new files...`，零信息量 | ⏳ 待决策（改生产日志路由，被排除的日志永久丢失） |
+| 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [`docs/channel-map.md`](docs/channel-map.md) §4 | ❌ 已撤回 |
 | 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | ⏳ 待决策 |
 | 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效**（filter 要求 `pod_name=~"-worker-"`，falcon pod 名对不上） | ⏳ 待决策（改现有生产告警） |
 | 4 | **kubemaker 改用 JobSet** | 1,540 个任务白拿 GKE 原生 goodput | 🚧 **TBD —— 蚂蚁正在做** |
 | 5 | Cluster Director 单 run 深链接路径 | 一站式页面上该按钮只到项目级 | ⏳ 需在浏览器里实测一次 |
+| 7 | **All Capacity 拓扑与健康** | 可拿到 block / sub-block / OCS 健康（`degradedInfraCount`）与 VM 的 `physical_host_topology`，能回答「变慢的 rank 是不是都在同一个 block」 | 🚧 **TBD —— 集群尚未启用该模式** |
 | 6 | 废弃 771 个 `custom.googleapis.com` 描述符 | 省 $0，仅整洁 | ⏳ 低优先级，脚本已备 |
 
 ---
