@@ -15,6 +15,9 @@
 
 ---
 
+> **这份是实测底数**——一个 jobset 到底能查到多少渠道。
+> **每个渠道该留 Cloud Logging 还是建模进 BigQuery，见 [`log-routing.md`](log-routing.md)。**
+
 ## 1. 全渠道清单（按归属层级）
 
 一个 job 相关的信号分布在 **27 个日志渠道 + 4 个 API/指标渠道**。关键区别不是

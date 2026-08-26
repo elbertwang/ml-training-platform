@@ -29,6 +29,7 @@
 10. [Caveats](#10-caveats)
 11. [附录 A：踩过的坑](#11-附录-a踩过的坑)
 12. [附录 B：监控渠道分类地图](docs/channel-map.md) ← 单独文档
+13. [附录 C：日志路由方案](docs/log-routing.md) ← 单独文档
 
 ---
 
@@ -739,3 +740,16 @@ API 渠道**，按归属层级（pod / node / cluster / api）组织，并附一
   的转发，含每小时 2.4 万次的**编译耗时**，无任何指标替代
 - **§5 ML Diagnostics 是三条子渠道** —— `WORKLOAD_TERMINATION` **只在日志流**里
   （12 小时 376 个），REST API 五个月一次都没返回过；另有 10 秒粒度的性能日志完全未采集
+
+---
+
+## 13. 附录 C：日志路由方案
+
+单独成文：**[`docs/log-routing.md`](docs/log-routing.md)**
+
+附录 B 是**实测底数**（一个 jobset 到底有多少渠道），附录 C 是**路由决策**
+（每个渠道留 Cloud Logging 还是建模进 BigQuery，为什么，现在做到哪一步）。
+
+判据一句话：**人要「读」的原文留 Cloud Logging，机器要「算」的事实进 BigQuery。**
+两者在 Grafana 里是同一个页面的上下两层，用同一个 `$job` 变量联动，缺任何一层
+页面都不成立。附录 C 还列出了 10 条待决事项（TBD-1 ~ TBD-10）和落地顺序。
