@@ -566,8 +566,12 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
                           f"AND first_seen <= TIMESTAMP_MILLIS(${{__to}}) "
                           f"ORDER BY last_seen DESC LIMIT 300",
                           "format": 1, "location": "US"},
-                "refresh": 2, "sort": 0, "includeAll": False, "multi": True,
-                "current": {},
+                # includeAll + All preselected. Without it Grafana picks only
+                # the FIRST value of a multi-value query variable on load, so
+                # the Cloud Monitoring panels would silently chart one pod out
+                # of sixty-four -- a plausible-looking chart that is wrong.
+                "refresh": 2, "sort": 0, "includeAll": True, "multi": True,
+                "current": {"selected": True, "text": ["$__all"], "value": ["$__all"]},
             },
             {
                 # Hidden, same shape as `pods`. The kube-system containers that
@@ -583,8 +587,12 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
                           f"AND first_seen <= TIMESTAMP_MILLIS(${{__to}}) "
                           f"LIMIT 300",
                           "format": 1, "location": "US"},
-                "refresh": 2, "sort": 0, "includeAll": False, "multi": True,
-                "current": {},
+                # includeAll + All preselected. Without it Grafana picks only
+                # the FIRST value of a multi-value query variable on load, so
+                # the Cloud Monitoring panels would silently chart one pod out
+                # of sixty-four -- a plausible-looking chart that is wrong.
+                "refresh": 2, "sort": 0, "includeAll": True, "multi": True,
+                "current": {"selected": True, "text": ["$__all"], "value": ["$__all"]},
             },
         ]},
         "panels": panels,

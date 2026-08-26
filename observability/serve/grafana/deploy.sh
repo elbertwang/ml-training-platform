@@ -81,12 +81,20 @@ for DS in mlobs_raw mlobs_core; do
   echo "  granted dataViewer (READER) on ${DS}"
 done
 
-# The Cloud Logging datasource reads the _Default bucket directly. logging.viewer
-# is read-only over log entries and does not include private (Data Access) logs.
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$SA" --role=roles/logging.viewer \
-  --condition=None --quiet >/dev/null
-echo "  granted logging.viewer (project)"
+# The other two datasources read GCP directly rather than through BigQuery, and
+# each needs its own project-level read scope. Missing monitoring.viewer is
+# invisible until someone opens the dashboard: the Cloud Monitoring panels just
+# render "No data", exactly as they would for a job with no metrics. That is how
+# it survived the first production deploy unnoticed.
+#   logging.viewer     Cloud Logging datasource; read-only over log entries,
+#                      and does not include private (Data Access) logs
+#   monitoring.viewer  Cloud Monitoring datasource; timeSeries.list
+for ROLE in roles/logging.viewer roles/monitoring.viewer; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:$SA" --role="$ROLE" \
+    --condition=None --quiet >/dev/null
+done
+echo "  granted logging.viewer + monitoring.viewer (project)"
 
 echo "=== Artifact Registry ==="
 gcloud artifacts repositories describe "$REPO" --location "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1 \

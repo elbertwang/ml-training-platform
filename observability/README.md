@@ -482,7 +482,7 @@ gcloud run services proxy mlobs-grafana \
 
 | SA | 项目级 | 数据集级 |
 |---|---|---|
-| `mlobs-grafana` | `bigquery.jobUser`、`logging.viewer` | `mlobs_raw` / `mlobs_core` **READER** |
+| `mlobs-grafana` | `bigquery.jobUser`、`logging.viewer`、`monitoring.viewer` | `mlobs_raw` / `mlobs_core` **READER** |
 | `mlobs-refresh` | `bigquery.jobUser`、`monitoring.viewer`、`hypercomputecluster.viewer` | `mlobs_raw` / `mlobs_core` **WRITER** |
 | `mlobs-scheduler` | — | 只有 `mlobs-refresh` job 上的 `run.invoker` |
 
@@ -750,6 +750,9 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 | **IAP 需要 OAuth 同意屏幕，而创建它的 API 已于 2026-03-19 关停** | 没配就报 `Error code 9`（OAuth 重定向失败），只能在 Console 手工配 |
 | **IAP 开启后会拦截 IAM 直连请求** | 报 `Invalid IAP credentials: Invalid JWT audience` —— 半配好的 IAP 让浏览器和 proxy **两条路同时不通**，而且两边症状不同，很容易误判成两个问题 |
 | `gcloud run deploy --iap` 在首次启用 IAP 的项目上会竞态 | 输出里只是一行 `Setting IAP service agent...warning`，但结果是 invoker 策略为空、浏览器报 `You don't have access`，而 IAP 的 IAM 策略看起来完全正确 |
+| **数据源缺权限时面板只显示 No data** | Grafana SA 起初没有 `monitoring.viewer`，Cloud Monitoring 面板全空 —— 和「这个 job 确实没指标」长得一模一样，不会报错。每加一个数据源都要单独授它自己的读权限 |
+| **Cloud Monitoring 的 filter 不支持 `=~`** | 直接调 v3 REST 会报 `syntax error ... token '=~'`；正则要写 `monitoring.regex.full_match()`。Grafana 的 stackdriver 插件会自动翻译，所以面板里写 `=~` 是对的 —— 但拿这个语法去手工验证会得到误导性的报错 |
+| **multi 变量默认只选第一个值** | `pods` 变量 `includeAll: false` 时 Grafana 只选中第一个 pod，Live 面板会画出 64 分之 1 —— 图能出来，但是错的，比 No data 更危险 |
 | `gcloud run services proxy` 需要 `cloud-run-proxy` 组件 | apt 版 gcloud 用 `sudo apt-get install google-cloud-cli-cloud-run-proxy`；且用户 ADC 签不出 ID token（`unsupported credentials type`），要在 `gcloud auth login` 过的机器上跑 |
 
 ### 工具自身
