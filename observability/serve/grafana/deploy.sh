@@ -45,27 +45,23 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --condition=None --quiet >/dev/null
 echo "  granted bigquery.jobUser (project)"
 
+# Dataset-level ACL rather than IAM: `bq get-iam-policy` on a dataset needs an
+# allowlist tpu-for-training does not have. The dataset resource's `access`
+# array is the supported path, and READER there is exactly dataViewer.
+#
+# `bq update --source` replaces the dataset config wholesale, so this is a
+# read-modify-write that then verifies no pre-existing entry disappeared. On a
+# customer's production dataset, silently dropping someone else's grant would
+# be a much worse bug than the over-broad permission this replaced.
 for DS in mlobs_raw mlobs_core; do
-  # bq update --set_iam_policy has no add primitive, so read-modify-write.
-  POLICY=$(mktemp)
-  bq --project_id="$PROJECT_ID" get-iam-policy --format=prettyjson "${PROJECT_ID}:${DS}" > "$POLICY"
-  python3 - "$POLICY" "$SA" <<'PY'
-import json, sys
-path, sa = sys.argv[1], sys.argv[2]
-policy = json.load(open(path))
-member = f"serviceAccount:{sa}"
-for b in policy.setdefault("bindings", []):
-    if b["role"] == "roles/bigquery.dataViewer":
-        if member not in b.setdefault("members", []):
-            b["members"].append(member)
-        break
-else:
-    policy["bindings"].append({"role": "roles/bigquery.dataViewer", "members": [member]})
-json.dump(policy, open(path, "w"))
-PY
-  bq --project_id="$PROJECT_ID" set-iam-policy "${PROJECT_ID}:${DS}" "$POLICY" >/dev/null
-  rm -f "$POLICY"
-  echo "  granted bigquery.dataViewer on ${DS}"
+  BEFORE=$(mktemp); PATCH=$(mktemp)
+  bq --project_id="$PROJECT_ID" show --format=prettyjson "${PROJECT_ID}:${DS}" > "$BEFORE"
+  "${HERE}/dataset_reader.py" --mode=patch --before="$BEFORE" --out="$PATCH" --sa="$SA"
+  bq --project_id="$PROJECT_ID" update --source "$PATCH" "${PROJECT_ID}:${DS}" >/dev/null
+  bq --project_id="$PROJECT_ID" show --format=prettyjson "${PROJECT_ID}:${DS}" \
+    | "${HERE}/dataset_reader.py" --mode=verify --before="$BEFORE" --sa="$SA"
+  rm -f "$BEFORE" "$PATCH"
+  echo "  granted dataViewer (READER) on ${DS}"
 done
 
 # The Cloud Logging datasource reads the _Default bucket directly. logging.viewer
