@@ -26,6 +26,7 @@
 11. [Caveats](#11-caveats)
 12. [指标分布盘点与 Grafana 架构 review](#12-指标分布盘点与-grafana-架构-review)
 13. [指标分级与漏斗：新增指标该放在哪一层](#13-指标分级与漏斗新增指标该放在哪一层)
+    - [13.7 平台实际要用的 24 个指标](#137-漏斗的最后一层平台实际要用的-24-个)
 
 ---
 
@@ -812,7 +813,7 @@ PromQL 时，再上 B。
 第 12 节回答了「现有指标在哪」。这一节回答**「以后要加一个指标，该放在哪」** ——
 一个可以照着走的判定流程，而不是每次重新讨论。
 
-### 13.1 漏斗：从 9,594 到 209
+### 13.1 漏斗：从 9,594 到 167
 
 `tools/build_capability_map.py` 对生产项目实测（探测窗口 1 天）：
 
@@ -1026,7 +1027,55 @@ prometheus.googleapis.com/kube_jobset_restarts
 路线图里「L3 补 K8s CR 状态 poller」这一条，对 JobSet 而言**不需要写 poller** ——
 kube-state-metrics 已经通过 GMP 采上来了。falcon 的普通 Job 仍需自己处理。
 
-### 13.7 按这个框架看，现在缺什么
+### 13.7 漏斗的最后一层：平台实际要用的 24 个
+
+167 个有数据 → `kubernetes.io/*` 89 个 → **这个平台真正需要的 24 个**。
+
+89 个里没有噪声，都是官方 GKE 指标表里的东西（container 29 · node 26 ·
+gcsfusecsi 12 · pod 7 · networking 5 · jobset 4 · node_daemon/node_pool/autoscaler
+各 2）。但训练可观测性只用得上其中一小部分。
+
+**要用的（★ = 已确认有数据但我们还没接）**
+
+| 指标（省略 `kubernetes.io/` 前缀） | 用途 | 状态 |
+|---|---|---|
+| `container/accelerator/tensorcore_utilization` | goodput 计算输入 | ✅ 已用（导入 BQ）|
+| `container/accelerator/memory_used` / `memory_total` | HBM | ✅ Grafana 直读 |
+| `container/accelerator/duty_cycle` | 芯片占用 | ✅ Grafana 直读 |
+| `logging.googleapis.com/log_entry_count` | 日志风暴 | ✅ 已用（导入 BQ）|
+| ★ `jobset/proxy_runtime_goodput` | **原生 goodput** | 未接，见 §13.6 |
+| ★ `jobset/scheduling_goodput` | 调度 goodput | 未接 |
+| ★ `jobset/uptime` / `jobset/startup_duration` | 运行时长 / 启动耗时 | 未接 |
+| ★ `node_pool/interruption_count` | **中断归因**，带 `interruption_type` / `interruption_reason`。实测：AutoResize 48、AutoUpgrade 38、HW/SW Maintenance 6 | 未接 |
+| ★ `node_pool/accelerator/startup_duration` | TPU 节点池启动耗时 | 未接 |
+| ★ `node/latencies/startup` | 节点启动延迟 | 未接 |
+| ★ `pod/latencies/pod_first_ready` | Pod 就绪延迟（排队→可用）| 未接 |
+| ★ `container/restart_count` | 崩溃循环检测 | 未接 |
+| ★ `container/uptime` | 容器存活时长 | 未接 |
+| ★ `container/multislice/network/collective_end_to_end_latencies` | **多 slice 通信延迟 —— hang 诊断的核心** | 未接 |
+| ★ `container/multislice/network/dcn_transfer_latencies` | 跨 slice DCN | 未接 |
+| ★ `container/multislice/accelerator/{host_to_device,device_to_host}_transfer_latencies` | 主机↔芯片传输 | 未接 |
+| ★ `container/multislice/network/grpc_tcp_{delivery_rates,min_round_trip_times}` | ICI/TCP 质量 | 未接 |
+| ★ `gcsfusecsi/file_cache_read_count`（带 `cache_hit`） | **数据管道缓存命中** | 未接 |
+| ★ `gcsfusecsi/fs_ops_error_count`（带 `fs_error_category`） | **gcsfuse 报错** —— 8-24 事故本可直接告警 | 未接 |
+| ★ `gcsfusecsi/gcs_request_latencies` | GCS 读延迟 | 未接 |
+
+**明确不要的（65 个）**
+
+| 族 | 数量 | 为什么不要 |
+|---|---|---|
+| `container/{cpu,memory,ephemeral_storage}/{request,limit}_*` | 15 | 容量规划指标，和训练效率无关 |
+| `container/{cpu,memory}/*_utilization`、`page_fault_count`、`swap_used_bytes` | 8 | host 侧资源，ML Diagnostics 的 analyzer 已覆盖 |
+| `node/{cpu,memory,ephemeral_storage,pid,network}/*` | 20 | 节点容量，非 job 归属 |
+| `pod/volume/*`、`pod/network/*` | 5 | 与 TPU 训练无关 |
+| `networking/dns/node_local_dns/*` | 5 | DNS，非训练路径 |
+| `node_daemon/*`、`autoscaler/*`、`node/logs/input_bytes` 等 | 12 | 平台自身运维 |
+
+**这一层的意义**：新增图表或告警时先在这 24 个里找，找不到再走 §13.3 的漏斗。
+不要因为「GKE 有 89 个指标」就去逐个看。
+
+### 13.8 按这个框架看，现在缺什么
+
 
 
 | 缺口 | 该在哪层 | 现状 |
@@ -1034,5 +1083,5 @@ kube-state-metrics 已经通过 GMP 采上来了。falcon 的普通 Job 仍需�
 | loss / MFU / step_time 时序 | L4（从 L0 的 `completed step` 行 ETL）| 数据已在 sink（33.5 万行/天），未建 `fact_step` |
 | 预留利用率（按 job） | — | ❌ **无解**。唯一带 `reservation_id` 的指标是 VM 粒度，归不到 job。集群级可以算，per-job 不行 |
 | TPU 硬件健康 | L1 直读 | `chip_state` / `infra_health` 未用，但同样是 VM 粒度，只能做集群级视图 |
-| 自动修复 MTTR | L4（`dim_job_attempt` + `fact_event`） | 原料齐，未建 |
-| 排队等待时长 | L4（需要 L3 补 Kueue Workload 对象） | poller 未做 |
+| 自动修复 MTTR | L4 | 原料更齐了：`node_pool/interruption_count` 带 `interruption_type`/`interruption_reason`，加上 `dim_job_attempt` 即可 |
+| 排队等待时长 | L1 + L4 | `pod/latencies/pod_first_ready` 是现成的；Kueue 级别的还需 L3 poller |
