@@ -154,12 +154,12 @@
 |---|---|---|---|---|
 | **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 07-27 起共 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，我们一个都没有** | 「历史所有 job 的启动/停止/占卡数」这个核心目标现在只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 把 30 天补齐？** |
 | **TBD-2** | **`dim_pod` 会遗忘** | `CREATE OR REPLACE` + 30 天滚动窗口 | 就算补齐，第 31 天旧数据照样掉。**维度表不能滚动重建，必须 MERGE 累积** | 无（确定要改） |
-| ~~TBD-3~~ | ~~`refresh.sh` 未排期~~ | **已完成 2026-08-26**：`schedule/` 打包成 Cloud Run job `mlobs-refresh`，Cloud Scheduler 每 30 分钟触发。实测无人值守跑通，各表滞后 1–2 分钟 | — | 周期取 30 分钟而非 15：实时值现在直接来自 Cloud Monitoring 和 Cloud Logging 面板，BQ 只承担历史与聚合，半小时不衰减。15 分钟 ~$65/月，30 分钟 ~$32 |
+| ~~TBD-3~~ | ~~`refresh.sh` 未排期~~ | **已完成 2026-08-26**：`schedule/` 打包成 Cloud Run job `mlobs-refresh`，Cloud Scheduler 每 30 分钟触发。实测无人值守跑通，各表滞后 1–2 分钟。**并发保护**：窗口替换已事务化，且 entrypoint 检测到有其它执行在跑就跳过（实测生效） | — | 周期取 30 分钟而非 15：实时值现在直接来自 Cloud Monitoring 和 Cloud Logging 面板，BQ 只承担历史与聚合，半小时不衰减。15 分钟 ~$65/月，30 分钟 ~$32 |
 | **TBD-4** | **L-node 一跳归属完全没实现** | 21 个 L-node 渠道，`fact_event` 里一个都没接 | 17,710 条 `OOMKilling` 全部落不到 job | 无（确定要做） |
 | **TBD-5** | **falcon-jobs 27% 事件归不到 job** | 12,211 未归属 / 33,597 已归属。其中 `SuccessfulCreate` 4,273 条其实可归属——pod 名在正文里（`Created pod: falcon-job-...`），但 `involvedObject` 是 Job 不是 Pod | 事件进了时间轴却落不到任何 job | 无（确定要做） |
 | **TBD-6** | **autoscaler 归属：定性** | 3,365 条 100% 未归属。`channel-map.md` 说它是 L-cluster「不归属，按时间对齐」，但 falcon 有专属节点池，理论上能归属 | 两种说法现在都写在文档里，自相矛盾 | **选一个：实现 node-pool 归属，还是承认只做时间对齐** |
 | **TBD-7** | **`sidecar-log-collector` 在 crash-loop** | `BackOff` **18,155 次**，全在这个容器 | TPU 驱动日志本身可能是断续的。**在修好之前，从它抽出的任何指标都有采样缺口** | 是客户侧问题还是配置问题，要先定位 |
-| **TBD-8** | **sink 误收了系统日志** | `fluentbit` 70,199 + `kube_proxy` 447 + `GCEGuestAgent` 456 | 存储浪费，且污染 L1 | 无（加排除条件即可） |
+| **TBD-8** | **sink 误收了系统日志** | `fluentbit` 70,199 + `kube_proxy` 447 + `GCEGuestAgent` 456，另加 `run_googleapis_com_stdout`（平台自己的 Cloud Run 日志） | 存储浪费。**不污染模型** —— `app_error` 要求 `resource.labels.pod_name IS NOT NULL`，Cloud Run 日志没有这个字段；`dim_pod` 只收 `log_id IN ('stdout','stderr','events')` | 无（加排除条件即可） |
 | ~~TBD-9~~ | ~~Cloud Logging 数据源未装~~ | **已完成 2026-08-26**：`googlecloud-logging-datasource` 已装，dashboard 增加「原始日志」一行三个面板（训练主输出 / 错误 / TPU 驱动与节点层）。以 Grafana SA 实测取到实时训练输出 | — | — |
 | **TBD-10** | **要不要用排除过滤器省 ingest** | 未做 | sink + `_Default` 排除**能**免掉 $0.50/GiB。**但一旦排除，L0 就不成立了**——省了 ingest 就换不回 Logs Explorer 能查 | 对 TPU 驱动日志这种量级（一个 64-pod jobset 3 小时 250 万行）值不值得 |
 

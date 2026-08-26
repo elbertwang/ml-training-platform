@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_metric
 PARTITION BY DATE(point_time)
 CLUSTER BY job_key, metric_type;
 
+-- Same reason as fact_event: overlapping refreshes must not expose the gap
+-- between DELETE and INSERT. See model/04_fact_event.sql.
+BEGIN TRANSACTION;
+
 DELETE FROM mlobs_core.fact_metric
 WHERE point_time >= metric_window_start AND point_time < metric_window_end;
 
@@ -99,6 +103,8 @@ WHERE s.point_time >= metric_window_start AND s.point_time < metric_window_end;
 -- metric_samples, and an aggregate cannot be pruned by a downstream
 -- job_key filter. As a view, job_attempts("x") scanned 46.6 MB; as a
 -- CLUSTER BY job_key table it scans what one job needs.
+COMMIT TRANSACTION;
+
 CREATE OR REPLACE TABLE mlobs_core.fact_goodput
 CLUSTER BY job_key
 AS

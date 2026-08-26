@@ -53,7 +53,9 @@ fi
 # to the IAM policy API: binding a role seconds after `create` fails with
 # "Service account ... does not exist", which is a propagation delay, not a
 # real error.
-for ROLE in roles/bigquery.jobUser roles/monitoring.viewer roles/hypercomputecluster.viewer; do
+# run.viewer is for the entrypoint's own overlap check -- it lists the job's
+# executions to decide whether another run is already in flight.
+for ROLE in roles/bigquery.jobUser roles/monitoring.viewer roles/hypercomputecluster.viewer roles/run.viewer; do
   for ATTEMPT in 1 2 3 4 5 6; do
     if gcloud projects add-iam-policy-binding "$PROJECT_ID" \
          --member="serviceAccount:$SA" --role="$ROLE" \
@@ -64,7 +66,7 @@ for ROLE in roles/bigquery.jobUser roles/monitoring.viewer roles/hypercomputeclu
     sleep 10
   done
 done
-echo "  granted jobUser + monitoring.viewer + hypercomputecluster.viewer (project)"
+echo "  granted jobUser + monitoring.viewer + hypercomputecluster.viewer + run.viewer (project)"
 
 # WRITER on the two datasets, via the dataset access array for the same reason
 # serve/grafana/deploy.sh uses it: bq get-iam-policy needs an allowlist this
@@ -108,7 +110,7 @@ echo "=== Cloud Run job ==="
 # genuinely broken run should surface rather than loop.
 ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE"
       --service-account "$SA"
-      --set-env-vars "PROJECT_ID=${PROJECT_ID},MLDIAG_LOCATIONS=${MLDIAG_LOCATIONS},METRIC_HOURS=1"
+      --set-env-vars "PROJECT_ID=${PROJECT_ID},REGION=${REGION},MLDIAG_LOCATIONS=${MLDIAG_LOCATIONS},METRIC_HOURS=1"
       --memory 2Gi --cpu 1 --task-timeout 45m --max-retries 1 --quiet)
 if gcloud run jobs describe "$JOB" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs update "$JOB" "${ARGS[@]}" >/dev/null

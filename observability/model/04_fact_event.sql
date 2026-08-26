@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_event
 PARTITION BY DATE(event_time)
 CLUSTER BY job_key, source;
 
+-- Atomic, because two refreshes can overlap. Cloud Scheduler fires every 30
+-- minutes whether or not the previous Cloud Run execution has finished, and
+-- Cloud Run jobs allow concurrent executions. Observed in production on
+-- 2026-08-26: two runs overlapped for two minutes and a reader between one
+-- run's DELETE and its INSERT saw fact_event with 273 rows instead of 3.1M.
+-- Inside a transaction the window swap is invisible until it commits, and two
+-- concurrent writers get a serialisation error rather than interleaving.
+BEGIN TRANSACTION;
+
 DELETE FROM mlobs_core.fact_event
 WHERE event_time >= window_start AND event_time < window_end;
 
@@ -218,3 +227,5 @@ JOIN mlobs_core.dim_pod p
 WHERE s.point_time >= window_start AND s.point_time < window_end
   AND s.metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
   AND s.value < 5.0;
+
+COMMIT TRANSACTION;
