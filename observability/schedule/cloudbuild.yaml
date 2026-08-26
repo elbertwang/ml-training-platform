@@ -1,0 +1,13 @@
+# Build the refresh image from the observability root.
+#
+# `gcloud builds submit --tag` always looks for a Dockerfile at the root of the
+# build context, and the image needs collect/ and model/, which live one level
+# above schedule/. Naming the Dockerfile explicitly here is what lets the
+# context be the root without copying files around at deploy time.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '-f', 'schedule/Dockerfile', '-t', '${_IMAGE}', '.']
+images:
+  - '${_IMAGE}'
+options:
+  logging: CLOUD_LOGGING_ONLY

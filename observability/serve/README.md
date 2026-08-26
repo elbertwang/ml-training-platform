@@ -10,7 +10,7 @@
 | 刷新 | 秒级可配 | 默认缓存 12 小时 |
 | 告警 | 内置（BQ 数据也能告警） | 无 |
 | 运维 | 一个 Cloud Run 服务 | 零 |
-| 给无 GCP 权限的人看 | 要授权 IAP | 最方便 |
+| 给无 GCP 权限的人看 | 做不到 —— 需要 `run.invoker` | 最方便 |
 | 部署 | `grafana/deploy.sh` | 手工点，见 `LOOKER_STUDIO.md` |
 
 **选 Grafana 做主力的理由是结构性的，不是偏好**：这个项目已经开了 GMP
@@ -19,52 +19,72 @@
 
 ---
 
-## Grafana（已部署并验证）
+## Grafana（生产已部署并验证）
 
 ```bash
 export CLOUDSDK_AUTH_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
-PROJECT_ID=tpu-launchpad-playground ./grafana/deploy.sh
+PROJECT_ID=tpu-for-training ./grafana/deploy.sh
 ```
 
-一条命令做完：服务账号 + BQ 授权、Artifact Registry、生成 dashboard JSON、
-Cloud Build 构建镜像、部署 Cloud Run（带 IAP）。
+一条命令做完：服务账号 + 三个数据源各自的读权限、Artifact Registry、
+生成 dashboard JSON、Cloud Build 构建镜像、部署 Cloud Run。
 
 ### 访问
 
-```
-https://<service-url>/d/mlobs-job                        # 带下拉选 job
-https://<service-url>/d/mlobs-job?var-job_key=<JOB>      # 一站式 URL
-```
-
-给人开权限：
+服务是私有的（`--no-allow-unauthenticated`），匿名请求返回 403。给人开权限：
 
 ```bash
-gcloud beta iap web add-iam-policy-binding --project <P> \
-  --resource-type=cloud-run --service=mlobs-grafana --region=us-central1 \
-  --member="user:someone@example.com" --role="roles/iap.httpsResourceAccessor"
+gcloud run services add-iam-policy-binding mlobs-grafana \
+  --project <P> --region us-central1 \
+  --member="user:someone@example.com" --role="roles/run.invoker"
 ```
+
+查看者在自己**登录过 gcloud 的机器**上起代理：
+
+```bash
+gcloud run services proxy mlobs-grafana --project <P> --region us-central1 --port 8080
+# http://localhost:8080/d/mlobs-job                    带下拉选 job
+# http://localhost:8080/d/mlobs-job?var-job_key=<JOB>  一站式 URL
+```
+
+首次会提示装 `cloud-run-proxy` 组件。apt 版 gcloud 要用
+`sudo apt-get install google-cloud-cli-cloud-run-proxy`。
 
 ### 认证模型
 
-**IAP 是唯一的认证层，Grafana 本身跑匿名（Admin 角色）。**
+**Cloud Run IAM 是唯一的认证层，Grafana 本身跑匿名（Admin 角色）。**
 
 不是偷懒 —— 两层认证会抢同一个 `Authorization` 头（实测：curl 带 Cloud Run 的
-Bearer 再带 Grafana 的 basic auth，后者会覆盖前者，必然 403）。而且 IAP 已经
-证明了 Google 身份，再要一个 Grafana 密码不增加任何安全性，只增加一个要保管的
-秘密。
+Bearer 再带 Grafana 的 basic auth，后者会覆盖前者，必然 403）。Google 已经证明了
+身份，再要一个 Grafana 密码不增加安全性，只增加一个要保管的秘密。
 
 组织策略 `constraints/iam.allowedPolicyMemberDomains` 禁止 `allUsers`，所以公开
 访问本来也不可能。
 
-### 已验证
+**为什么不是 IAP。** IAP 能给出一个可以直接发给人的 URL，比本地代理好用，
+`ENABLE_IAP=1` 也留着。但它要求项目配置 OAuth 同意屏幕，而创建同意屏幕的
+IAP OAuth Admin API 已于 **2026-03-19 永久关停**，现在只能在 Cloud Console 里手工配。
+没配的表现是 `Error code 9`（OAuth 重定向失败）。
+
+更要命的是第二层：**IAP 一旦开启，会拦截所有到达服务的请求，包括 IAM 认证的直连**，
+报 `Invalid IAP credentials: Invalid JWT audience`（它要求 audience 是那个不存在的
+OAuth 客户端）。所以半配好的 IAP 会让浏览器和代理**两条路同时不通**，而且两边报错
+完全不同，看起来像两个独立的问题。要开 IAP，先在 Console 里把同意屏幕配好。
+
+### 已验证（生产，以 Grafana 服务账号身份实跑）
 
 | 项 | 结果 |
 |---|---|
-| Provisioning | datasource `mlobs-bq`（`gce` 认证，无密钥文件）+ dashboard `mlobs-job` 自动加载 |
-| BigQuery 查询 | ✅ Cloud Run 上实测返回真实数据 |
-| TVF 查询 | ✅ `job_timeline('vllm-tpu')` 返回 tpu_idle / app_error / k8s_event 三源交叉 |
-| 变量下拉 | ✅ 从 `job_hub` 拉出真实 job 列表 |
-| IAP | ✅ 未认证访问返回 302 跳登录 |
+| Provisioning | 三个数据源自动加载：`mlobs-bq` / `mlobs-cm` / `mlobs-logs`（都用 `gce` 认证，无密钥文件） |
+| BigQuery | ✅ `job_overview(<job>)` 返回真实数据 |
+| Cloud Monitoring | ✅ tensorcore / memory_used / log_entry_count 各 4 序列 48 点 |
+| Cloud Logging | ✅ 取到实时 `completed step` 行 |
+| 最小权限 | ✅ 查 `defaultLink` **被拒绝** —— 读权限只在 `mlobs_raw` / `mlobs_core` |
+| 匿名访问 | ✅ 403 |
+
+> **数据源缺权限时面板只显示 No data，不报错。** Cloud Monitoring 面板全空了一阵，
+> 原因是 SA 少了 `monitoring.viewer` —— 和「这个 job 确实没指标」长得一模一样。
+> 每加一个数据源，都要单独授它自己的读权限。
 
 ### 成本
 

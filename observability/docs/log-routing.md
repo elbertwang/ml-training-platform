@@ -88,7 +88,8 @@
 | `fact_metric` 全量重建 | 每次重算全历史 | $88/月 |
 | `pod_labels_backfill` | 19 亿行日志表达 8,746 个 pod | $10,151/月 |
 
-三次都已修复。第三次的详情见 `collect/dedupe_pod_labels_backfill.sh`。
+三次都已修复。第三次的修复脚本是一次性的，两个项目都跑过之后已删除；
+经过见 git 历史 `3ed91f1`。
 
 **同一个渠道可以同时属于 L0 和 L2。** 渠道不是分类单位，问题才是。最典型的是 TPU 驱动日志：250 万行原文留 L0，只把每小时 23,927 条 `END_TO_END stage duration` 抽成 L2 的编译耗时。
 
@@ -146,21 +147,34 @@
 
 ---
 
-## 4. 待解决（TBD）
+## 4. 已完成
 
-按严重度排。**P0 三条互相咬合，要一起做，单做任何一条都会被另外两条抵消。**
+生产环境 `tpu-for-training`，2026-08-26。
+
+| # | 事项 | 结果 |
+|---|---|---|
+| TBD-3 | `refresh.sh` 排期 | Cloud Run job `mlobs-refresh` + Cloud Scheduler，每 30 分钟。各表滞后 1–2 分钟。**并发保护双层**：窗口替换是 BigQuery 事务（读者永远看不到 DELETE 和 INSERT 之间的空档），entrypoint 检测到有其它执行在跑就 exit 0 跳过。两者都实测触发过 |
+| TBD-9 | Cloud Logging 数据源 | 已装，dashboard 多了「原始日志」一行三个面板（训练主输出 / 错误 / TPU 驱动与节点层），以 Grafana SA 实测取到实时训练输出 |
+
+周期为什么是 30 分钟而不是 15：实时值现在直接来自 Cloud Monitoring 和 Cloud Logging
+面板，BigQuery 只承担历史、排名和跨渠道 join，半小时不衰减。`dim_pod` 仍是 3.6 GB
+全量重建，周期就是主要成本——15 分钟约 $65/月，30 分钟约 $32。TBD-2 做完还能再降。
+
+---
+
+## 5. 待解决（TBD）
+
+按严重度排。**P0 两条互相咬合，要一起做，单做任何一条都会被另一条抵消。**
 
 | # | 事项 | 现状 | 影响 | 需要决策 |
 |---|---|---|---|---|
 | **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 07-27 起共 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，我们一个都没有** | 「历史所有 job 的启动/停止/占卡数」这个核心目标现在只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 把 30 天补齐？** |
 | **TBD-2** | **`dim_pod` 会遗忘** | `CREATE OR REPLACE` + 30 天滚动窗口 | 就算补齐，第 31 天旧数据照样掉。**维度表不能滚动重建，必须 MERGE 累积** | 无（确定要改） |
-| ~~TBD-3~~ | ~~`refresh.sh` 未排期~~ | **已完成 2026-08-26**：`schedule/` 打包成 Cloud Run job `mlobs-refresh`，Cloud Scheduler 每 30 分钟触发。实测无人值守跑通，各表滞后 1–2 分钟。**并发保护**：窗口替换已事务化，且 entrypoint 检测到有其它执行在跑就跳过（实测生效） | — | 周期取 30 分钟而非 15：实时值现在直接来自 Cloud Monitoring 和 Cloud Logging 面板，BQ 只承担历史与聚合，半小时不衰减。15 分钟 ~$65/月，30 分钟 ~$32 |
 | **TBD-4** | **L-node 一跳归属完全没实现** | 21 个 L-node 渠道，`fact_event` 里一个都没接 | 17,710 条 `OOMKilling` 全部落不到 job | 无（确定要做） |
 | **TBD-5** | **falcon-jobs 27% 事件归不到 job** | 12,211 未归属 / 33,597 已归属。其中 `SuccessfulCreate` 4,273 条其实可归属——pod 名在正文里（`Created pod: falcon-job-...`），但 `involvedObject` 是 Job 不是 Pod | 事件进了时间轴却落不到任何 job | 无（确定要做） |
 | **TBD-6** | **autoscaler 归属：定性** | 3,365 条 100% 未归属。`channel-map.md` 说它是 L-cluster「不归属，按时间对齐」，但 falcon 有专属节点池，理论上能归属 | 两种说法现在都写在文档里，自相矛盾 | **选一个：实现 node-pool 归属，还是承认只做时间对齐** |
 | **TBD-7** | **`sidecar-log-collector` 在 crash-loop** | `BackOff` **18,155 次**，全在这个容器 | TPU 驱动日志本身可能是断续的。**在修好之前，从它抽出的任何指标都有采样缺口** | 是客户侧问题还是配置问题，要先定位 |
 | **TBD-8** | **sink 误收了系统日志** | `fluentbit` 70,199 + `kube_proxy` 447 + `GCEGuestAgent` 456，另加 `run_googleapis_com_stdout`（平台自己的 Cloud Run 日志） | 存储浪费。**不污染模型** —— `app_error` 要求 `resource.labels.pod_name IS NOT NULL`，Cloud Run 日志没有这个字段；`dim_pod` 只收 `log_id IN ('stdout','stderr','events')` | 无（加排除条件即可） |
-| ~~TBD-9~~ | ~~Cloud Logging 数据源未装~~ | **已完成 2026-08-26**：`googlecloud-logging-datasource` 已装，dashboard 增加「原始日志」一行三个面板（训练主输出 / 错误 / TPU 驱动与节点层）。以 Grafana SA 实测取到实时训练输出 | — | — |
 | **TBD-10** | **要不要用排除过滤器省 ingest** | 未做 | sink + `_Default` 排除**能**免掉 $0.50/GiB。**但一旦排除，L0 就不成立了**——省了 ingest 就换不回 Logs Explorer 能查 | 对 TPU 驱动日志这种量级（一个 64-pod jobset 3 小时 250 万行）值不值得 |
 
 ### 客户侧 TBD（不在我们控制范围）
@@ -174,13 +188,9 @@
 
 ---
 
-## 5. 落地顺序
+## 6. 落地顺序
 
 ```
-已完成（2026-08-26，生产环境 tpu-for-training）
-  TBD-3  refresh.sh 排期 —— Cloud Run job + Scheduler，每 30 分钟
-  TBD-9  Cloud Logging 数据源 —— Grafana 已装，原文层可用
-
 第一批（互相咬合，一起做）
   TBD-2  dim_pod 改 MERGE 累积
   TBD-1  回填补到 30 天         ← 等 TBD-2 先改完，否则白花 $56
@@ -197,5 +207,5 @@
   TBD-10 排除过滤器的取舍
 ```
 
-TBD-9 已经插队做完了 —— 它不依赖任何其它条目，装个插件加个数据源，「看原文」这一层就立刻可用。
-剩下的第一批是现在的瓶颈：历史只有 3 天，且每次重建还会再忘一点。
+第一批是现在的瓶颈：历史只有 3 天，而且每次重建还会再忘一点。先做 TBD-2 再做 TBD-1，
+顺序反了就是白花 $56。

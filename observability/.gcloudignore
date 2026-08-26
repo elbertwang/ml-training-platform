@@ -1,0 +1,9 @@
+# The refresh image needs collect/ and model/ and nothing else. Keeping the
+# upload small also keeps the build context free of the dashboards' JSON and
+# the docs, which change far more often than the image does.
+.git
+.gitignore
+docs
+serve
+tools
+*.md

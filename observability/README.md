@@ -326,7 +326,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 **删掉它们省 $0** —— Metric Volume 按写入字节计费，停写的描述符不产生费用。唯一
 收益是 Metrics Explorer 少 771 个死选项，代价是不可逆且带走历史。
-`collect/deprecate_legacy_metrics.sh` 提供了这个操作（**默认 dry-run**，且会先确认
+`tools/deprecate_legacy_metrics.sh` 提供了这个操作（**默认 dry-run**，且会先确认
 样本 7 天无数据）。**未执行，由你决定。**
 
 ---
@@ -414,33 +414,54 @@ JobSet **65 → 201**。
 
 ### 4.5 目录结构
 
+三个部署脚本，各管一层，因为它们的爆炸半径和重部署频率都不同。
+`./deploy.sh` 默认把三层都装好，`STAGES=data` 只装数据面。
+
 ```
 observability/
 ├── README.md                       本文档
-├── deploy.sh                       安装：dataset + sink + 全部 model
-├── refresh.sh                      增量刷新（放进 Scheduler）
+├── deploy.sh                       ① 数据面：dataset + sink + model + 首次填充
+│                                     默认还会调用 ② ③（STAGES 控制）
+├── refresh.sh                      增量刷新的实际逻辑（本地跑或被 ② 调用）
+├── lib/
+│   ├── gcp.sh                      三个部署脚本共用：建 SA、授角色（带传播重试）、
+│   │                                 授 dataset ACL（读-改-写 + 校验没丢条目）
+│   └── dataset_access.py           dataset ACL 的读-改-写与校验
 ├── collect/
 │   ├── create_log_sink.sh          精选 Log Router sink
 │   ├── mldiag_poller.py            MLDiag REST → mlobs_raw（多 region）
 │   ├── metrics_exporter.py         Monitoring → metric_samples（幂等）
-│   ├── backfill_pod_labels.sh      一次性：sink 之前的 pod→job 映射
-│   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run）
+│   └── backfill_pod_labels.sh      一次性：sink 建立之前的 pod→job 映射
 ├── model/
 │   ├── build_v_sink_logs.py        动态发现 sink 表
 │   ├── 00_functions.sql            api_ts()、job_key_from_pod_fallback()
 │   ├── 01_dim_pod.sql              ★ 骨架
 │   ├── 02_dim_mlrun.sql            MLDiag run + 事件
 │   ├── 03_dim_job.sql              dim_job_attempt + dim_job
-│   ├── 04_fact_event.sql           统一事件流（6 源）
+│   ├── 04_fact_event.sql           统一事件流（6 源，窗口替换是事务）
 │   ├── 05_dim_tpu_price.sql        TPU 价格维表
-│   ├── 06_fact_goodput.sql         fact_metric + fact_goodput
+│   ├── 06_fact_goodput.sql         fact_metric + fact_goodput（同上）
 │   └── 07_views.sql                job_hub + 4 个 TVF + 深链接
-├── serve/
-│   ├── README.md                   展示层选型与部署
+├── schedule/                       ② 定时刷新：Cloud Run job + Cloud Scheduler
+│   ├── deploy.sh
+│   ├── Dockerfile                  google/cloud-sdk:slim + collect/ + model/
+│   ├── cloudbuild.yaml             构建上下文是 observability 根
+│   └── entrypoint.sh               取 token；检测到并发执行就跳过
+├── serve/                          ③ 展示层
+│   ├── README.md                   选型与部署
 │   ├── LOOKER_STUDIO.md            对外分享面（可选）
 │   └── grafana/                    Cloud Run 上的 Grafana
-└── tools/
-    └── build_capability_map.py     生成能力地图
+│       ├── deploy.sh
+│       ├── build_dashboard.py      dashboard JSON 由代码生成
+│       └── provisioning/           三个数据源：BQ / Cloud Monitoring / Cloud Logging
+├── tools/
+│   ├── build_capability_map.py     生成能力地图
+│   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run；看清注释再跑）
+└── docs/
+    ├── channel-map.md              附录 B：渠道实测底数
+    ├── log-routing.md              附录 C：路由决策 + 待办
+    └── capability-map-prod.md      指标能力地图
+
 ```
 
 ---
@@ -452,8 +473,11 @@ observability/
 
 | 环境 | 采集 | 建模 | 展示 | 定时刷新 |
 |---|---|---|---|---|
-| `tpu-launchpad-playground` | ✅ | ✅ 干净重装验证通过 | ✅ Grafana | 未部署 |
-| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana（IAM + proxy） | ✅ 每 30 分钟 |
+| `tpu-launchpad-playground` | ✅ | ✅ | ✅ Grafana | ✅ 每 30 分钟 |
+| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana | ✅ 每 30 分钟 |
+
+两个环境跑的是同一份代码、同一条 `./deploy.sh`。playground 是重构后的验证环境
+—— 每次改部署脚本都先在那儿完整跑一遍，再动生产。
 
 ### 5.1 生产部署（2026-08-26）
 
@@ -604,16 +628,21 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 | 4 | **kubemaker 改用 JobSet** | 1,540 个任务白拿 GKE 原生 goodput | 🚧 **TBD —— 蚂蚁正在做** |
 | 5 | Cluster Director 单 run 深链接路径 | 一站式页面上该按钮只到项目级 | ⏳ 需在浏览器里实测一次 |
 | 7 | **All Capacity 拓扑与健康** | 可拿到 block / sub-block / OCS 健康（`degradedInfraCount`）与 VM 的 `physical_host_topology`，能回答「变慢的 rank 是不是都在同一个 block」 | 🚧 **TBD —— 集群尚未启用该模式** |
-| 6 | 废弃 771 个 `custom.googleapis.com` 描述符 | 省 $0，仅整洁 | ⏳ 低优先级，脚本已备 |
+| 6 | 废弃 771 个 `custom.googleapis.com` 描述符 | 省 $0，仅整洁 | ⏳ 低优先级，`tools/deprecate_legacy_metrics.sh` 已备 |
 
 ---
 
 ## 8. 路线图
 
-**P0 — 生产化**（不做的话整套是快照，会慢慢变旧）
-- [ ] `refresh.sh` 进 Cloud Run Job + Cloud Scheduler
-- [ ] Grafana 部署到生产 `tpu-for-training`
-- [ ] 验证 Grafana 告警（BQ 插件自带 alerting，需确认是否要 `min-instances=1`）
+**P0 — 生产化** ✅ **已完成 2026-08-26**
+- [x] `refresh.sh` 进 Cloud Run Job + Cloud Scheduler（每 30 分钟，含并发保护）
+- [x] Grafana 部署到生产 `tpu-for-training`（三个数据源实测都取到数）
+- [ ] 验证 Grafana 告警（BQ 插件自带 alerting，需确认是否要 `min-instances=1`；
+      Cloud Logging 数据源**不支持**告警，见附录 C §1.2）
+
+**P0' — 历史深度**（现在最大的缺口，见附录 C 的 TBD-1 / TBD-2）
+- [ ] `dim_pod` 改成 MERGE 累积 —— 现在是 30 天滚动全量重建，会遗忘
+- [ ] 回填补到 30 天 —— 现在只有 3 天，`_Default` 里有 30 天（一次性约 $56）
 
 **P1 — 接入已确认存在的原生信号**（§3.5 的 ★）
 - [ ] `node_pool/interruption_count` —— 中断归因，补 ML Diag 4.5% 可操作率的洞
@@ -645,20 +674,57 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 ```bash
 export CLOUDSDK_AUTH_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
+```
 
-# 安装（幂等）
-PROJECT_ID=tpu-launchpad-playground ./deploy.sh
+### 全新安装（幂等，装完就在跑）
 
-# 首次回填
-collect/mldiag_poller.py --project <P> --locations us-central1[,...] --backfill
-collect/metrics_exporter.py --project <P> --hours 12
-DAYS=7 PROJECT_ID=<P> collect/backfill_pod_labels.sh   # sink 建立前的 pod→job 映射
+```bash
+PROJECT_ID=<P> ./deploy.sh
+```
 
-# 增量（放进 Cloud Scheduler，建议 5–15 分钟）
+它按顺序做：建 dataset（跟随 `defaultLink` 的 location）→ 建 sink → 等 sink 出数
+→ 跑全部 model → 首次填充（MLDiag 回填 + 12 小时指标 + 建事实表）
+→ 部署定时刷新 → 部署 Grafana。
+
+只装其中一层：
+
+```bash
+STAGES=data     PROJECT_ID=<P> ./deploy.sh          # 只装数据面
+STAGES=schedule PROJECT_ID=<P> ./deploy.sh          # 只装定时刷新
+PROJECT_ID=<P> ./schedule/deploy.sh                 # 等价，直接调
+PROJECT_ID=<P> ./serve/grafana/deploy.sh            # 只重部署 dashboard
+```
+
+### 看 dashboard
+
+服务是私有的，匿名访问返回 403。查看者需要 `roles/run.invoker`：
+
+```bash
+gcloud run services add-iam-policy-binding mlobs-grafana \
+  --project <P> --region us-central1 \
+  --member=user:SOMEONE@example.com --role=roles/run.invoker
+```
+
+然后在自己**登录过 gcloud 的机器**上：
+
+```bash
+gcloud run services proxy mlobs-grafana --project <P> --region us-central1 --port 8080
+# → http://localhost:8080/d/mlobs-job?var-job_key=<JOB>
+```
+
+### 日常运维
+
+```bash
+# 手工刷一次（定时任务是每 30 分钟）
 PROJECT_ID=<P> MLDIAG_LOCATIONS=us-central1 ./refresh.sh
+gcloud run jobs execute mlobs-refresh --project <P> --region us-central1
 
-# 展示层
-PROJECT_ID=<P> serve/grafana/deploy.sh
+# 暂停 / 恢复定时刷新
+gcloud scheduler jobs pause  mlobs-refresh --project <P> --location us-central1
+gcloud scheduler jobs resume mlobs-refresh --project <P> --location us-central1
+
+# 补 sink 建立之前的 pod→job 映射（会扫 defaultLink，先看脚本里的成本说明）
+DAYS=30 PROJECT_ID=<P> ./collect/backfill_pod_labels.sh
 ```
 
 ### 常用查询

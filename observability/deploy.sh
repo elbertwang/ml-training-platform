@@ -10,13 +10,26 @@
 #
 # The model SQL uses unqualified dataset names and is deployed with
 # `bq --project_id=$PROJECT_ID`, so the same files serve every project.
+#
+# This installs the data plane only -- datasets, sink, model. The two things
+# that keep it alive and make it visible are separate, because they have
+# different blast radii and are redeployed on different cadences:
+#
+#   schedule/deploy.sh     the refresh on Cloud Scheduler
+#   serve/grafana/deploy.sh  the dashboard on Cloud Run
+#
+# STAGES controls which of the three run. Default is all of them; use
+# STAGES=data to install just this one.
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-tpu-for-training}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WAIT_SINK_SECONDS="${WAIT_SINK_SECONDS:-300}"
+source "${HERE}/lib/gcp.sh"
 
-: "${CLOUDSDK_AUTH_ACCESS_TOKEN:?export CLOUDSDK_AUTH_ACCESS_TOKEN=\$(gcloud auth application-default print-access-token)}"
+PROJECT_ID="${PROJECT_ID:-tpu-for-training}"
+WAIT_SINK_SECONDS="${WAIT_SINK_SECONDS:-300}"
+STAGES="${STAGES:-data,schedule,serve}"
+
+require_token
 
 bqq() { bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "$@"; }
 
@@ -138,10 +151,31 @@ for f in "${HERE}"/model/*.sql; do
   fi
 done
 
+# A sink is not retroactive, so a fresh install only knows about pods that have
+# logged since it was created. Seed the model from what already exists before
+# handing over to the scheduler.
+echo "=== First fill ==="
+"${HERE}/collect/mldiag_poller.py"    --project "$PROJECT_ID" \
+                                      --locations "${MLDIAG_LOCATIONS:-us-central1}" --backfill
+"${HERE}/collect/metrics_exporter.py" --project "$PROJECT_ID" --hours "${FIRST_FILL_HOURS:-12}"
+bqq < "${HERE}/model/04_fact_event.sql" >/dev/null
+bqq < "${HERE}/model/06_fact_goodput.sql" >/dev/null
+bqq < "${HERE}/model/07_views.sql" >/dev/null
+echo "  seeded"
+
+if [[ ",${STAGES}," == *",schedule,"* ]]; then
+  echo
+  PROJECT_ID="$PROJECT_ID" bash "${HERE}/schedule/deploy.sh"
+fi
+
+if [[ ",${STAGES}," == *",serve,"* ]]; then
+  echo
+  PROJECT_ID="$PROJECT_ID" bash "${HERE}/serve/grafana/deploy.sh"
+fi
+
 cat <<EOF
 
-Done. Next:
-  ${HERE}/collect/mldiag_poller.py    --project ${PROJECT_ID} --locations <regions> --backfill
-  ${HERE}/collect/metrics_exporter.py --project ${PROJECT_ID} --hours 12
-  bq --project_id=${PROJECT_ID} query --use_legacy_sql=false < ${HERE}/model/04_fact_event.sql
+Done.
+  Pods older than the sink:  DAYS=30 PROJECT_ID=${PROJECT_ID} ${HERE}/collect/backfill_pod_labels.sh
+  Ad-hoc refresh:            PROJECT_ID=${PROJECT_ID} ${HERE}/refresh.sh
 EOF

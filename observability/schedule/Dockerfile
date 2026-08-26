@@ -8,7 +8,8 @@ FROM google/cloud-sdk:slim
 WORKDIR /app
 COPY collect /app/collect
 COPY model   /app/model
-COPY refresh.sh entrypoint.sh /app/
+COPY refresh.sh /app/
+COPY schedule/entrypoint.sh /app/
 RUN chmod +x /app/refresh.sh /app/entrypoint.sh /app/collect/*.py
 
 ENTRYPOINT ["/app/entrypoint.sh"]
