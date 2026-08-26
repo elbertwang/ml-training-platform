@@ -450,22 +450,46 @@ observability/
 同一份代码部署到两个项目，**不改动任何现有配置** —— 摄入、`_Default` bucket、
 11 个 dashboard、7 条告警原样未动。
 
-| 环境 | 采集 | 建模 | 展示 |
-|---|---|---|---|
-| `tpu-launchpad-playground` | ✅ | ✅ 干净重装验证通过 | ✅ Grafana |
-| `tpu-for-training` | ✅ | ✅ | 未部署 |
+| 环境 | 采集 | 建模 | 展示 | 定时刷新 |
+|---|---|---|---|---|
+| `tpu-launchpad-playground` | ✅ | ✅ 干净重装验证通过 | ✅ Grafana | 未部署 |
+| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana + IAP | ✅ 每 30 分钟 |
 
-### 5.1 生产模型层规模
+### 5.1 生产部署（2026-08-26）
+
+| 组件 | 名称 | 说明 |
+|---|---|---|
+| Grafana | Cloud Run `mlobs-grafana` | IAP 是唯一认证层；Grafana 本身匿名 Admin，两层认证会争 `Authorization` 头 |
+| 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 C） |
+| 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
+| 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
+
+**权限是按最小面给的，并且实测验证过**（以各自 SA 身份在 Cloud Run 里实跑）：
+
+| SA | 项目级 | 数据集级 |
+|---|---|---|
+| `mlobs-grafana` | `bigquery.jobUser`、`logging.viewer` | `mlobs_raw` / `mlobs_core` **READER** |
+| `mlobs-refresh` | `bigquery.jobUser`、`monitoring.viewer`、`hypercomputecluster.viewer` | `mlobs_raw` / `mlobs_core` **WRITER** |
+| `mlobs-scheduler` | — | 只有 `mlobs-refresh` job 上的 `run.invoker` |
+
+早期版本在项目级授 `bigquery.dataViewer`，那会让 dashboard 读到客户生产项目里
+**所有**数据集（含 `defaultLink` 全量日志）。已收窄，并用一次实跑确认
+`mlobs-grafana` 查 `defaultLink` 会被拒绝。
+
+### 5.2 生产模型层规模
 
 | 表 | 行数 |
 |---|---|
-| `fact_event` | 1,524,740 |
-| `dim_pod` | 8,812 |
-| `fact_mlrun_event` | 4,276 |
-| `dim_job_attempt` | 1,951 |
-| `dim_job` / `job_hub` | 1,832 |
+| `fact_event` | 3,104,603 |
+| `job_hub` | 2,955 |
+| `dim_pod` | 12,275 |
+| `fact_metric` | 302,126 |
+| `mldiag_runs`（原始） | 15,220 |
 
-### 5.2 延迟预算（实测）
+> **历史深度只有 3 天**（`dim_pod` 最早 08-23），而 `_Default` 有 30 天可用。
+> 这是当前最大的缺口，见附录 C 的 TBD-1 / TBD-2。
+
+### 5.3 延迟预算（实测）
 
 | 环节 | 实测 |
 |---|---|
@@ -479,7 +503,7 @@ observability/
 sink **不是**瓶颈，是全链路最快的一环。文档里「sink 有时间限制」指的是
 **不回溯**（只导出创建之后的日志），不是延迟。
 
-### 5.3 展示层每次刷新的扫描量
+### 5.4 展示层每次刷新的扫描量
 
 | TVF | 扫描量 | 优化前 |
 |---|---|---|
@@ -489,7 +513,7 @@ sink **不是**瓶颈，是全链路最快的一环。文档里「sink 有时间
 | `job_metrics(job_key)` | 1.68 MB | 45.6 MB |
 | **一次页面加载** | **~2.3 MB** | ~185 MB |
 
-### 5.4 平台产出的实例
+### 5.5 平台产出的实例
 
 **RCA** —— `falcon-job-jaytje07es`，2026-08-24：
 

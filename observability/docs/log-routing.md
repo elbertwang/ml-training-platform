@@ -27,7 +27,7 @@
 
 | | **BigQuery** `grafana-bigquery-datasource` | **Cloud Logging** `googlecloud-logging-datasource` |
 |---|---|---|
-| 状态 | **已装**（`serve/grafana/Dockerfile`） | **未装**，需加一行 `grafana cli plugins install` |
+| 状态 | **已装** | **已装**（2026-08-26，`serve/grafana/Dockerfile`） |
 | 许可 | Apache-2.0（Grafana Labs） | Apache-2.0（GoogleCloudPlatform），v1.7.0，24 stars，2026-08-17 仍在更新 |
 | Grafana 版本要求 | 12.4.3 在支持范围内 | 需要 ≥ 11.2.0，我们是 12.4.3 ✓ |
 | 认证 | `gce`（Cloud Run SA，无密钥文件） | 同样支持 `gce` ✓ |
@@ -104,7 +104,7 @@
 |---|---|---|---|
 | `stderr` / `jax-tpu` —— `completed step` 行 | 526,910 中 580k 累计 | **L1 → L2 `fact_step`** | ⬜ 未建模。要按 `job-completion-index` 去重（64 个 pod 打同样的 step，但 TFLOPs 各不相同） |
 | `stderr` / `jax-tpu` —— 错误与警告 | 同上 | **L1 → L2 `app_error`**（按签名+分钟折叠） | ✅ |
-| `stderr` / `jax-tpu` —— `Thread 0x` 栈转储 | 704 个 pod 里只有 3–6 个会打 | **L0 原文 + L2 只记「发生了栈转储」** | ⬜ 原文绝不能进 BQ；但「哪个 rank 卡了」是关键事实 |
+| `stderr` / `jax-tpu` —— `Thread 0x` 栈转储 | 704 个 pod 里只有 3–6 个会打 | **L0 原文 + L2 只记「发生了栈转储」** | ⬜ L0 那半已可用（「错误」面板）；L2 的「哪个 rank 卡了」仍未建 |
 | `stdout` / `jax-tpu` | 10,901 | **L1** | ✅ |
 | `events` (k8s_pod) | 640 | **L1 → L2 `k8s_event`** | 🔧 falcon-jobs 里 27% 归不到 job |
 | `stdout`+`stderr` / gcsfuse sidecar 三件套 | 24,792 | **L0** —— 有 12 个 `gcsfusecsi/*` 指标可用，原文只在排查时读 | ✅（当前只收 ERROR+，够了） |
@@ -115,9 +115,9 @@
 
 | 渠道 | 3h 量 | 路由 | 状态 |
 |---|---|---|---|
-| **`sidecar-log-collector`**（TPU 驱动日志转发） | 61,961 行 / 底层 250 万行 | **L0 原文** + **L2 抽 `deepsea_compiler_*` 编译耗时** | ⬜ **修正了之前的建议**：原文不 sink，用 Cloud Logging 数据源读。只有编译耗时进 BQ（无任何指标替代） |
-| **`tpu-device-plugin`**（驱动层） | 68,582 | **L0 原文** + **L2 抽故障事件** | ⬜ 当前只收 ERROR+ |
-| **`vbar-control-agent`**（板级控制） | 22,401 | **L0 原文** + **L2 抽故障事件** | ⬜ 同上 |
+| **`sidecar-log-collector`**（TPU 驱动日志转发） | 61,961 行 / 底层 250 万行 | **L0 原文** + **L2 抽 `deepsea_compiler_*` 编译耗时** | 🔧 **L0 已可用**（dashboard「TPU 驱动与节点层」面板，按 node 归属）。**修正了之前的建议**：原文不 sink。L2 的编译耗时仍未抽 |
+| **`tpu-device-plugin`**（驱动层） | 68,582 | **L0 原文** + **L2 抽故障事件** | 🔧 L0 已可用（同上面板）；L2 未建 |
+| **`vbar-control-agent`**（板级控制） | 22,401 | **L0 原文** + **L2 抽故障事件** | 🔧 L0 已可用（同上面板，实测有数据）；L2 未建 |
 | `events` (k8s_node) —— OOM / NotReady / 修复 | 3,632 | **L1 → L2**，走 node→job 一跳 | 🔧 **17,710 条 `OOMKilling` 完全没有 pod name，现在全是孤儿** |
 | `maintenance-handler` | 79,232 | **L0** + **L2 中断事件** | ⬜ 中断归因用 |
 | `gcs-fuse-csi-driver` | 469,276 | **L0**（有指标替代） | ✅ 只收 ERROR+ |
@@ -141,7 +141,7 @@
 | `ml_diagnostics_workload_event` —— 含 `WORKLOAD_TERMINATION` | 198 | **L1 → L2** | ⬜ **已 sink 但未建模**。REST API 五个月没返回过一条 TERMINATION，只有这条流有 |
 | `ml_diagnostic_workload_performance` —— 10 秒 0–1 性能比 | 3,549 | **L1 → L2 `fact_metric`** | ⬜ **完全没采集**。比我们的 goodput 细 30 倍 |
 | `tpu.googleapis.com/runtime_monitor` | 649 | **L1 → L2** | ⬜ 已 sink 未建模 |
-| ML Diagnostics REST API | 13.4k runs | **L2 `dim_mlrun` / `fact_mlrun_event`** | ✅ 但 poller 未排期 |
+| ML Diagnostics REST API | 15.2k runs | **L2 `dim_mlrun` / `fact_mlrun_event`** | ✅ poller 已随 `mlobs-refresh` 每 30 分钟运行 |
 | GKE Operations API —— 节点池修复事件 | — | **L2** | ⬜ falcon 有专属节点池，可归属 |
 
 ---
@@ -154,13 +154,13 @@
 |---|---|---|---|---|
 | **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 07-27 起共 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，我们一个都没有** | 「历史所有 job 的启动/停止/占卡数」这个核心目标现在只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 把 30 天补齐？** |
 | **TBD-2** | **`dim_pod` 会遗忘** | `CREATE OR REPLACE` + 30 天滚动窗口 | 就算补齐，第 31 天旧数据照样掉。**维度表不能滚动重建，必须 MERGE 累积** | 无（确定要改） |
-| **TBD-3** | **`refresh.sh` 未排期** | 数据停在 08-25 05:44 | 一切都不刷新 | Cloud Run Job + Cloud Scheduler，周期定多少 |
+| ~~TBD-3~~ | ~~`refresh.sh` 未排期~~ | **已完成 2026-08-26**：`schedule/` 打包成 Cloud Run job `mlobs-refresh`，Cloud Scheduler 每 30 分钟触发。实测无人值守跑通，各表滞后 1–2 分钟 | — | 周期取 30 分钟而非 15：实时值现在直接来自 Cloud Monitoring 和 Cloud Logging 面板，BQ 只承担历史与聚合，半小时不衰减。15 分钟 ~$65/月，30 分钟 ~$32 |
 | **TBD-4** | **L-node 一跳归属完全没实现** | 21 个 L-node 渠道，`fact_event` 里一个都没接 | 17,710 条 `OOMKilling` 全部落不到 job | 无（确定要做） |
 | **TBD-5** | **falcon-jobs 27% 事件归不到 job** | 12,211 未归属 / 33,597 已归属。其中 `SuccessfulCreate` 4,273 条其实可归属——pod 名在正文里（`Created pod: falcon-job-...`），但 `involvedObject` 是 Job 不是 Pod | 事件进了时间轴却落不到任何 job | 无（确定要做） |
 | **TBD-6** | **autoscaler 归属：定性** | 3,365 条 100% 未归属。`channel-map.md` 说它是 L-cluster「不归属，按时间对齐」，但 falcon 有专属节点池，理论上能归属 | 两种说法现在都写在文档里，自相矛盾 | **选一个：实现 node-pool 归属，还是承认只做时间对齐** |
 | **TBD-7** | **`sidecar-log-collector` 在 crash-loop** | `BackOff` **18,155 次**，全在这个容器 | TPU 驱动日志本身可能是断续的。**在修好之前，从它抽出的任何指标都有采样缺口** | 是客户侧问题还是配置问题，要先定位 |
 | **TBD-8** | **sink 误收了系统日志** | `fluentbit` 70,199 + `kube_proxy` 447 + `GCEGuestAgent` 456 | 存储浪费，且污染 L1 | 无（加排除条件即可） |
-| **TBD-9** | **Cloud Logging 数据源未装** | Grafana 里只有 BQ + Cloud Monitoring | 「原文」那一层现在没有承载 | 无（Dockerfile 加一行） |
+| ~~TBD-9~~ | ~~Cloud Logging 数据源未装~~ | **已完成 2026-08-26**：`googlecloud-logging-datasource` 已装，dashboard 增加「原始日志」一行三个面板（训练主输出 / 错误 / TPU 驱动与节点层）。以 Grafana SA 实测取到实时训练输出 | — | — |
 | **TBD-10** | **要不要用排除过滤器省 ingest** | 未做 | sink + `_Default` 排除**能**免掉 $0.50/GiB。**但一旦排除，L0 就不成立了**——省了 ingest 就换不回 Logs Explorer 能查 | 对 TPU 驱动日志这种量级（一个 64-pod jobset 3 小时 250 万行）值不值得 |
 
 ### 客户侧 TBD（不在我们控制范围）
@@ -177,10 +177,13 @@
 ## 5. 落地顺序
 
 ```
+已完成（2026-08-26，生产环境 tpu-for-training）
+  TBD-3  refresh.sh 排期 —— Cloud Run job + Scheduler，每 30 分钟
+  TBD-9  Cloud Logging 数据源 —— Grafana 已装，原文层可用
+
 第一批（互相咬合，一起做）
   TBD-2  dim_pod 改 MERGE 累积
   TBD-1  回填补到 30 天         ← 等 TBD-2 先改完，否则白花 $56
-  TBD-3  refresh.sh 排期
 
 第二批（归属修复，让已收的数据能用）
   TBD-4  L-node 一跳（先接 OOMKilling / 节点事件）
@@ -189,10 +192,10 @@
   TBD-8  sink 排除系统日志
 
 第三批（补齐渠道）
-  TBD-9  装 Cloud Logging 数据源 —— 成本最低、见效最快，可以提前做
   ML Diagnostics 两条子流（WORKLOAD_TERMINATION + 10 秒性能比）
   TBD-7  先定位 crash-loop，再抽 TPU 驱动的编译耗时
   TBD-10 排除过滤器的取舍
 ```
 
-**TBD-9 可以插队先做**：装个插件、加个数据源，就能让「看原文」这一层立刻可用，而且它不依赖上面任何一条。
+TBD-9 已经插队做完了 —— 它不依赖任何其它条目，装个插件加个数据源，「看原文」这一层就立刻可用。
+剩下的第一批是现在的瓶颈：历史只有 3 天，且每次重建还会再忘一点。
