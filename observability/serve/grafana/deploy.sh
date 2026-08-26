@@ -85,12 +85,47 @@ gcloud builds submit "$HERE" --project "$PROJECT_ID" --region "$REGION" \
   --tag "$IMAGE" --quiet >/dev/null
 echo "  ${IMAGE}"
 
+echo "=== IAP prerequisites ==="
+# `--iap` provisions the IAP service agent itself, but on a project where IAP
+# has never run that provisioning races: the first deploy into tpu-for-training
+# printed "Setting IAP service agent...warning" followed by "Setting IAM policy
+# failed", left the service's invoker policy empty, and every browser hit came
+# back "You don't have access" despite a correct-looking IAP IAM policy.
+# Creating the identity up front and granting the invoker before deploying
+# makes the deploy step's own attempt a no-op instead of a race.
+gcloud beta services identity create --service=iap.googleapis.com \
+  --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+IAP_SA="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
+echo "  ${IAP_SA}"
+
 echo "=== Deploy ==="
-gcloud beta run deploy "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
-  --image "$IMAGE" --service-account "$SA" \
-  --set-env-vars "MLOBS_PROJECT=${PROJECT_ID},GF_AUTH_ANONYMOUS_ENABLED=true,GF_AUTH_ANONYMOUS_ORG_ROLE=Admin,GF_AUTH_DISABLE_LOGIN_FORM=true,GF_AUTH_BASIC_ENABLED=false" \
-  --iap --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
-  --min-instances 0 --max-instances 2 --timeout 300 --quiet >/dev/null
+deploy_service() {
+  gcloud beta run deploy "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
+    --image "$IMAGE" --service-account "$SA" \
+    --set-env-vars "MLOBS_PROJECT=${PROJECT_ID},GF_AUTH_ANONYMOUS_ENABLED=true,GF_AUTH_ANONYMOUS_ORG_ROLE=Admin,GF_AUTH_DISABLE_LOGIN_FORM=true,GF_AUTH_BASIC_ENABLED=false" \
+    --iap --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
+    --min-instances 0 --max-instances 2 --timeout 300 --quiet >/dev/null
+}
+deploy_service
+
+# The service has to exist before its resource-level IAM can be set, so the
+# invoker grant lands after the first deploy -- and IAP only picks up a new
+# invoker on the next revision. Google's own docs say to redeploy if you
+# granted Invoker and still get permission denied. Do it automatically rather
+# than leaving a service that looks deployed but rejects every request.
+if gcloud run services get-iam-policy "$SERVICE" --project "$PROJECT_ID" \
+     --region "$REGION" --format="value(bindings.members)" 2>/dev/null \
+     | grep -q "$IAP_SA"; then
+  echo "  IAP agent already had run.invoker"
+else
+  # Needs roles/run.admin; roles/editor does NOT include run.services.setIamPolicy.
+  gcloud run services add-iam-policy-binding "$SERVICE" --project "$PROJECT_ID" \
+    --region "$REGION" --member="serviceAccount:${IAP_SA}" \
+    --role=roles/run.invoker --quiet >/dev/null
+  echo "  granted run.invoker to the IAP agent; redeploying so IAP picks it up"
+  deploy_service
+fi
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
       --region "$REGION" --format="value(status.url)")
