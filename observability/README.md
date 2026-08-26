@@ -27,7 +27,8 @@
 8. [路线图](#8-路线图)
 9. [运行方式](#9-运行方式)
 10. [Caveats](#10-caveats)
-11. [附录：踩过的坑](#11-附录踩过的坑)
+11. [附录 A：踩过的坑](#11-附录-a踩过的坑)
+12. [附录 B：监控渠道分类地图](docs/channel-map.md) ← 单独文档
 
 ---
 
@@ -668,7 +669,7 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 11. 附录：踩过的坑
+## 11. 附录 A：踩过的坑
 
 按类型归档。都是实测撞出来的，写在这里避免重犯。
 
@@ -721,3 +722,20 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 **通用教训：探测类工具必须把「查不到」和「查失败」严格分开**，否则输出永远看起来
 是合理的。工具现在会显式输出 `INCOMPLETE` 名单。
+
+---
+
+## 12. 附录 B：监控渠道分类地图
+
+单独成文：**[`docs/channel-map.md`](docs/channel-map.md)**
+
+实测一个 JobSet（64 pod / 64 节点 / 3 小时）能查到的**全部 27 个日志渠道 + 4 个
+API 渠道**，按归属层级（pod / node / cluster / api）组织，并附一张给算法同学的
+**「我想知道 X → 该看哪儿」** 导航表。
+
+里面有两个容易误判的渠道值得单独看：
+
+- **§4 TPU 驱动日志** —— `sidecar-log-collector` 有 99.94% 是 `tpu_driver.INFO`
+  的转发，含每小时 2.4 万次的**编译耗时**，无任何指标替代
+- **§5 ML Diagnostics 是三条子渠道** —— `WORKLOAD_TERMINATION` **只在日志流**里
+  （12 小时 376 个），REST API 五个月一次都没返回过；另有 10 秒粒度的性能日志完全未采集
