@@ -67,8 +67,8 @@ pod 名就在 `resource.labels.pod_name` 里，`dim_pod` 一跳就能关联。
 
 | 渠道 | 3h 量 | 内容 | 归属方式 |
 |---|---|---|---|
-| `ml_diagnostic_workload_performance` | 3,549 | ML Diagnostics 10 秒粒度指标 | `resource.labels.node_id` **就是 ML run ID** |
-| `ml_diagnostics_workload_event` | 198 | 诊断事件 | 同上 |
+| `ml_diagnostic_workload_performance` | 3,549 | **10 秒粒度 0–1 性能比**，见 §5.2 —— **未采集** | `resource.labels.node_id` **就是 ML run ID** |
+| `ml_diagnostics_workload_event` | 198 | 诊断事件，**含 API 没有的 `WORKLOAD_TERMINATION`**，见 §5.1 | 同上 |
 | `tpu.googleapis.com/runtime_monitor` | 649 | TPU runtime 事件 | `tpu_worker` 资源 |
 | **GKE Operations API** | — | 节点池 创建/删除/升级/修复 | 见 §3.4 |
 
@@ -94,6 +94,8 @@ pod 名就在 `resource.labels.pod_name` 里，`dim_pod` 一跳就能关联。
 | **为什么没扩容 / 排不上队** | `cluster-autoscaler-visibility`（结构化 JSON） | `pod/latencies/pod_first_ready` 指标 | cluster |
 | **Checkpoint 慢** | `gke-managed-checkpointing/csi` 日志 | `gcsfusecsi/gcs_request_latencies` | node |
 | **这个 job 花了多少钱 / 有效率多少** | `mlobs_core.job_hub` | `job_attempts(job_key)` 看每次尝试 | job |
+| **任务是怎么结束的** | ML Diagnostics `WORKLOAD_TERMINATION`（**只在日志流**，见 §5.1） | `events`(k8s_cluster) 的 `Job completed` | job |
+| **秒级的性能波动** | ML Diagnostics 10 秒性能比（§5.2，未采集） | tensorcore 利用率（60 秒） | job |
 | **整个事故时间线** | `mlobs_core.job_timeline(job_key)` | Grafana 一站式页面 | job |
 | **想看全部原始日志** | Logs Explorer 深链接（`job_hub.logs_explorer_url`） | Log Analytics SQL | 全部 |
 
@@ -165,7 +167,78 @@ node label 或 Operations API 的 `targetLink`。JobSet 族用的是静态节点
 
 ---
 
-## 5. 缺口
+## 5. ML Diagnostics：三条子渠道，不是一条
+
+我们一直只用 REST API。实测它下面有**三条互不重叠**的子渠道，另外两条在日志里。
+
+| 子渠道 | 载体 | 内容 | 我们用了吗 |
+|---|---|---|---|
+| **A. REST API** | `hypercomputecluster.googleapis.com/v1alpha` | `machineLearningRuns` · `monitoredEvents` · `analyzerReports` | ✅ poller 已接 |
+| **B. 事件日志** | `ml_diagnostics_workload_event` | `WorkloadEvent{eventName, eventType, startTime}` | ⚠️ **sink 已收，未建模** |
+| **C. 性能日志** | `ml_diagnostic_workload_performance` | `WorkloadPerformance{timestamp, values[]}`，**约 10 秒粒度** | ❌ **完全没接** |
+
+### 5.1 只有日志流里有 `WORKLOAD_TERMINATION`
+
+| 来源 | eventType | 数量 |
+|---|---|---|
+| **B 事件日志**（12 小时） | **`WORKLOAD_TERMINATION`** | **376，覆盖 353 个 run** |
+| B 事件日志（12 小时） | `WORKLOAD_PERFORMANCE_DEGRADATION` | 200，覆盖 42 个 run |
+| A REST API（**5 个月全量**） | `PERFORMANCE_DEGRADATION` | 4,262 |
+| A REST API（5 个月全量） | `ORCHESTRATOR_INTERRUPTION` | 14 |
+| A REST API | `TERMINATION` | **0 —— 一次都没有** |
+
+**任务终止事件只在日志流里发布，REST API 五个月没返回过一次。** 只轮询 API 就会
+把它们全部漏掉。
+
+> 这也更正了早期调研的一条结论。之前记录「HANG 与 TERMINATION 两类事件未直接观测
+> 到实例」—— TERMINATION **是可观测的**，只是在日志流而不是 API 里。
+
+注意命名不同：日志用 `WORKLOAD_PERFORMANCE_DEGRADATION`，API 用
+`PERFORMANCE_DEGRADATION`。建模时要归一化。
+
+### 5.2 性能日志是 10 秒粒度的 0–1 性能比
+
+```json
+{"@type": ".../WorkloadPerformance",
+ "timestamp": "2026-08-26T03:05:01.845610280Z",
+ "values": [0.926640625]}
+```
+
+实测值 0.926 / 0.709 / 0.805 —— 归一化到 0–1 的性能比，**约 10 秒一个点**，
+6 小时内覆盖 **166 个 run**。
+
+对比我们自建的 goodput：5 分钟桶、tensorcore 代理。**这个信号细 30 倍，而且是
+第一方的。** 目前完全没有采集 —— sink 过滤器里只有 `ml_diagnostics_workload_event`，
+没有 `ml_diagnostic_workload_performance`。
+
+### 5.3 归属：join key 是对的，问题在 poller 没跑
+
+两条日志流的 `resource.labels.node_id` **就是 ML run ID**，可直接关联
+`dim_mlrun` → `job_key`。
+
+但实测 374 个 `WORKLOAD_TERMINATION` 事件**一个都没关联上**。原因不是建模错误：
+
+```
+取一个事件的 node_id: 512b4295b1b4153a4b1747a11eb23020ee477db02906da442f8fe10e08a622ae
+直接问 API   →  falcon-job-x7rpce7p79, COMPLETED     ✅ id 有效
+查 dim_mlrun →  0 行                                  ❌
+dim_mlrun 最后一条 run 的 create_time: 08-25 03:00    ← 已过期一天多
+```
+
+**`refresh.sh` 没接调度**（README 路线图 P0），poller 停在一天前，所以新 run 不在
+维表里。这不是设计问题，但它正在造成可测量的数据丢失。
+
+### 5.4 还没用的 API 子资源
+
+| 子资源 | 用途 | 状态 |
+|---|---|---|
+| `profilerTargets` | 每个 pod 自动注册的 profiling 目标 | 未用 |
+| `profilerSessions` | on-demand XProf 抓取与结果（含 `dashboardUri`） | 未用 —— 抓下来的 profile 目前无处索引 |
+| `runSet` / `runGroup` | 多 run 归组对比 | 未用 |
+
+---
+
+## 6. 缺口
 
 | 缺口 | 现状 |
 |---|---|
@@ -174,11 +247,14 @@ node label 或 Operations API 的 `targetLink`。JobSet 族用的是静态节点
 | **serial console** | 3 小时只有 14 行，但硬件故障常只在这里 —— 未采集 |
 | **GKE Operations** | 未接 poller；falcon 临时节点池 ↔ job 的映射未建立 |
 | **Checkpoint I/O** | `gke-managed-checkpointing` 日志未建模 |
+| **ML Diagnostics `WORKLOAD_TERMINATION`** | sink 已收 2,813 行，**未建模** —— 见 §5.1 |
+| **ML Diagnostics 10 秒性能日志** | **未采集** —— sink 过滤器里没有，见 §5.2 |
+| **XProf profile 产物索引** | `profilerSessions` 未用，抓下来的 profile 无处可查 |
 | **All Capacity 拓扑/健康** | 🚧 **TBD** —— 集群尚未启用。启用后可拿到 block / sub-block / OCS 健康（`degradedInfraCount`），以及 VM 的 `physical_host_topology`，能回答「变慢的 rank 是不是都在同一个 block」 |
 
 ---
 
-## 6. 复现这份地图
+## 7. 复现这份地图
 
 ```sql
 -- 圈定一个 job 的 pod 与节点
