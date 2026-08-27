@@ -52,24 +52,27 @@ gcloud run services proxy mlobs-grafana --project <P> --region us-central1 --por
 
 ### 认证模型
 
-**Cloud Run IAM 是唯一的认证层，Grafana 本身跑匿名（Admin 角色）。**
+**IAP 是主路径，Cloud Run IAM + proxy 是组织外用户的备路径。** 服务两种情况下都是
+私有的（`--no-allow-unauthenticated`），Grafana 本身跑匿名 Admin —— Google 已经证明
+了身份，再要一个 Grafana 密码不增加安全性，只增加一个要保管的秘密。而且两层认证会
+抢同一个 `Authorization` 头（实测：curl 带 Cloud Run 的 Bearer 再带 Grafana 的
+basic auth，后者覆盖前者，必然 403）。
 
-不是偷懒 —— 两层认证会抢同一个 `Authorization` 头（实测：curl 带 Cloud Run 的
-Bearer 再带 Grafana 的 basic auth，后者会覆盖前者，必然 403）。Google 已经证明了
-身份，再要一个 Grafana 密码不增加安全性，只增加一个要保管的秘密。
+组织策略 `constraints/iam.allowedPolicyMemberDomains` 禁止 `allUsers`，公开访问本来
+也不可能。
 
-组织策略 `constraints/iam.allowedPolicyMemberDomains` 禁止 `allUsers`，所以公开
-访问本来也不可能。
+**IAP 的两个前置条件。** 一是项目要有 OAuth 同意屏幕，没有就报 `Error code 9`
+（OAuth 重定向失败），而 IAM 策略读回来都是对的。创建 brand 的 API gcloud 会警告已于
+2026-03-19 关停，实测那只针对**新项目**，老项目仍可调用；brand 不可删除。二是这样
+建出来的 brand 是 `orgInternalOnly`，只有项目所属组织内的账号能登录，且该字段无法
+通过 API 修改。
 
-**为什么不是 IAP。** IAP 能给出一个可以直接发给人的 URL，比本地代理好用，
-`ENABLE_IAP=1` 也留着。但它要求项目配置 OAuth 同意屏幕，而创建同意屏幕的
-IAP OAuth Admin API 已于 **2026-03-19 永久关停**，现在只能在 Cloud Console 里手工配。
-没配的表现是 `Error code 9`（OAuth 重定向失败）。
+**因此 `tpu-for-training` 的实际模式是**：`antgroup.com` 用户授
+`roles/iap.httpsResourceAccessor` 后直接开 URL；组织外用户授 `roles/run.invoker`
+后走 `gcloud run services proxy`。
 
-更要命的是第二层：**IAP 一旦开启，会拦截所有到达服务的请求，包括 IAM 认证的直连**，
-报 `Invalid IAP credentials: Invalid JWT audience`（它要求 audience 是那个不存在的
-OAuth 客户端）。所以半配好的 IAP 会让浏览器和代理**两条路同时不通**，而且两边报错
-完全不同，看起来像两个独立的问题。要开 IAP，先在 Console 里把同意屏幕配好。
+> 开启 IAP 后它会拦截**所有**请求，包括 IAM 直连的（`Invalid IAP credentials:
+> Invalid JWT audience`）。所以配到一半的 IAP 会让两条路同时不通，而且两边报错不同。
 
 ### 已验证（生产，以 Grafana 服务账号身份实跑）
 

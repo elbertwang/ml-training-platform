@@ -513,7 +513,7 @@ observability/
 | 环境 | 采集 | 建模 | 展示 | 定时刷新 |
 |---|---|---|---|---|
 | `tpu-launchpad-playground` | ✅ | ✅ | ✅ Grafana | ✅ 每 30 分钟 |
-| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana | ✅ 每 30 分钟 |
+| `tpu-for-training`（生产） | ✅ | ✅ | ✅ Grafana（IAP + proxy） | ✅ 每 30 分钟 |
 
 两个环境跑的是同一份代码、同一条 `./deploy.sh`。playground 是重构后的验证环境
 —— 每次改部署脚本都先在那儿完整跑一遍，再动生产。
@@ -522,12 +522,17 @@ observability/
 
 | 组件 | 名称 | 说明 |
 |---|---|---|
-| Grafana | Cloud Run `mlobs-grafana` | **私有服务 + Cloud Run IAM**，通过 `gcloud run services proxy` 访问。Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
+| Grafana | Cloud Run `mlobs-grafana` | **私有服务 + IAP**。组织内用户直接开 URL，组织外走 proxy。Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
 | 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 A） |
 | 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
 | 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
 
-**访问方式**：服务私有（匿名请求返回 403），查看者用 `roles/run.invoker` 授权后本地起代理：
+**访问方式**：服务私有，匿名请求返回 302 跳 Google 登录。分两条路，按账号所属组织决定。
+
+- **`antgroup.com` 用户** —— 授 `roles/iap.httpsResourceAccessor` 后直接开
+  `https://mlobs-grafana-…run.app/d/mlobs-job?var-job_key=<JOB>`
+- **组织外用户** —— OAuth 同意屏幕是 Internal，IAP 登不进去。授 `roles/run.invoker`
+  后走代理：
 
 ```bash
 gcloud run services proxy mlobs-grafana \
@@ -535,11 +540,29 @@ gcloud run services proxy mlobs-grafana \
 # → http://localhost:8080/d/mlobs-job
 ```
 
-**为什么不是 IAP。** 原计划用 IAP，实际部署时发现它需要项目配置 OAuth 同意屏幕，
-而创建它的 IAP OAuth Admin API 已在 **2026-03-19 永久关停**，只能在 Console 手工配。
-没配的表现是 `Error code 9`（OAuth 重定向失败）。更麻烦的是：**IAP 一旦开启会拦截
-所有请求，包括 IAM 直连的**，报 `Invalid IAP credentials: Invalid JWT audience`
-—— 所以半配好的 IAP 会让两条路同时不通。`ENABLE_IAP=1` 可以开回去，前提是先配好同意屏幕。
+**IAP 的两个前置条件，都踩过。**
+
+一是项目必须有 OAuth 同意屏幕。没有的话 IAP 报 `Error code 9`（OAuth 重定向失败），
+而所有 IAM 策略读回来都是对的，很难定位。创建方式：
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  https://iap.googleapis.com/v1/projects/<项目>/brands \
+  -d '{"applicationTitle":"...","supportEmail":"<你>@<组织>"}'
+```
+
+gcloud 会警告这个 API 已于 2026-03-19 关停 —— 那只针对**新项目**，早于关停日期的
+项目仍可调用，`tpu-for-training` 就是这样建的。**brand 不可删除。**
+
+二是这样创建的 brand 是 `orgInternalOnly`，只有项目所属组织内的账号能登录。
+本项目属于 `antgroup.com`，所以 56 个 antgroup 用户走 IAP，其余走代理。改成 External
+要在 Console 的 Google Auth Platform → Audience 里操作，且改完还要 **PUBLISH**，
+否则只有 100 人以内的测试用户名单能进。IAP 只请求 `openid email` 两个非敏感 scope，
+发布不需要 Google 验证。
+
+> 开启 IAP 后它会拦截**所有**请求，包括 IAM 直连的（报
+> `Invalid IAP credentials: Invalid JWT audience`）。所以半配好的 IAP 会让浏览器和
+> 代理两条路同时不通 —— 而两边报错完全不同，看起来像两个独立的问题。
 
 **权限按最小面给**，以各自 SA 身份在 Cloud Run 里实跑确认过：
 
@@ -852,8 +875,9 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 | `tpu.googleapis.com/*` 是 Cloud TPU VM 表面 | GKE 托管的 TPU 在这里几乎没数据（`interruption_count` 全项目 2 条序列） |
 | Cloud Run 与 Grafana 都要 `Authorization` 头 | 两层认证必然冲突 —— 认证只放一层，Grafana 跑匿名 Admin |
 | 组织策略禁止 `allUsers` | Cloud Run 不可能公开访问，必须走认证 |
-| **IAP 需要 OAuth 同意屏幕，而创建它的 API 已于 2026-03-19 关停** | 没配就报 `Error code 9`（OAuth 重定向失败），只能在 Console 手工配 |
+| **IAP 需要 OAuth 同意屏幕** | 没配就报 `Error code 9`（OAuth 重定向失败），而所有 IAM 策略读回来都是对的。gcloud 警告创建 API 已于 2026-03-19 关停 —— 那只针对**新项目**，老项目仍可用，别被它劝退 |
 | **IAP 开启后会拦截 IAM 直连请求** | 报 `Invalid IAP credentials: Invalid JWT audience` —— 半配好的 IAP 让浏览器和 proxy **两条路同时不通**，而且两边症状不同，很容易误判成两个问题 |
+| **brand 是 `orgInternalOnly` 且不可改** | 只有项目所属组织内的账号能通过 IAP 登录，API 无法 PATCH 这个字段。组织外的人只能走 proxy，或在 Console 把同意屏幕改 External 并发布 |
 | `gcloud run deploy --iap` 在首次启用 IAP 的项目上会竞态 | 输出里只是一行 `Setting IAP service agent...warning`，但结果是 invoker 策略为空、浏览器报 `You don't have access`，而 IAP 的 IAM 策略看起来完全正确 |
 | **数据源缺权限时面板只显示 No data** | Grafana SA 起初没有 `monitoring.viewer`，Cloud Monitoring 面板全空 —— 和「这个 job 确实没指标」长得一模一样，不会报错。每加一个数据源都要单独授它自己的读权限 |
 | **Cloud Monitoring 的 filter 不支持 `=~`** | 直接调 v3 REST 会报 `syntax error ... token '=~'`；正则要写 `monitoring.regex.full_match()`。Grafana 的 stackdriver 插件会自动翻译，所以面板里写 `=~` 是对的 —— 但拿这个语法去手工验证会得到误导性的报错 |

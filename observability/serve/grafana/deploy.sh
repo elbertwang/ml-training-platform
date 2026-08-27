@@ -9,27 +9,43 @@
 # deleted without touching a cluster other people share.
 #
 # ---------------------------------------------------------------------------
-# Auth model: plain Cloud Run IAM.
+# Auth model: IAP, with Cloud Run IAM as the fallback path.
 #
-# The service is private (--no-allow-unauthenticated); viewers hold
-# roles/run.invoker and reach it through `gcloud run services proxy`. Grafana
-# itself runs anonymous with the Admin role: a second password buys nothing once
-# Google has already proved the identity, and two layers would both want the
-# `Authorization` header and fight over it.
+# The service is private either way (--no-allow-unauthenticated). Grafana itself
+# runs anonymous with the Admin role: a second password buys nothing once Google
+# has proved the identity, and two layers would both want the `Authorization`
+# header and fight over it.
 #
-# ENABLE_IAP=1 switches to IAP, which is nicer -- a shareable URL instead of a
-# local proxy. It is not the default because it needs a prerequisite this script
-# cannot satisfy: the project must have an OAuth consent screen, and the IAP
-# OAuth Admin API that used to create one was permanently shut down on
-# 2026-03-19. Without it IAP fails with "Error code 9" (failed OAuth redirect)
-# and the consent screen has to be configured by hand in the Cloud Console.
+# Two things gate IAP, and both bit us before they were understood.
 #
-# The trap, learned the hard way in tpu-for-training: enabling IAP breaks the
-# proxy too. IAP intercepts every request to the service, including
-# IAM-authenticated ones, rejecting them with "Invalid IAP credentials: Invalid
-# JWT audience" because it expects an audience of an OAuth client that does not
-# exist. A half-configured IAP therefore leaves no way in at all, and the two
-# doors fail with different messages, which reads like two separate problems.
+# 1. The project needs an OAuth consent screen. Without one IAP fails with
+#    "Error code 9" (failed OAuth redirect) even though every IAM policy reads
+#    correct. Create it with:
+#
+#      curl -X POST -H "Authorization: Bearer $TOKEN" \
+#        https://iap.googleapis.com/v1/projects/<PROJECT>/brands \
+#        -d '{"applicationTitle":"...","supportEmail":"<you>@<org>"}'
+#
+#    gcloud warns this API was turned down on 2026-03-19. That applies to
+#    *new* projects; it still works for projects that predate the turndown,
+#    which is how tpu-for-training got one. A brand cannot be deleted.
+#
+# 2. A brand created this way is `orgInternalOnly`, so only accounts inside the
+#    project's own organisation can sign in. tpu-for-training sits under
+#    antgroup.com, so @antgroup.com users reach the dashboard through IAP and
+#    everyone else does not. Flipping it to External is a Cloud Console change
+#    on the Google Auth Platform audience page -- and after flipping, the app
+#    must also be published, or only accounts on a 100-entry test-user list can
+#    sign in. IAP only requests `openid email`, both non-sensitive, so
+#    publishing does not require Google verification.
+#
+# Whoever cannot use IAP uses the proxy instead, which needs only run.invoker:
+#
+#   gcloud run services proxy mlobs-grafana --project <P> --region <R> --port 8080
+#
+# ENABLE_IAP defaults to whatever the deployed service already has, so
+# redeploying never silently changes how people get in. On a project with no
+# service yet it defaults off, because a fresh project has no consent screen.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -42,9 +58,18 @@ SERVICE="${SERVICE:-mlobs-grafana}"
 REPO="${REPO:-mlobs}"
 SA_NAME="${SA_NAME:-mlobs-grafana}"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/grafana:v1"
-ENABLE_IAP="${ENABLE_IAP:-0}"   # read the auth-model note above first
-
 require_token
+
+# Follow the deployed service rather than defaulting blind: flipping a live
+# service's auth mode as a side effect of redeploying would lock out everyone
+# who reaches it the other way.
+if [[ -z "${ENABLE_IAP:-}" ]]; then
+  ENABLE_IAP=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
+                 --region "$REGION" \
+                 --format="value(metadata.annotations['run.googleapis.com/iap-enabled'])" \
+                 2>/dev/null | grep -q true && echo 1 || echo 0)
+fi
+
 
 echo "=== Service account ==="
 SA=$(ensure_service_account "$PROJECT_ID" "$SA_NAME" "Grafana for ML observability")
@@ -129,13 +154,21 @@ URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
 
 echo "=== Access ==="
 if [[ "$ENABLE_IAP" == "1" ]]; then
-  echo "  Grant each viewer:"
+  echo "  Viewers inside the project's own organisation -- grant IAP access:"
   echo "    gcloud beta iap web add-iam-policy-binding --project ${PROJECT_ID} \\"
   echo "      --resource-type=cloud-run --service=${SERVICE} --region=${REGION} \\"
   echo "      --member=user:SOMEONE@example.com --role=roles/iap.httpsResourceAccessor"
   echo
   echo "  Dashboard:      ${URL}/d/mlobs-job"
   echo "  One job's page: ${URL}/d/mlobs-job?var-job_key=<JOB>"
+  echo
+  echo "  Viewers OUTSIDE that organisation cannot sign in while the consent"
+  echo "  screen is Internal. Grant them run.invoker and use the proxy instead:"
+  echo "    gcloud run services add-iam-policy-binding ${SERVICE} \\"
+  echo "      --project ${PROJECT_ID} --region ${REGION} \\"
+  echo "      --member=user:SOMEONE@example.com --role=roles/run.invoker"
+  echo "    gcloud run services proxy ${SERVICE} \\"
+  echo "      --project ${PROJECT_ID} --region ${REGION} --port 8080"
 else
   echo "  Grant each viewer:"
   echo "    gcloud run services add-iam-policy-binding ${SERVICE} \\"
