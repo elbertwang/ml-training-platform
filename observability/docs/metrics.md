@@ -583,19 +583,30 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 ---
 
-## 9. 待打开的开关（客户侧）
+## 9. 任务侧的开关
 
 按性价比排。**全部只需改提交参数，不改镜像、不改节点池**（节点池 scope 已实测满足
 `cloud-platform`，这一项不可变，不满足就得重建节点池）。
 
-| # | 开关 | 现在 | 打开后得到 | 代价 |
+| # | 开关 | 状态 | 得到 | 代价 |
 |---|---|---|---|---|
-| **1** | `enable_goodput_recording=True`<br>`monitor_goodput=True` | **False** | **14 类 badput 归因** + 真实分母的 goodput + `disruptions`。覆盖 **77% 卡时** | 一条日志流 ~200 条/小时/job |
-| **2** | `enable_checkpoint_cloud_logger=True` | **False** | checkpoint 读写耗时。**不开的话 goodput 把它算成 0 而不是缺失** | 极小 |
-| **3** | `managed_mldiagnostics=True` | **False** | 8 个核心指标进 ML Diagnostics 的 **10 秒粒度**流 | 小 |
-| 4 | `enable_cloud_monitoring=true`<br>**必须配白名单**，只留 `perf/*` 和 `learning/{loss,grad_norm,is_nan,is_inf}` | 未设 | 结构化时序，替代日志解析 | ⚠️ **不做白名单会重演 758 个死描述符** |
+| **1** | `enable_goodput_recording=True`<br>`monitor_goodput=True` | 🚧 PR #958 待合并 | **14 类 badput 归因** + 真实分母的 goodput + `disruptions`。覆盖 **77% 卡时** | 一条日志流 ~200 条/小时/job |
+| **2** | `enable_checkpoint_cloud_logger=True` | 🚧 PR #958 待合并 | checkpoint 读写耗时。**不开的话 goodput 把它算成 0 而不是缺失** | 极小 |
+| **3** | `managed_mldiagnostics=True` | ❌ 未开 | 8 个核心指标进 ML Diagnostics 的 **10 秒粒度**流 | 小 |
+| 4 | `enable_cloud_monitoring=true`<br>**必须配白名单**，只留 `perf/*` 和 `learning/{loss,grad_norm,is_nan,is_inf}` | ❌ 未设 | 结构化时序，替代日志解析 | ⚠️ **不做白名单会重演 758 个死描述符** |
 
-**1 和 2 建议一起开**，先在一个 JobSet 上试跑。
+**1 和 2 由 `primatrix/maxtext` PR #958 在提交流里默认打开**（已提，未合并）：
+`presets.py` 的 `enable_goodput` / `enable_checkpoint_cloud_logger` 默认 `True`，
+经 pod 环境变量 `ENABLE_GOODPUT` / `ENABLE_CHECKPOINT_CLOUD_LOGGER` 传给
+`pretrain_ling3_*.sh`，落到那两个 MaxText 参数上。管线本来就通，PR 改的只是每一层
+的默认值 —— 此前少数几个 overlay 各自打开，其余生产任务 goodput 是黑的。
+
+`base.yml` 里的默认值仍是 `False` 且 PR 没动它 —— 那属于上游 MaxText，被测试和不走
+`scripts/submit/` 的调用方依赖。任何 overlay 仍可显式关闭。
+
+**只有在 PR 合并之后启动的 job 才有数据**，此前的 job 查不到 goodput 指标。合并后
+用 §9.1 的验证 SQL 确认 `badput_source` 有值再改这一行。
+
 **4 可以缓** —— `fact_step` 已经能从日志拿到同样的字段。
 
 另外确认 `DECOUPLE_GCLOUD` 没被设成 `TRUE`（会把整个集成 stub 掉）。

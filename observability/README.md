@@ -405,8 +405,9 @@ flowchart LR
   style FS stroke-width:3px
 ```
 
-三条虚线是全部缺口：Goodput 库（**开关**）、ML Diagnostics 指标流（**开关**）、
-TPU 驱动的编译耗时（要开发）。粗框 `fact_step` 同时喂两个问题，原料已在 sink 里，
+三条虚线是全部缺口：Goodput 库（**开关**，`primatrix/maxtext` PR #958 已提，合并后
+新启动的 job 自动有）、ML Diagnostics 指标流（**开关**，未推）、TPU 驱动的编译耗时
+（要开发）。粗框 `fact_step` 同时喂两个问题，原料已在 sink 里，
 详见[附录 A](docs/logs.md)。
 
 ### 4.4 `dim_pod`：pod → job 的映射
@@ -818,6 +819,7 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 | # | 事项 | 影响 | 状态 |
 |---|---|---|---|
+| 0 | **提交流默认打开 goodput 两个开关 + checkpoint cloud logger** | 合并前所有生产 job 的 goodput 只能靠 tensorcore 代理算法；合并后新启动的 job 有 14 类 badput 归因。见[附录 B §9](docs/metrics.md) | 🚧 `primatrix/maxtext` **PR #958 待 review** |
 | 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [附录 A](docs/logs.md) §4 | ❌ 已撤回 |
 | 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | ⏳ 待决策 |
 | 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效**（filter 要求 `pod_name=~"-worker-"`，falcon pod 名对不上） | ⏳ 待决策（改现有生产告警） |
