@@ -210,50 +210,85 @@ Grafana 里是「训练稳定性与效率」那一行。详见[附录 A §7](doc
 
 ### 4.1 总体
 
+```mermaid
+flowchart TB
+  subgraph ING["① 收集"]
+    direction LR
+    GKE["GKE 日志与事件<br/>pod stdout·stderr<br/>K8s events · autoscaler<br/>audit · ml_diagnostic"]
+    CL["Cloud Logging<br/>_Default · 30 天<br/>1,631 GiB/天"]
+    LA["Log Analytics<br/>defaultLink<br/>全保真 · $0<br/>303 GB/天"]
+    SINK["Log Router sink<br/>mlobs-selective<br/>精选 ~0.2%"]
+    MLD["ML Diagnostics REST<br/>→ mldiag_poller.py"]
+    MON["Cloud Monitoring<br/>→ metrics_exporter.py"]
+    GKE --> CL
+    CL --> LA
+    CL --> SINK
+  end
+
+  subgraph RAW["② mlobs_raw · L1 原样落地"]
+    direction LR
+    RL["stderr · stdout · events<br/>+ 9 张 sink 表"]
+    RM["mldiag_runs<br/>mldiag_events"]
+    RS["metric_samples"]
+  end
+
+  subgraph MODEL["③ mlobs_core · 纯 SQL · 与 defaultLink 同 location"]
+    direction TB
+    VS["v_sink_logs<br/>动态发现 sink 表"]
+    DP["dim_pod ★骨架<br/>pod ⟶ job_key<br/>pod ⟶ attempt_uid"]
+    DIM["dim_job_attempt · dim_job<br/>dim_mlrun · dim_tpu_price"]
+    FCT["fact_event · fact_step<br/>fact_metric · fact_goodput<br/>窗口替换是 BQ 事务"]
+    HUB["job_hub<br/>每 job 一行 + 深链接"]
+    VS --> DP --> DIM --> FCT --> HUB
+  end
+
+  SCHED["④ mlobs-refresh<br/>Cloud Run job + Scheduler<br/>每 30 分钟<br/>并发跳过"]
+
+  subgraph SERVE["⑤ Grafana on Cloud Run · 私有 · 经 proxy 访问"]
+    direction LR
+    G3["Cloud Logging 数据源<br/>原始日志三面板"]
+    G1["BigQuery 数据源<br/>4 个 TVF<br/>传 job_key 才裁剪"]
+    G2["Cloud Monitoring 数据源<br/>实时 TPU · HBM<br/>日志速率"]
+  end
+
+  SINK --> RL
+  MLD --> RM
+  MON --> RS
+  RL --> VS
+  RM --> DIM
+  RS --> FCT
+  LA -.一次性回填.-> DP
+  SCHED -.驱动.-> VS
+
+  HUB --> G1
+  FCT --> G1
+  CL -. 直读，不过 BQ .-> G3
+  MON -. 直读，不过 BQ .-> G2
+
+  style DP stroke-width:4px
+  style LA stroke-dasharray: 5 5
+  style SCHED stroke-dasharray: 3 3
 ```
-┌─ 收集 ────────────────────────────────────────────────────────────────┐
-│  GKE Pod 日志 ─┐                                                       │
-│  K8s Events   ─┼─▶ Cloud Logging ─┬─▶ Log Analytics ─▶ defaultLink    │
-│  autoscaler   ─┤    _Default 30天  │     全保真，$0，US 多区域          │
-│  ml_diagnostic─┤                   └─▶ sink `mlobs-selective`          │
-│  Audit Log ────┘                         精选 ~0.2% ─▶ mlobs_raw       │
-│                                                                        │
-│  ML Diagnostics REST ─▶ mldiag_poller.py    ─▶ mlobs_raw.mldiag_*     │
-│  Cloud Monitoring    ─▶ metrics_exporter.py ─▶ mlobs_raw.metric_samples│
-│  （一次性）defaultLink ─▶ backfill_pod_labels.sh ─▶ pod_labels_backfill│
-└────────────────────────────────────────────────────────────────────────┘
-                                    │
-┌─ 处理（纯 SQL，与 defaultLink 同 location）─▼──────────────────────────┐
-│  v_sink_logs      动态发现 sink 表的统一视图                            │
-│        ↓                                                               │
-│  dim_pod  ★骨架   pod → job_key / attempt_uid，取自 GKE label，不猜    │
-│        ↓                                                               │
-│  dim_job_attempt  PK = attempt_uid（一个 Job 对象 = 一次尝试）          │
-│  dim_job          PK = job_key（job 系列，1:N attempt）                 │
-│  dim_mlrun        ML Diagnostics，enrichment（LEFT JOIN）               │
-│        ↓                                                               │
-│  fact_event   统一事件流（6 源），物化，CLUSTER BY job_key              │
-│  fact_step    每 (job, attempt, step) 一行，从日志的 23 个字段抽        │
-│  fact_metric  指标 ⨝ dim_pod，增量，CLUSTER BY job_key                  │
-│  fact_goodput 每次 attempt 的 chip-hours / goodput / 成本               │
-│  job_hub      每个 job 一行 + 深链接，物化                              │
-│         （fact_event / fact_metric 的窗口替换是 BigQuery 事务）          │
-└────────────────────────────────────┬───────────────────────────────────┘
-                                     │
-┌─ 展示：Grafana on Cloud Run（私有 + run.invoker，经 proxy 访问）─▼─────┐
-│  数据源1 BigQuery ─▶ TVF job_overview / job_timeline /                 │
-│                      job_metrics / job_attempts（传 job_key 才裁剪）    │
-│  数据源2 Cloud Monitoring ─▶ 实时 TPU / HBM / 日志速率                  │
-│           （pod 范围由 BQ 的 dim_pod 提供，不靠名字前缀猜）              │
-│  数据源3 Cloud Logging   ─▶ 原始日志三面板（训练输出 / 错误 / TPU 驱动）│
-│           上层 BQ 回答「哪里不对」，下层原文回答「具体是什么」            │
-│  一个 job 一个 URL：/d/mlobs-job?var-job_key=<job>                      │
-└────────────────────────────────────┬───────────────────────────────────┘
-                                     │
-┌─ 保活：Cloud Run job + Cloud Scheduler ─▼──────────────────────────────┐
-│  mlobs-refresh  每 30 分钟跑 refresh.sh；检测到并发执行就跳过            │
-└────────────────────────────────────────────────────────────────────────┘
-```
+
+**三条读路径，成本差三个数量级，这是整个架构的关键取舍：**
+
+| 路径 | 什么时候走 | 成本 |
+|---|---|---|
+| **Cloud Logging 直读**（⑤ G3） | 人要看原文 | **$0** —— ingest 已付 |
+| **Cloud Monitoring 直读**（⑤ G2） | 要实时值，不需要 join job | **$0** |
+| **BigQuery**（③④） | 要排序、聚合、跨渠道 join、超过 30 天 | 扫描计费 |
+
+判据与逐渠道决策见[附录 A](docs/logs.md)，指标侧见[附录 B](docs/metrics.md)。
+
+**图里三个刻意的设计：**
+
+- **`dim_pod` 是骨架（粗框）。** Cloud Monitoring 只给 `pod_name`，日志只给 pod/node，
+  ML Diagnostics 只给自己的 run id —— **没有任何一个渠道知道「job」是什么**。
+  `dim_pod` 是唯一回答「这个 pod 属于哪个 job」的地方，所有东西都从它 join 出去。
+- **`defaultLink` 是虚线。** 全保真、$0，但**每天 303 GB**，只用于一次性回填和人工排查。
+  模型永远不读它 —— 早期版本读了，$1,240/月。
+- **④ 的窗口替换是 BigQuery 事务。** 实测两次刷新重叠时，读者会看到 `fact_event`
+  只有 273 行而不是 310 万行。事务 + ⑥ 的并发跳过，两层都要。
 
 ### 4.2 指标与日志溯源
 
