@@ -4,9 +4,10 @@
 #
 #   PROJECT_ID=tpu-for-training MLDIAG_LOCATIONS=us-central1 ./refresh.sh
 #
-# Order matters. dim_pod must be rebuilt before fact_event and fact_metric,
-# because both resolve pods to jobs through it and a pod that first logged in
-# this cycle would otherwise have a NULL job_key baked into the facts.
+# Order matters. dim_pod must be rebuilt before fact_event, fact_metric and
+# fact_step, because all three resolve pods to jobs through it and a pod that
+# first logged in this cycle would otherwise have a NULL job_key baked into the
+# facts. 08_views stays last: it materialises job_hub from everything above.
 #
 # Cost per cycle is dominated by the two rebuild windows, and both are bounded
 # on purpose. Everything reads the sink tables and metric_samples, never the
@@ -33,7 +34,7 @@ echo "=== Collect ==="
 python3 "${HERE}/model/build_v_sink_logs.py" --project "$PROJECT_ID"
 
 echo "=== Model ==="
-for f in 01_dim_pod 04_fact_event 06_fact_goodput 07_views; do
+for f in 01_dim_pod 04_fact_event 06_fact_goodput 07_fact_step 08_views; do
   printf "  %-18s " "$f"
   if out=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
              < "${HERE}/model/${f}.sql" 2>&1); then
@@ -53,4 +54,7 @@ SELECT 'fact_metric', TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(point_time), MINUT
 FROM \`${PROJECT_ID}.mlobs_core.fact_metric\`
 UNION ALL
 SELECT 'job_hub', TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(last_seen), MINUTE), COUNT(*)
-FROM \`${PROJECT_ID}.mlobs_core.job_hub\`"
+FROM \`${PROJECT_ID}.mlobs_core.job_hub\`
+UNION ALL
+SELECT 'fact_step', TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(step_time), MINUTE), COUNT(*)
+FROM \`${PROJECT_ID}.mlobs_core.fact_step\`"

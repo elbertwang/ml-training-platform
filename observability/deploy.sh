@@ -160,7 +160,7 @@ echo "=== First fill ==="
 "${HERE}/collect/metrics_exporter.py" --project "$PROJECT_ID" --hours "${FIRST_FILL_HOURS:-12}"
 bqq < "${HERE}/model/04_fact_event.sql" >/dev/null
 bqq < "${HERE}/model/06_fact_goodput.sql" >/dev/null
-bqq < "${HERE}/model/07_views.sql" >/dev/null
+bqq < "${HERE}/model/08_views.sql" >/dev/null
 echo "  seeded"
 
 if [[ ",${STAGES}," == *",schedule,"* ]]; then

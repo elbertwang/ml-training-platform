@@ -361,22 +361,103 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 │  dim_mlrun        ML Diagnostics，enrichment（LEFT JOIN）               │
 │        ↓                                                               │
 │  fact_event   统一事件流（6 源），物化，CLUSTER BY job_key              │
+│  fact_step    每 (job, attempt, step) 一行，从日志的 23 个字段抽        │
 │  fact_metric  指标 ⨝ dim_pod，增量，CLUSTER BY job_key                  │
 │  fact_goodput 每次 attempt 的 chip-hours / goodput / 成本               │
 │  job_hub      每个 job 一行 + 深链接，物化                              │
+│         （fact_event / fact_metric 的窗口替换是 BigQuery 事务）          │
 └────────────────────────────────────┬───────────────────────────────────┘
                                      │
-┌─ 展示：Grafana on Cloud Run（IAP）──▼──────────────────────────────────┐
+┌─ 展示：Grafana on Cloud Run（私有 + run.invoker，经 proxy 访问）─▼─────┐
 │  数据源1 BigQuery ─▶ TVF job_overview / job_timeline /                 │
 │                      job_metrics / job_attempts（传 job_key 才裁剪）    │
 │  数据源2 Cloud Monitoring ─▶ 实时 TPU / HBM / 日志速率                  │
 │           （pod 范围由 BQ 的 dim_pod 提供，不靠名字前缀猜）              │
+│  数据源3 Cloud Logging   ─▶ 原始日志三面板（训练输出 / 错误 / TPU 驱动）│
+│           上层 BQ 回答「哪里不对」，下层原文回答「具体是什么」            │
 │  一个 job 一个 URL：/d/mlobs-job?var-job_key=<job>                      │
-│  深链接 ─▶ Logs Explorer（全量日志）/ Cluster Director                  │
+└────────────────────────────────────┬───────────────────────────────────┘
+                                     │
+┌─ 保活：Cloud Run job + Cloud Scheduler ─▼──────────────────────────────┐
+│  mlobs-refresh  每 30 分钟跑 refresh.sh；检测到并发执行就跳过            │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 为什么 `dim_pod` 是骨架
+### 4.2 指标与日志溯源
+
+同一份数据可以从好几条通道拿到，选错通道的代价很大（见[附录 E](docs/metric-map.md)）。
+这张图是**产生方 → 通道 → 我们的模型 → 要回答的问题**的完整链路，
+按算法同学最关心的两个问题组织。虚线是当前的缺口。
+
+```mermaid
+flowchart LR
+  subgraph P["产生方"]
+    direction TB
+    T["训练进程<br/>MaxText"]
+    K["GKE 平台"]
+    H["TPU 硬件<br/>驱动"]
+  end
+
+  subgraph C["通道"]
+    direction TB
+    L1["stderr 日志<br/>completed step 23 字段"]
+    L2["栈转储 / 错误行"]
+    G["Goodput 库<br/>workload/*"]
+    M1["Cloud Monitoring<br/>container/node accelerator"]
+    E1["K8s events"]
+    D1["ML Diagnostics"]
+    TB["TensorBoard<br/>GCS"]
+    DRV["TPU 驱动日志<br/>编译耗时"]
+  end
+
+  subgraph B["我们的模型"]
+    direction TB
+    FS["fact_step 🔨"]
+    FE["fact_event ✅"]
+    FG["fact_goodput ⚠️代理"]
+    DP["dim_job_attempt ✅"]
+  end
+
+  subgraph Q["算法同学的两个问题"]
+    direction TB
+    S["训练稳定性<br/>会不会挂 / 在不在发散"]
+    F["训练效率<br/>能不能更快"]
+  end
+
+  T --> L1 & TB
+  T -.⚙️开关.-> G
+  T -.⚙️开关.-> D1
+  T --> L2
+  K --> E1 & M1
+  H --> DRV & M1
+
+  L1 --> FS
+  L2 --> FE
+  E1 --> FE
+  D1 --> FE
+  M1 --> FG
+  G -.⚙️.-> FG
+  DRV -.❌未收.-> FS
+
+  FS --> S
+  FS --> F
+  FE --> S
+  DP --> S
+  FG --> F
+  G -.⚙️.-> F
+  TB -.人工看.-> F
+
+  style G stroke-dasharray: 5 5
+  style D1 stroke-dasharray: 5 5
+  style DRV stroke-dasharray: 5 5
+  style FS stroke-width:3px
+```
+
+三条虚线是全部缺口：Goodput 库（**开关**）、ML Diagnostics 指标流（**开关**）、
+TPU 驱动的编译耗时（要开发）。粗框的 `fact_step` 同时喂两个问题，
+而且原料已经在 sink 里 —— 详见[附录 F](docs/ml-engineer-view.md)。
+
+### 4.3 为什么 `dim_pod` 是骨架
 
 Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job 必须有映射，
 三种做法只有一种可靠：
@@ -394,7 +475,7 @@ Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job �
 job 两样都不产生。加入 event 前后：生产可见 falcon job **589 → 1,540**，
 JobSet **65 → 201**。
 
-### 4.3 为什么要两个粒度
+### 4.4 为什么要两个粒度
 
 | 键 | 含义 | 不这么做会怎样 |
 |---|---|---|
@@ -403,7 +484,7 @@ JobSet **65 → 201**。
 
 非 Job 工作负载（Deployment/DaemonSet）没有 controller_uid，回落到 controller 名。
 
-### 4.4 四条收集路径
+### 4.5 四条收集路径
 
 | 路径 | 承载 | 不可替代的理由 |
 |---|---|---|
@@ -415,7 +496,7 @@ JobSet **65 → 201**。
 **`severity=WARNING` 刻意不入 sink**：9.33 亿行/天，几乎全是两次 gcsfuse 风暴。
 日志「量」的异常由免费的 `log_entry_count` 指标发现。
 
-### 4.5 目录结构
+### 4.6 目录结构
 
 三个部署脚本，各管一层，因为它们的爆炸半径和重部署频率都不同。
 `./deploy.sh` 默认把三层都装好，`STAGES=data` 只装数据面。
@@ -444,7 +525,7 @@ observability/
 │   ├── 04_fact_event.sql           统一事件流（6 源，窗口替换是事务）
 │   ├── 05_dim_tpu_price.sql        TPU 价格维表
 │   ├── 06_fact_goodput.sql         fact_metric + fact_goodput（同上）
-│   └── 07_views.sql                job_hub + 4 个 TVF + 深链接
+│   └── 08_views.sql                job_hub + 4 个 TVF + 深链接
 ├── schedule/                       ② 定时刷新：Cloud Run job + Cloud Scheduler
 │   ├── deploy.sh
 │   ├── Dockerfile                  google/cloud-sdk:slim + collect/ + model/

@@ -112,6 +112,8 @@
 
 ## 3. 溯源图
 
+> 同一张图也放在 [README §4.2 架构](../README.md#42-指标与日志溯源) 里。
+
 ```mermaid
 flowchart LR
   subgraph P["产生方"]
@@ -182,9 +184,10 @@ TPU 驱动的编译耗时（要开发）。**粗框的 `fact_step` 是回报最�
 
 ---
 
-## 4. 一张表覆盖大部分：`fact_step`
+## 4. 一张表覆盖大部分：`fact_step` ✅ **已上线**
 
-一行 = 一个 (job, attempt, step)，从已经在 sink 里的 23 个字段抽出来。
+一行 = 一个 (attempt, step)，从已经在 sink 里的 23 个字段抽出来。
+生产实测 **74,700 行 / 328 个 job / 零 NULL**，dashboard 里是「训练稳定性与效率」那一行。
 
 | 列 | 来源字段 | 服务于 |
 |---|---|---|
@@ -195,11 +198,25 @@ TPU 驱动的编译耗时（要开发）。**粗框的 `fact_step` 是回报最�
 | `tflops_per_device` | `TFLOP/s/device` | 效率 + MFU 分子 |
 | `tokens_per_sec_device` | `Tokens/s/device` | 效率 |
 | `lr`、`global_batch_size`、`total_weights`、`num_zeros` | 同名 | 上下文 |
-| `step_regressed` | step 号是否回退 | **重启检测** |
-| `tflops_p50` / `tflops_min` / `tflops_spread` | 同一 step 跨 64 个 pod 聚合 | **straggler 检测** |
+| `step_regressed` | step 号低于已达到的最高值 | **重做的进度**。按 `job_key` 而非 `attempt_uid` 分区 —— 重启通常会新建 attempt，按 attempt 分区的话崩溃循环全看着是单调的 |
+| `straggler_ratio` = `step_seconds_max / p50` | 同一 step 跨 rank 聚合 | **straggler 检测，只看慢的一侧** |
+| `step_seconds_min` | 同上 | 异常**快**的 rank = 没干活。实测有一步 63 个 rank 用 56.047 秒、第 64 个用 0.046 秒 |
 
-**必须按 `job-completion-index` 去重**：64 个 pod 每步各打一行，
+**必须按 `completion_index` 去重**：64 个 pod 每步各打一行，
 但 `TFLOP/s/device` 各不相同 —— 聚合成一行的同时保留离散度。
+
+**straggler 只能看慢的一侧。** 对称的 `(max-min)/max` 会被异常快的 rank 主导：
+实测 `falcon-job-7v57lgnxq1` step 7，63 个 rank 报 56.047 秒、rank 24 报 0.046 秒
+（它根本没干活），对称指标读出 0.999 说「灾难性 straggler」，而慢的一侧其实完全齐步。
+`max/p50` 正确读出 1.0。
+
+实测三个 job 的结果：
+
+| job | 结论 |
+|---|---|
+| `falcon-job-8odsihtlc6` | `nan_iters=1`、`skipped_iters=1`、`loss=NaN` → **发散** |
+| `henry-ling3-plus-fp8-test-pdb2` | 4 次尝试各跑 0–29 步，**87 步被重做**，straggler 26.9 → **崩溃循环** |
+| `lossdif-plus-1000-r107-08260532` | 946 步、150 TFLOP/s、straggler 1.46 → 健康 |
 
 MFU 的分母 `peak_tflops_per_device` 在日志的 `Config param` 行里，一次性取就行。
 
@@ -226,9 +243,12 @@ MFU 的分母 `peak_tflops_per_device` 在日志的 `Config param` 行里，一�
 ## 6. 建议顺序
 
 ```
+已完成
+  ✅ fact_step + job_steps TVF + dashboard「训练稳定性与效率」一行
+
 现在就能做（不依赖任何开关）
-  🔨 fact_step ——「一张表覆盖大部分」，原料已在 sink
   🔨 栈转储抽成事件（哪个 rank 卡了）
+  🔨 MFU —— 分母 peak_tflops_per_device 在 Config param 行里，要单独解析
   🔧 修 OOMKilling 归属（17,710 条孤儿，走 node→job 一跳）
 
 你开完开关之后

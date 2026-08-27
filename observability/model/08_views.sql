@@ -166,3 +166,35 @@ WHERE job_key = p_job_key;
 CREATE OR REPLACE TABLE FUNCTION mlobs_core.job_attempts(p_job_key STRING) AS
 SELECT * FROM mlobs_core.fact_goodput WHERE job_key = p_job_key
 ORDER BY first_seen;
+
+-- The per-step view an ML engineer opens first. Everything here is parsed from
+-- the training log line, so it works today without any workload config change.
+--
+-- `step_regressed` is the restart detector: a step number lower than the
+-- highest one already reached means progress was lost and those steps are being
+-- redone. Two details matter.
+--
+-- Partition by job_key, NOT attempt_uid. A restart usually creates a *new*
+-- attempt, so partitioning by attempt would make every crash loop look
+-- monotonic -- measured: henry-ling3-plus-fp8-test-pdb2 ran steps 0-29 four
+-- times over four attempts, and an attempt-scoped window reports zero
+-- regressions for it.
+--
+-- Compare against the running maximum, not the previous row, because a crash
+-- loop replays the same range repeatedly and a lagged comparison only flags the
+-- single row at each seam.
+CREATE OR REPLACE TABLE FUNCTION mlobs_core.job_steps(p_job_key STRING) AS
+SELECT
+  * EXCEPT (max_step_so_far),
+  step < max_step_so_far AS step_regressed
+FROM (
+  SELECT
+    s.*,
+    MAX(step) OVER (
+      PARTITION BY job_key ORDER BY step_time
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ) AS max_step_so_far
+  FROM mlobs_core.fact_step s
+  WHERE job_key = p_job_key
+)
+ORDER BY step_time;

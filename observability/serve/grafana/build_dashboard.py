@@ -423,6 +423,87 @@ GROUP BY time, container_name ORDER BY time""")],
     })
     y += 7
 
+    # ---- row: training stability & efficiency (fact_step) -------------------
+    # The row an ML engineer opens first. Every series here is parsed from the
+    # training log line that is already in the sink -- no workload config change
+    # is needed for any of it. See docs/ml-engineer-view.md.
+    panels.append({"type": "row", "title": "训练稳定性与效率 Steps",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    # Stability first, and as stat tiles rather than a chart: these are
+    # threshold questions ("is it non-zero?"), not trends.
+    panels += [
+        stat(f"""SELECT MAX(nan_iters) AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "NaN 迭代", 0, y, 4, 4, "v", decimals=0,
+             desc="非 0 就是训练发散。这是最早的信号，来自日志里的 nan_iters 字段。",
+             steps=[{"color": STATUS["good"], "value": None},
+                    {"color": STATUS["critical"], "value": 1}]),
+        stat(f"""SELECT MAX(skipped_iters) AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "跳过的迭代", 4, y, 4, 4, "v", decimals=0,
+             desc="梯度裁剪触发或坏 batch。持续增长说明数据或学习率有问题。",
+             steps=[{"color": STATUS["good"], "value": None},
+                    {"color": STATUS["warning"], "value": 1}]),
+        stat(f"""SELECT COUNTIF(step_regressed) AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "重做的 step", 8, y, 4, 4, "v", decimals=0,
+             desc="step 号低于已达到的最高值 = 从 checkpoint 重启，这些步白跑了。"
+                  "按 job 而非 attempt 统计，所以跨重启的重放也算得到。",
+             steps=[{"color": STATUS["good"], "value": None},
+                    {"color": STATUS["warning"], "value": 1},
+                    {"color": STATUS["critical"], "value": 50}]),
+        stat(f"""SELECT MAX(straggler_ratio) AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "最差 straggler 比", 12, y, 4, 4, "v", decimals=2,
+             desc="最慢的 rank 相对中位数的倍数。1.0 = 齐步走；1.1 = 有人拖慢 10%。"
+                  "只看慢的一侧 —— 异常快的 rank 是没干活，不是快。",
+             steps=[{"color": STATUS["good"], "value": None},
+                    {"color": STATUS["warning"], "value": 1.1},
+                    {"color": STATUS["critical"], "value": 1.5}]),
+        stat(f"""SELECT MAX(step) AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "最大 step", 16, y, 4, 4, "v", decimals=0,
+             desc="训练进度。"),
+        stat(f"""SELECT APPROX_QUANTILES(tflops_p50, 2)[OFFSET(1)] AS v
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')""",
+             "TFLOP/s/device 中位", 20, y, 4, 4, "v", decimals=0,
+             desc="实测单卡算力。除以 peak_tflops_per_device 就是 MFU。"),
+    ]
+    y += 4
+
+    panels.append({
+        "type": "timeseries", "title": "Loss 与梯度范数",
+        "description": "loss 突刺、grad_norm 飙高、grad_norm 与 raw_grad_norm 分离"
+                       "（= 裁剪在起作用），都是发散的前兆。",
+        "gridPos": {"x": 0, "y": y, "w": 12, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT step_time, loss, lm_loss, grad_norm, raw_grad_norm
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')
+WHERE $__timeFilter(step_time) ORDER BY step_time""")],
+        "fieldConfig": {"defaults": {"custom": {"lineWidth": 2, "fillOpacity": 0,
+                                                "showPoints": "never"}},
+                        "overrides": []},
+    })
+
+    panels.append({
+        "type": "timeseries", "title": "Step 耗时：中位 / 最慢 rank",
+        "description": "两条线分开 = 有 straggler。整体抬高 = 变慢了，"
+                       "去看编译或数据管道。",
+        "gridPos": {"x": 12, "y": y, "w": 12, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT step_time, step_seconds_p50, step_seconds_max
+FROM `{project}.mlobs_core.job_steps`('${{job_key}}')
+WHERE $__timeFilter(step_time) ORDER BY step_time""")],
+        "fieldConfig": {"defaults": {"unit": "s",
+                                     "custom": {"lineWidth": 2, "fillOpacity": 0,
+                                                "showPoints": "never"}},
+                        "overrides": []},
+    })
+    y += 8
+
     # ---- row 6: raw logs (Cloud Logging, not BigQuery) ----------------------
     # The "read the text" layer. Everything above this row is BigQuery telling
     # you *that* something happened and how it ranks; these three panels are

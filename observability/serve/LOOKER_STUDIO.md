@@ -173,6 +173,6 @@ EOF
   做成条件格式，过期的 job 把按钮置灰。
 - **Cluster Director 深链接只到项目级。** ML Diagnostics 单个 run 的控制台路径没有
   公开文档，我没有实测确认，所以没有编造一个可能失效的路径。需要有人在浏览器里
-  打开一次 run 页面、把真实 URL 贴出来，然后改 `07_views.sql` 里那一行。
+  打开一次 run 页面、把真实 URL 贴出来，然后改 `08_views.sql` 里那一行。
 - **Looker Studio 报表本身不在版本控制里。** 建完之后建议导出报表配置留档，
   或者至少把 `REPORT_ID` 记进 `dim_config`。
