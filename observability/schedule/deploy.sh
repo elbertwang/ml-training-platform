@@ -11,7 +11,7 @@
 # which decay in half an hour. dim_pod is still a full rebuild at ~3.6 GB, which
 # makes cadence most of the running cost: ~$65/month at 15 minutes, ~$32 at 30.
 #
-# See docs/log-routing.md for the split, and its TBD-2 for why dim_pod should
+# See docs/logs.md for the split, and its TBD-2 for why dim_pod should
 # eventually accumulate rather than rebuild -- that would cut this again.
 set -euo pipefail
 

@@ -21,7 +21,7 @@ costs to use:
                   live in BigQuery and exist nowhere else.
 
 Usage:
-  ./build_capability_map.py --project tpu-for-training --out ../docs/capability-map.md
+  ./build_capability_map.py --project tpu-for-training --out ../docs/generated/capability-map-prod.md
   ./build_capability_map.py --project X --probe-days 7 --concurrency 32
 """
 

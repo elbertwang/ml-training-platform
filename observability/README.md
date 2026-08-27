@@ -19,7 +19,7 @@
 
 1. [设计原则](#1-设计原则)
 2. [环境实测底数](#2-环境实测底数)
-3. [指标能力地图与分层漏斗](#3-指标能力地图与分层漏斗)
+3. [两个视角、两个使用者](#3-两个视角两个使用者)
 4. [架构](#4-架构)
 5. [当前状态](#5-当前状态)
 6. [成本](#6-成本)
@@ -27,12 +27,14 @@
 8. [路线图](#8-路线图)
 9. [运行方式](#9-运行方式)
 10. [Caveats](#10-caveats)
-11. [附录 A：踩过的坑](#11-附录-a踩过的坑)
-12. [附录 B：监控渠道分类地图](docs/channel-map.md) ← 单独文档
-13. [附录 C：日志路由方案](docs/log-routing.md) ← 单独文档
-14. [附录 D：Goodput 框架原生指标](docs/goodput.md) ← 单独文档
-15. [附录 E：指标渠道地图](docs/metric-map.md) ← 单独文档
-16. [附录 F：算法同学视角](docs/ml-engineer-view.md) ← 单独文档
+11. [踩过的坑](#11-踩过的坑)
+
+**两个附录，各自自包含（大全 + 地图）：**
+
+- **[附录 A：日志](docs/logs.md)** —— 27 个日志渠道 + 4 个 API 渠道的完整清单、
+  按意图导航、归属方式、每条渠道的路由决策（留 Cloud Logging 还是进 BigQuery）、待办
+- **[附录 B：指标](docs/metrics.md)** —— 五个来源 × 两个视角、全量能力地图（167 个
+  实测有数据）、goodput 算法拆解、新增指标的决策规则、要客户打开的开关
 
 ---
 
@@ -132,7 +134,7 @@ severity 分布（1 天）：`WARNING` **9.33 亿（75%）** · `INFO` 2.97 亿 
 sink，从不扫全量 payload。
 
 > 一个 job 到底能查到哪些日志渠道（实测 27 个日志 + 4 个 API），以及算法同学
-> 「我想知道 X 该看哪儿」的导航表，见 [`docs/channel-map.md`](docs/channel-map.md)。
+> 「我想知道 X 该看哪儿」的导航表，见 [附录 A](docs/logs.md)。
 
 ### 2.4 保留与降采样
 
@@ -148,189 +150,59 @@ BigQuery 副本必需而非冗余的根本原因。
 
 ---
 
-## 3. 指标能力地图与分层漏斗
+## 3. 两个视角、两个使用者
 
-### 3.1 漏斗：9,594 → 167 → 24
+这个平台要回答的问题分两类。它们的使用者、分母和紧急程度都不同，混在一起看会得出
+错误结论。
 
-`tools/build_capability_map.py` 对生产实测（1 天窗口）：
-
-```
-Cloud Monitoring 全局目录        9,594 个描述符
-   │ 按指标类型前缀过滤，排除 kubernetes.io/anthos/*
-   │ （anthos 占 kubernetes.io 3,486 个里的 3,360 个，与 GKE 无关）
-   ▼
-本项目可能有的                   1,012 个
-   │ 逐个探测是否真有数据
-   ▼
-本项目实际有数据                   167 个   ← 能力地图
-   │ L1 平台 109（kubernetes.io 89 · logging 12 · container 8）
-   │ L2 采集  58（GMP 53 · 自定义 5）
-   │ 合计 1,757,628 条时间序列
-   ▼
-本平台真正要用的                    24 个   ← 见 §3.5
-```
-
-**只看描述符会得出错误结论** —— 全局目录里有 AWS EC2、CloudSQL、AlloyDB、Apigee，
-这个项目一个都不产生。能力地图必须生成，不能手写。
-
-生成结果：[`docs/capability-map-prod.md`](docs/capability-map-prod.md)（`.json` 是
-机器可读版）。重新生成：
-
-```bash
-tools/build_capability_map.py --project <P> --probe-days 1 \
-  --out docs/capability-map-<env>.md --json-out docs/capability-map-<env>.json
-```
-
-> **基数注意**：`container/accelerator/tensorcore_utilization` **一天内**就有
-> **17,768 条序列** —— 不是有 1.7 万个容器，而是 pod 名不断变化，每个新 pod 就是
-> 一条新序列。基数最高的是 `gcsfusecsi/fs_ops_latencies`（59,726）。
-> 这是 Grafana 面板必须按 pod 过滤、不能整指标拉的原因。
-
-### 3.2 五层模型
-
-| 层 | 是什么 | 例子 | 采集成本 | 存哪 |
-|---|---|---|---|---|
-| **L0 原始信号** | 非结构化，不是指标，但是很多指标的原料 | 容器日志、K8s 事件 | **$0.50/GiB —— 全平台最贵**（1,631 GiB/天） | Log Analytics 全量 + 精选 sink |
-| **L1 平台指标** | GCP 白送 | `kubernetes.io/*` —— GKE TPU 的全部信号都在这 | **$0** | Cloud Monitoring 原地 |
-| **L2 采集指标** | 要跑采集器或改代码 | GMP `prometheus.googleapis.com/*`、工作负载自报 `custom.googleapis.com/*` | GMP **$0.06/百万样本**；自定义 **$0.258/MiB** | Cloud Monitoring 原地 |
-| **L3 运行元数据** | **不是时序，是实体** —— 提供身份与判定 | ML Diagnostics run/event/analyzer、K8s 对象 | 轮询，几乎免费 | BQ `mlobs_raw` → `dim_*` |
-| **L4 派生指标** | 本平台算出来的，**别处不存在** | goodput、chip-hours、成本、启停时间、MTTR | BQ 增量扫描，约 $0.01/月 | BQ `fact_*` / `job_hub`，**永久** |
-
-**L3 必须单独成层**：ML Diagnostics 的 run 是带生命周期的对象不是时序。当成指标
-处理会丢掉 `workloadDetails.gke.id` 这个 join key——而整个 L4 都靠它。
-
-### 3.3 决策漏斗：新指标放哪
-
-按顺序过闸，第一个命中的就是答案。前提是 §1.1 那条边界已满足。
-
-```
-新指标需求
-  │
-  ├─① 短名单（§3.5 的 24 个）里有吗？ → 有 → 直接用            → L1/L2
-  │
-  ├─② 完整能力地图里有吗？            → 有 → 直接用            → L1/L2
-  │
-  ├─③ 它其实是「实体属性」而非时序吗？
-  │     owner、模型名、超参、TPU 型号、提交时间 → dim_*        → L3
-  │
-  ├─④ GCP 能免费产生吗？ → 能 → 零成本零维护                   → L1
-  │
-  ├─⑤ 必须由训练进程自报吗？（loss / MFU / 自定义业务量）      → L2
-  │     两条硬规矩：
-  │       a. 走 GMP，不要 custom.googleapis.com
-  │          4.32 亿样本/月：GMP ≈ $26，自定义指标 ≈ $3,150
-  │       b. 一个指标 + 标签，绝不每个维度一个指标
-  │          反面教材：maxtext 的 713 个 Router_bias_mean_layer_N
-  │
-  ├─⑥ 需要 join job 身份 / 跨源关联 / 超过 6 周原分辨率 / 算钱？→ L4
-  │
-  └─⑦ 只是想多一条曲线？ → 不新建，Grafana 直读 L1/L2         → 不落地
-```
-
-> ⑤a 的口径：GMP 按样本计费（$0.06/百万，量大降到 $0.024），自定义指标按字节
-> （前 150 MiB 免费，之后 $0.258/MiB）。$3,150 假设每样本约 30 字节，此假设未实测
-> 核实 —— 但相差两个数量级的结论不依赖精确取值。
-
-### 3.4 指标直读还是入 BigQuery
-
-| | 直读 Cloud Monitoring | 导出到 BigQuery |
+| | **Job 视角** | **集群视角** |
 |---|---|---|
-| API 请求 | $0（SKU 原文「Sku is not being priced by default」） | $0 |
-| Time series 计数 | 随 面板×人数×刷新率 增长 | 固定，与观看人数无关 |
-| BQ 存储 | $0 | 第 12 月约 $0.4 |
-| **BQ 重建扫描** | $0 | **增量 6h 窗口 $0.01 / 全量重建 $88** |
-| 能 join job 身份 | ❌ | ✅ |
-| 6 周后仍有原分辨率 | ❌ | ✅ |
+| 问的是 | 「我这个任务跑得好不好」 | 「我们买的卡有没有在产出」 |
+| 使用者 | 算法同学 + SRE | 平台负责人、财务 |
+| 分母 | 这个 job 的墙钟时间 | **集群总芯片 × 时间**（不管有没有 job） |
+| 代表指标 | goodput、MFU、step time、中断次数 | 芯片占用率、空闲卡数、$/有效卡时 |
+| 现状 | ✅ 已做，goodput 精度待提升 | ❌ **几乎没做** |
 
-**判据：**
+**Job 视角永远看不见「没跑起来的卡」。** 实测集群 **488 张卡，432 张有容器，
+298 张在忙 = 61%** —— 那 56 张连 pod 都没有的卡，每个 job 的 goodput 都报 100%
+也照样在烧钱。这是集群视角必须单独建的原因。
 
-- **直读** —— 只用于看、不参与 join、只看 6 周内。例：`memory_used`、`duty_cycle`
-- **入 BQ** —— 满足任一：① 要 join `dim_pod`（goodput / 成本 / 按 owner·exp 归因）
-  ② 要超过 6 周的原分辨率 ③ 要和日志事件同表做时间线。
-  例：`tensorcore_utilization`、`log_entry_count`
+### 3.1 算法同学关心的两件事
 
-存储从来不是成本，**重建方式才是**：全量 `CREATE OR REPLACE` 与增量窗口相差三个
-数量级。
-
-### 3.5 平台实际要用的 24 个
-
-89 个 `kubernetes.io/*` 全部对得上官方 GKE 指标表，没有噪声。但训练可观测性只用得
-上其中一小部分。
-
-**要用的**（★ = 有数据但尚未接入）
-
-| 指标（省略 `kubernetes.io/`） | 用途 | 状态 |
+| | **训练稳定性** | **训练效率** |
 |---|---|---|
-| `container/accelerator/tensorcore_utilization` | goodput 输入 | ✅ 已入 BQ |
-| `container/accelerator/{memory_used, memory_total, duty_cycle}` | HBM / 芯片占用 | ✅ Grafana 直读 |
-| `logging.googleapis.com/log_entry_count` | 日志风暴 | ✅ 已入 BQ |
-| ★ `jobset/proxy_runtime_goodput` | **原生 goodput** | 未接，见 §3.6 |
-| ★ `jobset/{scheduling_goodput, uptime, startup_duration}` | 调度 goodput / 时长 | 未接 |
-| ★ `node_pool/interruption_count` | **中断归因**，带 `interruption_type`/`interruption_reason` | 未接 |
-| ★ `node_pool/accelerator/startup_duration` | TPU 节点池启动 | 未接 |
-| ★ `node/latencies/startup` | 节点启动延迟 | 未接 |
-| ★ `pod/latencies/pod_first_ready` | Pod 就绪延迟 | 未接 |
-| ★ `container/{restart_count, uptime}` | 崩溃循环 / 存活时长 | 未接 |
-| ★ `container/multislice/network/{collective_end_to_end_latencies, dcn_transfer_latencies}` | **多 slice 通信 —— hang 诊断核心** | 未接 |
-| ★ `container/multislice/accelerator/{host_to_device, device_to_host}_transfer_latencies` | 主机↔芯片传输 | 未接 |
-| ★ `container/multislice/network/grpc_tcp_{delivery_rates, min_round_trip_times}` | ICI/TCP 质量 | 未接 |
-| ★ `gcsfusecsi/file_cache_read_count`（`cache_hit`） | 数据管道缓存命中 | 未接 |
-| ★ `gcsfusecsi/fs_ops_error_count`（`fs_error_category`） | **gcsfuse 报错** | 未接 |
-| ★ `gcsfusecsi/gcs_request_latencies` | GCS 读延迟 | 未接 |
+| 问的是 | 「会不会挂 / 是不是在发散」 | 「同样的卡能不能跑更快」 |
+| 时间尺度 | **秒级到分钟级**，要告警 | 小时级，看趋势 |
+| 看错的代价 | 烧几小时卡时训出一个废模型 | 慢 10% |
+| 最该盯 | `nan_iters`、`grad_norm`、重启次数 | `TFLOP/s/device`、MFU、step time 方差 |
 
-**明确不要的 65 个**
+**紧急程度差一个量级**，所以稳定性做告警、效率做趋势图。
 
-| 族 | 数量 | 为什么 |
-|---|---|---|
-| `container/*/{request,limit}_*` | 15 | 容量规划，与训练效率无关 |
-| `container/*_utilization`、`page_fault_count`、`swap_used_bytes` | 8 | host 侧资源，ML Diag analyzer 已覆盖 |
-| `node/{cpu,memory,ephemeral_storage,pid,network}/*` | 20 | 节点容量，无 job 归属 |
-| `pod/volume/*`、`pod/network/*` | 5 | 与 TPU 训练无关 |
-| `networking/dns/*` | 5 | 非训练路径 |
-| `node_daemon/*`、`autoscaler/*` 等 | 12 | 平台自运维 |
+好消息是稳定性最关键的三个信号**今天就在 sink 里流着，不用开任何开关** ——
+一条 `completed step` 日志有 23 个字段，`nan_iters` / `skipped_iters` /
+`grad_norm` 都在里面。`mlobs_core.fact_step` 已经把它们建成表，
+Grafana 里是「训练稳定性与效率」那一行。详见[附录 A §7](docs/logs.md)。
 
-**用法：加图表或告警先在这 24 个里找，找不到再走 §3.3。** 不要去读 89 条说明。
+### 3.2 SRE 关心的
 
-### 3.6 原生 goodput 与 falcon 的覆盖缺口
+硬件健康、任务连续性、中断归因 —— 主要靠 `fact_event` 的统一时间轴
+（6 个来源）和节点级指标。归属方式见[附录 A §3](docs/logs.md)。
 
-GKE 原生发布 JobSet 的 goodput，资源是 `k8s_entity`，`entity_name` **就是我们的
-`job_key`**：
+### 3.3 指标从哪来
 
-```
-kubernetes.io/jobset/proxy_runtime_goodput   实测 0.88 / 0.30 / 0.80 / 0.79
-kubernetes.io/jobset/scheduling_goodput      实测 0.89 / 0.84 / 0.88
-kubernetes.io/jobset/startup_duration        实测 55s / 119s
-```
+五个来源、全量能力地图（实测 **9,594 个描述符 → 167 个有数据 → 24 个真正要用**）、
+以及「新增指标放哪」的决策规则，全部在**[附录 B](docs/metrics.md)**。
 
-**但 `entity_type` 实测只有 `jobset`**：
+三条最该记住的：
 
-| | 生产 job 数 | 有原生 goodput |
-|---|---|---|
-| falcon（普通 `Job`） | **1,540** | ❌ 0 |
-| jobset | 201 | ✅ |
-| 其它 | 91 | ❌ |
-
-**85% 的任务拿不到原生 goodput**，因为 kubemaker 提交的是普通 `Job`。
-
-> **🚧 TBD —— 蚂蚁正在做 kubemaker 改用 JobSet 的迁移。** 迁移完成后这 1,540 个
-> 任务白拿 GKE 原生的 goodput / 运行时长 / 启动耗时，双方都不用写代码。
-> 在那之前 falcon 族继续用 L4 的 tensorcore 代理算法，并用那 201 个 JobSet 校准
-> 代理算法的偏差。
-
-### 3.7 已废弃的自定义指标
-
-项目里有 771 个 `custom.googleapis.com/*` 描述符，**全部停写**：
-
-| 族 | 数量 | 最后有数据 | 能力 → 我们的对应 |
-|---|---|---|---|
-| `maxtext/*` | 758（其中 713 个是每层一个的 Router 诊断） | 2026-08-02 | loss/MFU/step_time → L4 `fact_step`，从 sink 里已有的 `completed step` 行建 |
-| `tpu_finance/*` | 9 | 2026-07-29 | jobrun_mfu → 同上；`month_reservation_utilization` → **仍是缺口** |
-| `ling3/*`、`training/*` | 4 | 30 天以上 | autorepair MTTR → L4，原料在 `dim_job_attempt` + `fact_event` |
-
-**删掉它们省 $0** —— Metric Volume 按写入字节计费，停写的描述符不产生费用。唯一
-收益是 Metrics Explorer 少 771 个死选项，代价是不可逆且带走历史。
-`tools/deprecate_legacy_metrics.sh` 提供了这个操作（**默认 dry-run**，且会先确认
-样本 7 天无数据）。**未执行，由你决定。**
+- **框架的同一份指标有 6 个出口**（stdout、TensorBoard、本地文件、GCS、
+  ML Diagnostics、Cloud Monitoring），选哪条是纯配置问题。**我们现在走的是最差的
+  那条 —— 从 stdout 解析**，虽然它今天就能用。
+- **按层展开的量永远不要进 Cloud Monitoring。** 生产里 771 个死描述符中 183 个是
+  `Router_*_layer_N`，全部零数据 —— 这条路开过又废弃了。
+- **集群视角要用 node 级指标。** 实测 `node/accelerator/tensorcore_utilization`
+  有 504 条序列，容器级只有 456 条 —— 差的 48 条正是**没有 pod 的芯片**，
+  在容器级指标里不是 0 而是根本不存在。
 
 ---
 
@@ -385,7 +257,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 ### 4.2 指标与日志溯源
 
-同一份数据可以从好几条通道拿到，选错通道的代价很大（见[附录 E](docs/metric-map.md)）。
+同一份数据可以从好几条通道拿到，选错通道的代价很大（见[附录 B](docs/metrics.md)）。
 这张图是**产生方 → 通道 → 我们的模型 → 要回答的问题**的完整链路，
 按算法同学最关心的两个问题组织。虚线是当前的缺口。
 
@@ -455,7 +327,7 @@ flowchart LR
 
 三条虚线是全部缺口：Goodput 库（**开关**）、ML Diagnostics 指标流（**开关**）、
 TPU 驱动的编译耗时（要开发）。粗框的 `fact_step` 同时喂两个问题，
-而且原料已经在 sink 里 —— 详见[附录 F](docs/ml-engineer-view.md)。
+而且原料已经在 sink 里 —— 详见[附录 A](docs/logs.md)。
 
 ### 4.3 为什么 `dim_pod` 是骨架
 
@@ -542,9 +414,11 @@ observability/
 │   ├── build_capability_map.py     生成能力地图
 │   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run；看清注释再跑）
 └── docs/
-    ├── channel-map.md              附录 B：渠道实测底数
-    ├── log-routing.md              附录 C：路由决策 + 待办
-    └── capability-map-prod.md      指标能力地图
+    ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
+    ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
+    └── generated/                  工具产物，勿手改
+        ├── capability-map-prod.md
+        └── capability-map-prod.json
 
 ```
 
@@ -568,7 +442,7 @@ observability/
 | 组件 | 名称 | 说明 |
 |---|---|---|
 | Grafana | Cloud Run `mlobs-grafana` | **私有服务 + Cloud Run IAM**，通过 `gcloud run services proxy` 访问。Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
-| 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 C） |
+| 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 A） |
 | 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
 | 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
 
@@ -609,7 +483,7 @@ gcloud run services proxy mlobs-grafana \
 | `mldiag_runs`（原始） | 15,220 |
 
 > **历史深度只有 3 天**（`dim_pod` 最早 08-23），而 `_Default` 有 30 天可用。
-> 这是当前最大的缺口，见附录 C 的 TBD-1 / TBD-2。
+> 这是当前最大的缺口，见附录 A 的 TBD-1 / TBD-2。
 
 ### 5.3 延迟预算（实测）
 
@@ -706,7 +580,7 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 | # | 事项 | 影响 | 状态 |
 |---|---|---|---|
-| 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [`docs/channel-map.md`](docs/channel-map.md) §4 | ❌ 已撤回 |
+| 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [附录 A](docs/logs.md) §4 | ❌ 已撤回 |
 | 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | ⏳ 待决策 |
 | 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效**（filter 要求 `pod_name=~"-worker-"`，falcon pod 名对不上） | ⏳ 待决策（改现有生产告警） |
 | 4 | **kubemaker 改用 JobSet** | 1,540 个任务白拿 GKE 原生 goodput | 🚧 **TBD —— 蚂蚁正在做** |
@@ -722,9 +596,9 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 - [x] `refresh.sh` 进 Cloud Run Job + Cloud Scheduler（每 30 分钟，含并发保护）
 - [x] Grafana 部署到生产 `tpu-for-training`（三个数据源实测都取到数）
 - [ ] 验证 Grafana 告警（BQ 插件自带 alerting，需确认是否要 `min-instances=1`；
-      Cloud Logging 数据源**不支持**告警，见附录 C §1.2）
+      Cloud Logging 数据源**不支持**告警）
 
-**P0' — 历史深度**（现在最大的缺口，见附录 C 的 TBD-1 / TBD-2）
+**P0' — 历史深度**（现在最大的缺口，见附录 A 的 TBD-1 / TBD-2）
 - [ ] `dim_pod` 改成 MERGE 累积 —— 现在是 30 天滚动全量重建，会遗忘
 - [ ] 回填补到 30 天 —— 现在只有 3 天，`_Default` 里有 30 天（一次性约 $56）
 
@@ -858,7 +732,7 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 11. 附录 A：踩过的坑
+## 11. 踩过的坑
 
 按类型归档。都是实测撞出来的，写在这里避免重犯。
 
@@ -920,90 +794,25 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 12. 附录 B：监控渠道分类地图
+## 12. 附录
 
-单独成文：**[`docs/channel-map.md`](docs/channel-map.md)**
+两个附录，各自自包含（大全 + 地图）：
 
-实测一个 JobSet（64 pod / 64 节点 / 3 小时）能查到的**全部 27 个日志渠道 + 4 个
-API 渠道**，按归属层级（pod / node / cluster / api）组织，并附一张给算法同学的
-**「我想知道 X → 该看哪儿」** 导航表。
+### [附录 A：日志](docs/logs.md)
 
-里面有两个容易误判的渠道值得单独看：
-
-- **§4 TPU 驱动日志** —— `sidecar-log-collector` 有 99.94% 是 `tpu_driver.INFO`
-  的转发，含每小时 2.4 万次的**编译耗时**，无任何指标替代
-- **§5 ML Diagnostics 是三条子渠道** —— `WORKLOAD_TERMINATION` **只在日志流**里
-  （12 小时 376 个），REST API 五个月一次都没返回过；另有 10 秒粒度的性能日志完全未采集
-
----
-
-## 13. 附录 C：日志路由方案
-
-单独成文：**[`docs/log-routing.md`](docs/log-routing.md)**
-
-附录 B 是**实测底数**（一个 jobset 到底有多少渠道），附录 C 是**路由决策**
-（每个渠道留 Cloud Logging 还是建模进 BigQuery，为什么，现在做到哪一步）。
+27 个日志渠道 + 4 个 API 渠道的完整清单（按归属层级 L-pod / L-node / L-cluster
+/ L-api）、按意图导航表、归属方式、每条渠道的路由决策、TPU 驱动日志与
+ML Diagnostics 三条子渠道的深挖、`fact_step` 的 23 个字段、缺口与 TBD。
 
 判据一句话：**人要「读」的原文留 Cloud Logging，机器要「算」的事实进 BigQuery。**
-两者在 Grafana 里是同一个页面的上下两层，用同一个 `$job` 变量联动，缺任何一层
-页面都不成立。附录 C 还列出了 10 条待决事项（TBD-1 ~ TBD-10）和落地顺序。
+两者在 Grafana 里是同一页面的上下两层，用同一个 `$job` 变量联动。
 
----
+### [附录 B：指标](docs/metrics.md)
 
-## 14. 附录 D：Goodput 框架原生指标
+五个来源（框架自带 / Goodput 库 / GCP 原生 / 日志派生 / 缺口）× 两个视角
+（job / 集群）、**全量能力地图**（167 个实测有数据，含标签与基数）、
+`ml-goodput-measurement` 的 14 类 badput 算法拆解、五层模型与新增指标决策规则、
+771 个废弃自定义指标的处置、要客户打开的开关清单。
 
-单独成文：**[`docs/goodput.md`](docs/goodput.md)**
-
-MaxText 集成的 `ml-goodput-measurement` 能直接把 goodput 和 **14 类 badput 分解**
-写进 Cloud Monitoring（`compute.googleapis.com/workload/*`）。附录 D 逐条拆解了
-它的算法与含义，以及和我们自算指标的差距。
-
-三个要点：
-
-- **分母是真实墙钟**（`job_end − job_start`），分解闭合（残差进 `OTHER`），
-  所以中断时间必然被计为 badput。我们自己的 `fact_goodput` 分母是「有样本的时间」，
-  故障时间被排除在外 —— 实测有 job 报 **goodput 100% 而采样覆盖只有 0.1**。
-- **前提条件全部满足**（库已装、节点池 scope 正确、埋点齐全），只差 fork 里
-  `enable_goodput_recording` / `monitor_goodput` 两个开关，现在**零数据**。
-- 按 job 数只覆盖 6%，但**按卡时覆盖 77%**（198 个 JobSet = $185,878/48h）。
-
-它覆盖不了的部分正是本平台要守住的：集群级账本（实测 **488 张卡只有 298 张在忙**）、
-进程启动之前的排队与节点池创建、非 MaxText 负载、跨 job 关联、归因到具体硬件。
-
----
-
-## 15. 附录 E：指标渠道地图
-
-单独成文：**[`docs/metric-map.md`](docs/metric-map.md)**
-
-附录 B 盘的是日志渠道，这份盘的是**指标**渠道：五个来源（框架自带、Goodput 库、
-GCP 原生、日志派生、缺口）× **两个视角**（job / 集群）。
-
-三个最该记住的：
-
-- **框架的同一份指标有 6 个出口**（stdout、TensorBoard、本地文件、GCS、
-  ML Diagnostics、Cloud Monitoring），选哪条是纯配置问题。**我们现在走的是最差的
-  那条 —— 从 stdout 解析。**
-- **按层展开的量永远不要进 Cloud Monitoring。** 生产里 771 个死描述符中有 183 个是
-  `Router_*_layer_N`，全部零数据 —— 这条路开过又废弃了。
-- **集群视角要用 node 级指标，不是 container 级。** 实测
-  `node/accelerator/tensorcore_utilization` 有 504 条序列，容器级只有 456 条 ——
-  差的 48 条正是**没有 pod 的芯片**，在容器级指标里不是 0 而是根本不存在。
-
-§7 是「新增指标放哪」的五步决策规则，§8 是建议的开发顺序。
-
----
-
-## 16. 附录 F：算法同学视角
-
-单独成文：**[`docs/ml-engineer-view.md`](docs/ml-engineer-view.md)**
-
-前面几个附录是按**渠道**盘的，这一份按**人**盘：算法同学关心训练稳定性和训练效率，
-每个该看的数从哪来，含一张溯源图。
-
-最重要的一条：**稳定性最关键的三个信号今天就在 sink 里流着，一个开关都不用开。**
-实测一条 `completed step` 日志有 **23 个字段**，其中 `nan_iters`（NaN 迭代计数，
-发散的最早信号）、`skipped_iters`、`grad_norm` / `raw_grad_norm` 全都在。
-缺的只是一张 `fact_step` 表 —— 它同时喂稳定性和效率两个问题，是当前回报最高的开发项。
-
-§5 是需要客户去打开的开关清单（按性价比排，全部只改提交参数，不改镜像也不改节点池）。
+> 工具产物在 [`docs/generated/`](docs/generated/)：能力地图的原始生成结果与
+> JSON。由 `tools/build_capability_map.py` 生成，不要手改。

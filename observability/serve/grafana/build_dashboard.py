@@ -82,7 +82,7 @@ def logs(project, lql):
     """A Cloud Logging query. The raw-text half of the page.
 
     This datasource deliberately does NOT go through BigQuery. The split is
-    documented in docs/log-routing.md: a human reads text here, a program
+    documented in docs/logs.md section 0: a human reads text here, a program
     computes over facts in BigQuery, and neither substitutes for the other.
     Keeping raw text out of the sink is what stops the model from paying to
     re-scan lines nobody aggregates.
@@ -426,7 +426,7 @@ GROUP BY time, container_name ORDER BY time""")],
     # ---- row: training stability & efficiency (fact_step) -------------------
     # The row an ML engineer opens first. Every series here is parsed from the
     # training log line that is already in the sink -- no workload config change
-    # is needed for any of it. See docs/ml-engineer-view.md.
+    # is needed for any of it. See docs/logs.md section 7.
     panels.append({"type": "row", "title": "训练稳定性与效率 Steps",
                    "collapsed": False,
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
@@ -509,7 +509,7 @@ WHERE $__timeFilter(step_time) ORDER BY step_time""")],
     # you *that* something happened and how it ranks; these three panels are
     # Cloud Logging showing *what it said*, live and unfiltered, with no sink
     # and no modelling in between. Ordered by the intent map in
-    # docs/channel-map.md section 2: training output, then errors, then the
+    # docs/logs.md section 2: training output, then errors, then the
     # node/driver layer.
     panels.append({"type": "row",
                    "title": "原始日志 Raw logs (Cloud Logging, 实时)",
@@ -548,7 +548,7 @@ WHERE $__timeFilter(step_time) ORDER BY step_time""")],
 
     # L-node. Scoped by node, not pod: these containers run in kube-system on
     # the job's nodes. The attribution is "on this job's node", NOT "caused by
-    # this job" -- see docs/channel-map.md section 3.2. sidecar-log-collector is
+    # this job" -- see docs/logs.md section 3.2. sidecar-log-collector is
     # where the TPU driver's own tpu_driver.INFO output surfaces, including the
     # compile timings that have no metric equivalent anywhere.
     panels.append({
