@@ -1000,8 +1000,9 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 | Cloud Run 与 Grafana 都要 `Authorization` 头 | 两层认证必然冲突 —— 认证只放一层，Grafana 跑匿名 Admin |
 | 组织策略禁止 `allUsers` | Cloud Run 不可能公开访问，必须走认证 |
 | **IAP 需要 OAuth 同意屏幕** | 没配就报 `Error code 9`（OAuth 重定向失败），而所有 IAM 策略读回来都是对的。gcloud 警告创建 API 已于 2026-03-19 关停 —— 那只针对**新项目**，老项目仍可用，别被它劝退 |
-| **IAP 开启后会拦截 IAM 直连请求** | 报 `Invalid IAP credentials: Invalid JWT audience` —— 半配好的 IAP 让浏览器和 proxy **两条路同时不通**，而且两边症状不同，很容易误判成两个问题 |
-| **brand 是 `orgInternalOnly` 且不可改** | 只有项目所属组织内的账号能通过 IAP 登录，API 无法 PATCH 这个字段。组织外的人只能走 proxy，或在 Console 把同意屏幕改 External 并发布 |
+| **IAP 开启后会拦截该服务的每一个入站请求**，包括 IAM 直连的 | 报 `Invalid IAP credentials: Invalid JWT audience`（浏览器渲染成 `Error code 9`）。所以**一个服务不可能同时服务 IAP 用户和 proxy 用户** —— 只能部署两个服务（`mlobs-grafana` / `mlobs-grafana-direct`），见 §5.1。半配好的 IAP 会让两条路同时不通且症状不同，很容易误判成两个问题 |
+| **brand 是 `orgInternalOnly` 且不可改** | 只有项目所属组织内的账号能通过 IAP 登录，API 无法 PATCH 这个字段（PATCH 返回 404）。组织外的人只能走那个**不开 IAP 的兄弟服务**的 proxy，或在 Console 把同意屏幕改 External 并发布（不发布则只有 100 人测试名单能登录） |
+| **IAP 服务上的用户级 `run.invoker` 是失效的** | 开 IAP 前授的 `run.invoker` 不会被清理，读 IAM 策略看着像有权限，实际请求仍被 IAP 拦下。判断谁能进一个 IAP 服务，看 IAP 策略 |
 | `gcloud run deploy --iap` 在首次启用 IAP 的项目上会竞态 | 输出里只是一行 `Setting IAP service agent...warning`，但结果是 invoker 策略为空、浏览器报 `You don't have access`，而 IAP 的 IAM 策略看起来完全正确 |
 | **数据源缺权限时面板只显示 No data** | Grafana SA 起初没有 `monitoring.viewer`，Cloud Monitoring 面板全空 —— 和「这个 job 确实没指标」长得一模一样，不会报错。每加一个数据源都要单独授它自己的读权限 |
 | **Cloud Monitoring 的 filter 不支持 `=~`** | 直接调 v3 REST 会报 `syntax error ... token '=~'`；正则要写 `monitoring.regex.full_match()`。Grafana 的 stackdriver 插件会自动翻译，所以面板里写 `=~` 是对的 —— 但拿这个语法去手工验证会得到误导性的报错 |
