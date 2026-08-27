@@ -687,15 +687,164 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
     }
 
 
+# A job counts as running if it was still logging within this window. There is
+# no "is running" flag to read: dim_job.run_phase comes from ML Diagnostics and
+# is keyed on the job name, so a name that has been reused reports the phase of
+# whichever run the poller saw -- one job measured COMPLETED while its pods were
+# still writing logs. Recency of the pods themselves is the honest signal.
+#
+# The window has to exceed the refresh cadence or every job looks finished
+# between cycles. refresh.sh runs every 30 minutes; 45 leaves margin for a slow
+# cycle without letting genuinely finished jobs linger for long.
+RUNNING_WINDOW_MIN = 45
+
+
+def _job_link_override(field="job_key"):
+    """Make the job name a link into the per-job dashboard.
+
+    A data link rather than a URL column: the table then carries one fewer
+    column of unreadable text, and the link inherits the dashboard's current
+    time range so the target opens on the same window the reader was looking at.
+    """
+    return {
+        "matcher": {"id": "byName", "options": field},
+        "properties": [{
+            "id": "links",
+            "value": [{
+                "title": "打开该 job 的面板",
+                "url": "/d/mlobs-job?var-job_key=${__data.fields." + field + "}"
+                       "&from=${__from}&to=${__to}",
+            }],
+        }],
+    }
+
+
+def build_index(project):
+    """The job index: what is running now, and everything that ran before."""
+    panels = []
+    y = 0
+
+    common_overrides = [
+        _job_link_override(),
+        {"matcher": {"id": "byName", "options": "goodput_pct"},
+         "properties": [
+             {"id": "unit", "value": "percent"},
+             {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+             {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                 {"color": STATUS["critical"], "value": None},
+                 {"color": STATUS["warning"], "value": 25},
+                 {"color": STATUS["good"], "value": 60}]}}]},
+        {"matcher": {"id": "byName", "options": "peak_chips"},
+         "properties": [{"id": "custom.align", "value": "right"}]},
+    ]
+
+    panels.append({"type": "row", "title": "运行中 Current", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels.append({
+        "type": "table", "title": "运行中的 job",
+        "description": f"最近 {RUNNING_WINDOW_MIN} 分钟内仍有日志的 job。"
+                       "点 job 名进入该 job 的面板。按占用芯片数排序 —— "
+                       "出问题时先看大的。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  job_key,
+  peak_chips,
+  tpu_model,
+  peak_nodes,
+  first_seen AS started,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), first_seen, MINUTE) AS running_min,
+  goodput_pct,
+  attempts,
+  owner,
+  job_family
+FROM `{project}.mlobs_core.job_hub`
+WHERE last_seen > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {RUNNING_WINDOW_MIN} MINUTE)
+ORDER BY peak_chips DESC, first_seen DESC""")],
+        "options": {"showHeader": True, "cellHeight": "sm"},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": common_overrides + [
+                {"matcher": {"id": "byName", "options": "running_min"},
+                 "properties": [{"id": "unit", "value": "m"},
+                                {"id": "custom.align", "value": "right"}]},
+            ],
+        },
+    })
+    y += 10
+
+    panels.append({"type": "row", "title": "历史 History", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels.append({
+        "type": "table", "title": "历史 job（按开始时间倒序）",
+        "description": "已结束的 job，最新的在最上面。`ended` 是最后一条日志的时间，"
+                       "不是退出码 —— 平台读的是日志与事件，没有作业的返回状态。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 16},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  job_key,
+  peak_chips,
+  tpu_model,
+  peak_nodes,
+  first_seen AS started,
+  last_seen  AS ended,
+  TIMESTAMP_DIFF(last_seen, first_seen, MINUTE) AS duration_min,
+  ROUND(chip_hours, 1) AS chip_hours,
+  goodput_pct,
+  attempts,
+  ROUND(est_usd, 0) AS est_usd,
+  owner,
+  job_family
+FROM `{project}.mlobs_core.job_hub`
+WHERE last_seen <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {RUNNING_WINDOW_MIN} MINUTE)
+ORDER BY first_seen DESC""")],
+        "options": {"showHeader": True, "cellHeight": "sm",
+                    "sortBy": [{"displayName": "started", "desc": True}]},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": common_overrides + [
+                {"matcher": {"id": "byName", "options": "duration_min"},
+                 "properties": [{"id": "unit", "value": "m"},
+                                {"id": "custom.align", "value": "right"}]},
+                {"matcher": {"id": "byName", "options": "est_usd"},
+                 "properties": [{"id": "unit", "value": "currencyUSD"},
+                                {"id": "custom.align", "value": "right"}]},
+            ],
+        },
+    })
+    y += 16
+
+    return {
+        "uid": "mlobs-jobs",
+        "title": "ML Training — Job 索引",
+        "description": "所有 job 的入口。点 job 名进入单个 job 的面板。",
+        "tags": ["mlobs"],
+        "timezone": "utc",
+        "editable": True,
+        "schemaVersion": 39,
+        "refresh": "1m",
+        "time": {"from": "now-7d", "to": "now"},
+        "templating": {"list": []},
+        "panels": panels,
+    }
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True)
-    ap.add_argument("--out", default="dashboards/job.json")
+    ap.add_argument("--out-dir", default="dashboards")
     args = ap.parse_args()
     # The dashboards directory is generated output, so it is not in git. Create
     # it rather than failing: on a fresh clone deploy.sh calls this before
     # `gcloud builds submit`, and the Dockerfile COPYs the directory.
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w") as fh:
-        json.dump(build(args.project), fh, indent=2, ensure_ascii=False)
-    print(f"wrote {args.out}")
+    os.makedirs(os.path.abspath(args.out_dir), exist_ok=True)
+    for name, doc in (("index.json", build_index(args.project)),
+                      ("job.json", build(args.project))):
+        path = os.path.join(args.out_dir, name)
+        with open(path, "w") as fh:
+            json.dump(doc, fh, indent=2, ensure_ascii=False)
+        print(f"wrote {path}")

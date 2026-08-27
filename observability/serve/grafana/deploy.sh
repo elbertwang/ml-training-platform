@@ -39,9 +39,12 @@
 #    sign in. IAP only requests `openid email`, both non-sensitive, so
 #    publishing does not require Google verification.
 #
-# Whoever cannot use IAP uses the proxy instead, which needs only run.invoker:
+# Whoever cannot use IAP uses the proxy instead, which needs only run.invoker.
+# It must point at the IAP-free sibling, never at $SERVICE -- IAP intercepts
+# every inbound request on its own service, including an IAM-authenticated one
+# (see the block above the ${SERVICE}-direct step at the bottom of this file):
 #
-#   gcloud run services proxy mlobs-grafana --project <P> --region <R> --port 8080
+#   gcloud run services proxy mlobs-grafana-direct --project <P> --region <R> --port 8080
 #
 # ENABLE_IAP defaults to whatever the deployed service already has, so
 # redeploying never silently changes how people get in. On a project with no
@@ -95,7 +98,7 @@ grant_dataset_access "$PROJECT_ID" "$SA" READER mlobs_raw mlobs_core
 
 echo "=== Image ==="
 ensure_artifact_repo "$PROJECT_ID" "$REGION" "$REPO"
-python3 "${HERE}/build_dashboard.py" --project "$PROJECT_ID" --out "${HERE}/dashboards/job.json"
+python3 "${HERE}/build_dashboard.py" --project "$PROJECT_ID" --out-dir "${HERE}/dashboards"
 gcloud builds submit "$HERE" --project "$PROJECT_ID" --region "$REGION" \
   --tag "$IMAGE" --quiet >/dev/null
 echo "  ${IMAGE}"
@@ -149,6 +152,29 @@ if [[ "$ENABLE_IAP" == "1" ]]; then
   fi
 fi
 
+# IAP is a per-service switch that intercepts *every* inbound request, including
+# an IAM-authenticated one carrying an ID token -- those come back "Invalid IAP
+# credentials: Invalid JWT audience", which a browser renders as Error code 9.
+# So one service cannot serve both IAP users and proxy users.
+#
+# When the consent screen is Internal that matters, because accounts outside the
+# project's organisation cannot sign in through IAP at all and have no way in.
+# `${SERVICE}-direct` is the same image with IAP off for exactly those people.
+# It is only touched if it already exists -- deploying the pair is a decision
+# made once, not something this script imposes on a new project.
+#
+# Create it with:
+#   gcloud beta run deploy ${SERVICE}-direct --image <same image> \
+#     --service-account <same SA> --no-iap --no-allow-unauthenticated ...
+DIRECT="${SERVICE}-direct"
+if gcloud run services describe "$DIRECT" --project "$PROJECT_ID" \
+     --region "$REGION" >/dev/null 2>&1; then
+  echo "=== Sibling service without IAP ==="
+  gcloud run services update "$DIRECT" --project "$PROJECT_ID" --region "$REGION" \
+    --image "$IMAGE" --quiet >/dev/null
+  echo "  ${DIRECT} updated to the same image"
+fi
+
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
       --region "$REGION" --format="value(status.url)")
 
@@ -159,16 +185,24 @@ if [[ "$ENABLE_IAP" == "1" ]]; then
   echo "      --resource-type=cloud-run --service=${SERVICE} --region=${REGION} \\"
   echo "      --member=user:SOMEONE@example.com --role=roles/iap.httpsResourceAccessor"
   echo
-  echo "  Dashboard:      ${URL}/d/mlobs-job"
+  echo "  Job index:      ${URL}/d/mlobs-jobs"
   echo "  One job's page: ${URL}/d/mlobs-job?var-job_key=<JOB>"
   echo
   echo "  Viewers OUTSIDE that organisation cannot sign in while the consent"
-  echo "  screen is Internal. Grant them run.invoker and use the proxy instead:"
-  echo "    gcloud run services add-iam-policy-binding ${SERVICE} \\"
-  echo "      --project ${PROJECT_ID} --region ${REGION} \\"
-  echo "      --member=user:SOMEONE@example.com --role=roles/run.invoker"
-  echo "    gcloud run services proxy ${SERVICE} \\"
-  echo "      --project ${PROJECT_ID} --region ${REGION} --port 8080"
+  echo "  screen is Internal, and cannot bypass IAP on this service either."
+  echo "  They go through ${DIRECT} -- NOT ${SERVICE}, which IAP would reject"
+  echo "  with Error code 9 however the IAM policy reads:"
+  if gcloud run services describe "$DIRECT" --project "$PROJECT_ID" \
+       --region "$REGION" >/dev/null 2>&1; then
+    echo "    gcloud run services add-iam-policy-binding ${DIRECT} \\"
+    echo "      --project ${PROJECT_ID} --region ${REGION} \\"
+    echo "      --member=user:SOMEONE@example.com --role=roles/run.invoker"
+    echo "    gcloud run services proxy ${DIRECT} \\"
+    echo "      --project ${PROJECT_ID} --region ${REGION} --port 8080"
+  else
+    echo "    ${DIRECT} does not exist yet. Create it with the same image and"
+    echo "    service account, plus --no-iap; this script keeps it in sync after."
+  fi
 else
   echo "  Grant each viewer:"
   echo "    gcloud run services add-iam-policy-binding ${SERVICE} \\"
@@ -179,7 +213,7 @@ else
   echo "    gcloud run services proxy ${SERVICE} \\"
   echo "      --project ${PROJECT_ID} --region ${REGION} --port 8080"
   echo
-  echo "  Dashboard:      http://localhost:8080/d/mlobs-job"
+  echo "  Job index:      http://localhost:8080/d/mlobs-jobs"
   echo "  One job's page: http://localhost:8080/d/mlobs-job?var-job_key=<JOB>"
   echo
   echo "  (${URL} rejects anonymous requests with 403. That is expected.)"

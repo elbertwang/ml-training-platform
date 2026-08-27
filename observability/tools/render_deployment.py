@@ -41,7 +41,11 @@ NODES = {
     "sch":  (170, 250, "cloud-scheduler", ["Cloud Scheduler", "每 30 分钟"]),
     "ar":   (450, 250, "artifact-registry", ["Artifact Registry", "grafana:v1 · refresh:v1"]),
     "job":  (170, 400, "cloud-run", ["Cloud Run job", "mlobs-refresh"]),
-    "svc":  (450, 400, "cloud-run", ["Cloud Run 服务", "mlobs-grafana · 私有"]),
+    # Two services, same image and same SA -- one with IAP, one without. They
+    # share a node here because the diagram's subject is identity and grants,
+    # and on that axis they are indistinguishable; §5.1 covers why there are two.
+    "svc":  (450, 400, "cloud-run", ["Cloud Run 服务 · 私有",
+                                     "mlobs-grafana (+ -direct)"]),
     "gke":  (830, 400, "google-kubernetes-engine", ["GKE tpu-training-antgroup", "122 节点 · 488 芯片"]),
     "raw":  (150, 582, "bigquery", ["mlobs_raw", "L1 原样落地"]),
     "core": (390, 582, "bigquery", ["mlobs_core", "L2/L3 建模，纯 SQL"]),

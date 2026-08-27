@@ -29,50 +29,65 @@ PROJECT_ID=tpu-for-training ./grafana/deploy.sh
 一条命令做完：服务账号 + 三个数据源各自的读权限、Artifact Registry、
 生成 dashboard JSON、Cloud Build 构建镜像、部署 Cloud Run。
 
-### 访问
+两个 dashboard：`/d/mlobs-jobs`（任务索引，点 job 名进详情）与
+`/d/mlobs-job`（单个 job 的七个分区，可带 `?var-job_key=<JOB>` 直达）。
 
-服务是私有的（`--no-allow-unauthenticated`），匿名请求返回 403。给人开权限：
+### 认证模型：两个服务
 
-```bash
-gcloud run services add-iam-policy-binding mlobs-grafana \
-  --project <P> --region us-central1 \
-  --member="user:someone@example.com" --role="roles/run.invoker"
-```
+Grafana 本身跑匿名 Admin —— Google 已经证明了身份，再要一个 Grafana 密码不增加
+安全性，只增加一个要保管的秘密。而且两层认证会抢同一个 `Authorization` 头（实测：
+curl 带 Cloud Run 的 Bearer 再带 Grafana 的 basic auth，后者覆盖前者，必然 403）。
+身份验证全部交给 Cloud Run 前面那一层，服务始终私有
+（`--no-allow-unauthenticated`）。组织策略
+`constraints/iam.allowedPolicyMemberDomains` 禁止 `allUsers`，公开访问本来也不可能。
 
-查看者在自己**登录过 gcloud 的机器**上起代理：
-
-```bash
-gcloud run services proxy mlobs-grafana --project <P> --region us-central1 --port 8080
-# http://localhost:8080/d/mlobs-job                    带下拉选 job
-# http://localhost:8080/d/mlobs-job?var-job_key=<JOB>  一站式 URL
-```
-
-首次会提示装 `cloud-run-proxy` 组件。apt 版 gcloud 要用
-`sudo apt-get install google-cloud-cli-cloud-run-proxy`。
-
-### 认证模型
-
-**IAP 是主路径，Cloud Run IAM + proxy 是组织外用户的备路径。** 服务两种情况下都是
-私有的（`--no-allow-unauthenticated`），Grafana 本身跑匿名 Admin —— Google 已经证明
-了身份，再要一个 Grafana 密码不增加安全性，只增加一个要保管的秘密。而且两层认证会
-抢同一个 `Authorization` 头（实测：curl 带 Cloud Run 的 Bearer 再带 Grafana 的
-basic auth，后者覆盖前者，必然 403）。
-
-组织策略 `constraints/iam.allowedPolicyMemberDomains` 禁止 `allUsers`，公开访问本来
-也不可能。
-
-**IAP 的两个前置条件。** 一是项目要有 OAuth 同意屏幕，没有就报 `Error code 9`
+**IAP 有两个前置条件。** 一是项目要有 OAuth 同意屏幕，没有就报 `Error code 9`
 （OAuth 重定向失败），而 IAM 策略读回来都是对的。创建 brand 的 API gcloud 会警告已于
 2026-03-19 关停，实测那只针对**新项目**，老项目仍可调用；brand 不可删除。二是这样
 建出来的 brand 是 `orgInternalOnly`，只有项目所属组织内的账号能登录，且该字段无法
-通过 API 修改。
+通过 API 修改（PATCH 返回 404），要改只能去 Cloud Console 的 Google Auth Platform
+页面，改成 External 后还必须发布，否则只有 100 人测试名单内的账号能登录。
 
-**因此 `tpu-for-training` 的实际模式是**：`antgroup.com` 用户授
-`roles/iap.httpsResourceAccessor` 后直接开 URL；组织外用户授 `roles/run.invoker`
-后走 `gcloud run services proxy`。
+**关键约束：开启 IAP 后它会拦截该服务的每一个入站请求**，包括携带 ID token 的
+IAM 直连请求 —— 回 `Invalid IAP credentials: Invalid JWT audience`，浏览器渲染成
+`Error code 9`。所以**一个服务无法同时服务 IAP 用户和 proxy 用户**。组织外账号既
+过不了 IAP，也不能绕过 IAP 直连，等于无路可走。
 
-> 开启 IAP 后它会拦截**所有**请求，包括 IAM 直连的（`Invalid IAP credentials:
-> Invalid JWT audience`）。所以配到一半的 IAP 会让两条路同时不通，而且两边报错不同。
+因此 `tpu-for-training` 部署的是一对服务，镜像与服务账号完全相同：
+
+| 服务 | 认证 | 谁用 | 怎么进 |
+|---|---|---|---|
+| `mlobs-grafana` | IAP | `antgroup.com` | 授 `roles/iap.httpsResourceAccessor`，直接开 URL |
+| `mlobs-grafana-direct` | 无 IAP，Cloud Run IAM | 组织外（含 `google.com`） | 授 `roles/run.invoker`，起 proxy |
+
+```bash
+# 组织内
+gcloud beta iap web add-iam-policy-binding --project <P> \
+  --resource-type=cloud-run --service=mlobs-grafana --region=us-central1 \
+  --member="user:someone@antgroup.com" --role=roles/iap.httpsResourceAccessor
+
+# 组织外
+gcloud run services add-iam-policy-binding mlobs-grafana-direct \
+  --project <P> --region us-central1 \
+  --member="user:someone@example.com" --role="roles/run.invoker"
+gcloud run services proxy mlobs-grafana-direct \
+  --project <P> --region us-central1 --port 8080
+# → http://localhost:8080/d/mlobs-jobs
+```
+
+proxy 必须指向 `-direct`。指向 `mlobs-grafana` 会被 IAP 拦成 `Error code 9`，
+而 IAM 策略看起来完全正确 —— 这是最容易误判的一个失败。proxy 要在
+**`gcloud auth login` 过的机器**上跑，纯 ADC 签不出 ID token。首次会提示装
+`cloud-run-proxy` 组件，apt 版 gcloud 用
+`sudo apt-get install google-cloud-cli-cloud-run-proxy`。
+
+`deploy.sh` 部署 `mlobs-grafana`，随后若 `mlobs-grafana-direct` 已存在就把它更新到
+同一个镜像，两边内容不会漂。该服务只在已存在时才被触碰 —— 是否要这一对是装的时候
+做一次的决定，脚本不替新项目做主。新项目默认只有一个服务且 IAP 关闭
+（`ENABLE_IAP` 跟随已部署服务的注解，重新部署不会静默改变别人的进入方式）。
+
+> IAP 开启后，服务自身 `run.invoker` 名单上的用户授权不再起作用，但也不会被清理。
+> 判断谁能进一个 IAP 服务，看 IAP 策略，不要看 `run.invoker`。
 
 ### 已验证（生产，以 Grafana 服务账号身份实跑）
 

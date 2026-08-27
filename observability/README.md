@@ -314,7 +314,7 @@ location join**。`mlobs_raw` / `mlobs_core` 必须跟着建在 US；建成 `us-
 | 精选导出 | Log Router sink `mlobs-selective` | global | `service-…@gcp-sa-logging` |
 | 原始层 | BigQuery `mlobs_raw` | **US** · 物理计费 | — |
 | 建模层 | BigQuery `mlobs_core`（纯 SQL） | **US** · 物理计费 | — |
-| 展示 | Cloud Run 服务 `mlobs-grafana` | us-central1 · 私有 | `mlobs-grafana` |
+| 展示 | Cloud Run 服务 `mlobs-grafana`（IAP）与 `mlobs-grafana-direct`（无 IAP） | us-central1 · 均私有 | `mlobs-grafana`（两者共用） |
 | 刷新 | Cloud Run job `mlobs-refresh` | us-central1 | `mlobs-refresh` |
 | 触发 | Cloud Scheduler `mlobs-refresh` | us-central1 · 每 30 分钟 | `mlobs-scheduler` |
 | 镜像 | Artifact Registry `mlobs` | us-central1 | — |
@@ -508,29 +508,47 @@ observability/
 
 ## 5. Grafana 面板
 
-### 5.1 访问
+### 5.1 两个入口
 
-一个 job 一个 URL。顶部下拉列出全部 job（按最近活跃排序），自动刷新 1 分钟，
-默认时间窗 24 小时。
+两个 dashboard：
 
-服务是私有的（`--no-allow-unauthenticated`），匿名请求 302 跳 Google 登录。
-进入方式取决于账号属于哪个组织：
+| UID | 内容 |
+|---|---|
+| `mlobs-jobs` | **任务索引**。上半区当前在跑的 job（起始时间、芯片数），下半区历史 job 按启动时间降序。每行点进去带 `job_key` 参数跳到详情页 |
+| `mlobs-job` | **单个 job 的详情**，七个分区（§5.3）。顶部下拉也可直接选 job |
+
+自动刷新 1 分钟，默认时间窗 24 小时。
+
+同一份 dashboard 由**两个 Cloud Run 服务**提供，镜像与服务账号完全相同，区别只在
+认证方式。这不是冗余部署，是 IAP 的一个硬约束：开启 IAP 后它会拦截该服务的**每一个**
+入站请求，包括携带 ID token 的 IAM 直连请求（回 `Invalid IAP credentials: Invalid
+JWT audience`，浏览器渲染成 `Error code 9`）。所以一个服务无法同时服务 IAP 用户和
+proxy 用户，只能拆成两个。
+
+| 服务 | 认证 | 谁用 |
+|---|---|---|
+| `mlobs-grafana` | IAP | `antgroup.com` 账号 |
+| `mlobs-grafana-direct` | 无 IAP，Cloud Run IAM | 组织外账号（含 `google.com`） |
+
+两个服务都是私有的（`--no-allow-unauthenticated`）。
 
 **`antgroup.com` 用户 —— 直接开 URL**
 
 ```
-https://mlobs-grafana-g4zlqqnjgq-uc.a.run.app/d/mlobs-job
+https://mlobs-grafana-g4zlqqnjgq-uc.a.run.app/d/mlobs-jobs
 https://mlobs-grafana-g4zlqqnjgq-uc.a.run.app/d/mlobs-job?var-job_key=<JOB>
 ```
 
-**组织外用户 —— 本地起代理**
+**组织外用户 —— 对 `-direct` 起代理**
 
-OAuth 同意屏幕是 Internal，组织外账号无法通过 IAP 登录（见 §5.4）。
+OAuth 同意屏幕是 Internal 且该字段无法通过 API 修改，组织外账号无法通过 IAP
+登录（见 §5.4）。代理必须指向 `-direct`，指向 `mlobs-grafana` 会被 IAP 拦成
+`Error code 9`。
 
 ```bash
-gcloud run services proxy mlobs-grafana \
+gcloud run services proxy mlobs-grafana-direct \
   --project tpu-for-training --region us-central1 --port 8080
-# → http://localhost:8080/d/mlobs-job
+# → http://localhost:8080/d/mlobs-jobs
 ```
 
 首次会提示装 `cloud-run-proxy` 组件。apt 版 gcloud 用
@@ -539,23 +557,34 @@ gcloud run services proxy mlobs-grafana \
 
 ### 5.2 授权
 
+两条路互不影响，同一个人可以同时有。
+
 ```bash
-# antgroup.com 用户：走 IAP
+# antgroup.com 用户：IAP
 gcloud beta iap web add-iam-policy-binding --project tpu-for-training \
   --resource-type=cloud-run --service=mlobs-grafana --region=us-central1 \
   --member=user:某人@antgroup.com --role=roles/iap.httpsResourceAccessor
 
-# 组织外用户：走代理
-gcloud run services add-iam-policy-binding mlobs-grafana \
+# 组织外用户：-direct 服务的 run.invoker
+gcloud run services add-iam-policy-binding mlobs-grafana-direct \
   --project tpu-for-training --region us-central1 \
   --member=user:某人@example.com --role=roles/run.invoker
 ```
 
-两者互不影响，同一个人可以同时有。
+当前名单：IAP 上 `mingliang.gml@antgroup.com`、`wangyunpeng@google.com`；
+`-direct` 上 `wangyunpeng@google.com`。
+
+> `mlobs-grafana` 自身的 `run.invoker` 名单里还留着两个用户，是开启 IAP 之前授的。
+> IAP 开启后这类授权不再起作用（请求仍会被 IAP 拦下），留着无害但不代表访问权限 ——
+> 判断谁能进 `mlobs-grafana`，看 IAP 策略。
+
+`deploy.sh` 部署 `mlobs-grafana` 后，若 `mlobs-grafana-direct` 已存在，会把它更新到
+同一个镜像，两边内容不会漂。该服务只在已存在时才被触碰 —— 是否要部署这一对是装的
+时候做一次的决定，脚本不替新项目做主。
 
 ### 5.3 面板
 
-七个分区，跨三个数据源。
+`mlobs-job` 七个分区，跨三个数据源。
 
 | 分区 | 面板 | 数据源 |
 |---|---|---|
@@ -567,8 +596,22 @@ gcloud run services add-iam-policy-binding mlobs-grafana \
 | **原始日志** | 训练主输出（`jax-tpu` / `task` 容器）· 错误（severity≥ERROR）· TPU 驱动与节点层（该 job 节点上的 kube-system 容器） | Cloud Logging |
 | **每次尝试** | 同名 job 的每次运行一行，含 goodput、chip-hours、成本、采样覆盖率 | BigQuery |
 
-面板由 `serve/grafana/build_dashboard.py` 生成，不是手维护的 JSON —— 700 行深度
-嵌套的对象里，一个位置错了的花括号在 review 时看不出来。
+`mlobs-jobs` 两个分区，都走 BigQuery，数据都来自 `job_hub`。
+
+| 分区 | 口径与排序 | 列 |
+|---|---|---|
+| **运行中** | 最近 45 分钟内仍有日志；按芯片数降序 —— 出问题时先看大的 | job 名、芯片数、TPU 型号、节点数、开始时间、已运行分钟、goodput、尝试次数、owner、job family |
+| **历史** | 其余全部；按开始时间降序 | 同上，另加结束时间、时长、chip-hours、成本 |
+
+两张表的 job 名列都带 data link，点进去打开 `mlobs-job` 并带上 `job_key` 与当前
+时间窗（`${__from}` / `${__to}`），不用手动重选。两张表都可按列过滤。
+
+> 「运行中」是**最近 45 分钟内有日志**，不是作业状态。平台读的是日志与事件，拿不到
+> 作业的退出码 —— 历史表里的 `ended` 同样是最后一条日志的时间，不代表正常结束。
+
+两个 dashboard 都由 `serve/grafana/build_dashboard.py` 生成（`--out-dir` 输出
+`index.json` + `job.json`），不是手维护的 JSON —— 700 行深度嵌套的对象里，一个位置
+错了的花括号在 review 时看不出来。
 
 ### 5.4 设计取舍
 
@@ -624,7 +667,7 @@ Cloud Monitoring、Cluster Director 四个入口，已按 job 预填查询条件
 
 | 组件 | 名称 | 说明 |
 |---|---|---|
-| Grafana | Cloud Run `mlobs-grafana` | **私有服务 + IAP**。组织内用户直接开 URL，组织外走 proxy。Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
+| Grafana | Cloud Run `mlobs-grafana` + `mlobs-grafana-direct` | 一对服务，同镜像同 SA，前者开 IAP 给组织内用户，后者不开 IAP 给组织外用户走 proxy —— IAP 会拦截同一服务上的 IAM 直连请求，两类人无法共用一个服务。两者都私有；Grafana 本身匿名 Admin —— 身份已由 Google 证明，再加一道密码没有意义 |
 | 数据源 | `mlobs-bq` / `mlobs-cm` / `mlobs-logs` | BigQuery、Cloud Monitoring、**Cloud Logging**（原文层，见附录 A） |
 | 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
 | 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
