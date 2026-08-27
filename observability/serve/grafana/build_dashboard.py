@@ -569,7 +569,13 @@ WHERE $__timeFilter(step_time) ORDER BY step_time""")],
     })
     y += 10
 
-    # ---- row 6: attempts ----------------------------------------------------
+    # ---- row 7: attempts ----------------------------------------------------
+    # Needs its own row marker. Without one Grafana files the panel under the
+    # preceding row, which put a per-attempt cost table inside "原始日志".
+    panels.append({"type": "row", "title": "每次尝试 Attempts", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
     panels.append({
         "type": "table", "title": "每次尝试 Attempts",
         "description": "同名 job 的每次运行一行。这就是模型要按 attempt 建的原因 —— "

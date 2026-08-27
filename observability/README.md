@@ -21,13 +21,14 @@
 2. [环境实测底数](#2-环境实测底数)
 3. [两个视角、两个使用者](#3-两个视角两个使用者)
 4. [架构](#4-架构)
-5. [当前状态](#5-当前状态)
-6. [成本](#6-成本)
-7. [待决策与进行中](#7-待决策与进行中)
-8. [路线图](#8-路线图)
-9. [运行方式](#9-运行方式)
-10. [Caveats](#10-caveats)
-11. [踩过的坑](#11-踩过的坑)
+5. [Grafana 面板](#5-grafana-面板)
+6. [当前状态](#6-当前状态)
+7. [成本](#7-成本)
+8. [待决策与进行中](#8-待决策与进行中)
+9. [路线图](#9-路线图)
+10. [运行方式](#10-运行方式)
+11. [Caveats](#11-caveats)
+12. [踩过的坑](#12-踩过的坑)
 
 **两个附录，各自自包含（大全 + 地图）：**
 
@@ -505,7 +506,108 @@ observability/
 
 ---
 
-## 5. 当前状态
+## 5. Grafana 面板
+
+### 5.1 访问
+
+一个 job 一个 URL。顶部下拉列出全部 job（按最近活跃排序），自动刷新 1 分钟，
+默认时间窗 24 小时。
+
+服务是私有的（`--no-allow-unauthenticated`），匿名请求 302 跳 Google 登录。
+进入方式取决于账号属于哪个组织：
+
+**`antgroup.com` 用户 —— 直接开 URL**
+
+```
+https://mlobs-grafana-g4zlqqnjgq-uc.a.run.app/d/mlobs-job
+https://mlobs-grafana-g4zlqqnjgq-uc.a.run.app/d/mlobs-job?var-job_key=<JOB>
+```
+
+**组织外用户 —— 本地起代理**
+
+OAuth 同意屏幕是 Internal，组织外账号无法通过 IAP 登录（见 §5.4）。
+
+```bash
+gcloud run services proxy mlobs-grafana \
+  --project tpu-for-training --region us-central1 --port 8080
+# → http://localhost:8080/d/mlobs-job
+```
+
+首次会提示装 `cloud-run-proxy` 组件。apt 版 gcloud 用
+`sudo apt-get install google-cloud-cli-cloud-run-proxy`。需要在
+`gcloud auth login` 过的机器上跑 —— 纯 ADC 签不出 ID token。
+
+### 5.2 授权
+
+```bash
+# antgroup.com 用户：走 IAP
+gcloud beta iap web add-iam-policy-binding --project tpu-for-training \
+  --resource-type=cloud-run --service=mlobs-grafana --region=us-central1 \
+  --member=user:某人@antgroup.com --role=roles/iap.httpsResourceAccessor
+
+# 组织外用户：走代理
+gcloud run services add-iam-policy-binding mlobs-grafana \
+  --project tpu-for-training --region us-central1 \
+  --member=user:某人@example.com --role=roles/run.invoker
+```
+
+两者互不影响，同一个人可以同时有。
+
+### 5.3 面板
+
+七个分区，跨三个数据源。
+
+| 分区 | 面板 | 数据源 |
+|---|---|---|
+| **概览** | Goodput · 峰值芯片数 · chip-hours · 成本（墙钟 / 实测两版）· 采样覆盖率 · 尝试次数，外加一张带深链接的元数据表 | BigQuery |
+| **事故时间线** | 事件密度（6 个来源分色）+ 事件明细表 | BigQuery |
+| **指标** | TensorCore 利用率（该 job 全部芯片均值）· 日志速率（按容器） | BigQuery |
+| **实时指标** | TensorCore 利用率 · HBM 已用 · 日志速率，均按 pod / 容器展开，滞后约 3–4 分钟 | Cloud Monitoring |
+| **训练稳定性与效率** | NaN 迭代 · 跳过的迭代 · 重做的 step · 最差 straggler 比 · 最大 step · TFLOP/s 中位，六个状态块带阈值配色；外加 Loss 与梯度范数、Step 耗时（中位 vs 最慢 rank）两条曲线 | BigQuery |
+| **原始日志** | 训练主输出（`jax-tpu` / `task` 容器）· 错误（severity≥ERROR）· TPU 驱动与节点层（该 job 节点上的 kube-system 容器） | Cloud Logging |
+| **每次尝试** | 同名 job 的每次运行一行，含 goodput、chip-hours、成本、采样覆盖率 | BigQuery |
+
+面板由 `serve/grafana/build_dashboard.py` 生成，不是手维护的 JSON —— 700 行深度
+嵌套的对象里，一个位置错了的花括号在 review 时看不出来。
+
+### 5.4 设计取舍
+
+**上下两层，同一个 `$job` 变量联动。** 上层 BigQuery 回答「哪里不对」（排名、聚合、
+跨渠道 join），下层 Cloud Logging 回答「具体是什么」（实时原文，未经 sink 过滤）。
+两层能力不重叠：Cloud Logging 数据源不支持聚合也不支持告警，返回条数还等于面板的
+`MaxDataPoints`；BigQuery 则拿不到实时原文。
+
+**Cloud Monitoring 面板的 pod 范围由 BigQuery 提供**，经一个隐藏变量传入，不靠 pod
+名前缀猜 —— `vllm` 同时是 `vllm-tpu` 和 `vllm-qwen3-5-r` 的前缀，前缀匹配会串。
+TPU 驱动那个面板同理，用隐藏的 `nodes` 变量按节点圈定。
+
+**每个面板查的是 table function，不是视图。** `job_overview` / `job_timeline` /
+`job_metrics` / `job_attempts` / `job_steps` 五个 TVF 把 `job_key` 下推到
+`CLUSTER BY`。实测单次加载扫描 **2.3 MB**；直接查视图再在 Grafana 里过滤是 **185 MB**。
+
+**成本给两个数。** `est_usd`（墙钟）与 `est_usd_observed`（实测）并列，同时显示
+`sample_coverage` 说明该信哪个 —— 两者失效方向相反：采样有缺口时前者高估、后者低估。
+
+**深链接直达 GCP 控制台。** 元数据表每行带 Logs Explorer、Log Analytics、
+Cloud Monitoring、Cluster Director 四个入口，已按 job 预填查询条件。
+
+**颜色固定绑定来源名，不绑排名。** 过滤掉某个来源不会让其余的重新着色。六种色取自
+校验过的分类色板，相邻对在两种模式下都通过 CVD 与常视觉分辨门槛。goodput 与采样
+覆盖率用保留的状态色，且都带文字标签 —— 颜色从不单独承载状态。
+
+### 5.5 还没接的
+
+**告警。** Grafana 自带的 alerting 可以基于 BigQuery 数据源工作（Cloud Logging
+数据源不支持，需要先建 log-based metric 再走 Cloud Monitoring）。`nan_iters` 与
+`straggler_ratio` 是最直接的两个候选。需要确认是否要把服务设成 `min-instances=1`
+—— 缩到 0 实例时告警规则不会执行。
+
+**TensorBoard 链接。** 路径 `base_output_directory/{run_name}/tensorboard/` 是确定的，
+但 `base_output_directory` 还没进 sink，所以暂时给不出链接。
+
+---
+
+## 6. 当前状态
 
 同一份代码部署到两个项目，**不改动任何现有配置** —— 摄入、`_Default` bucket、
 11 个 dashboard、7 条告警原样未动。
@@ -518,7 +620,7 @@ observability/
 两个环境跑的是同一份代码、同一条 `./deploy.sh`。playground 是重构后的验证环境
 —— 每次改部署脚本都先在那儿完整跑一遍，再动生产。
 
-### 5.1 生产部署（2026-08-26）
+### 6.1 生产部署（2026-08-26）
 
 | 组件 | 名称 | 说明 |
 |---|---|---|
@@ -527,18 +629,7 @@ observability/
 | 刷新 | Cloud Run job `mlobs-refresh` + Cloud Scheduler | `*/30 * * * *`，实测无人值守跑通，各表滞后 1–2 分钟 |
 | 镜像仓库 | Artifact Registry `mlobs` | `grafana:v1`、`refresh:v1` |
 
-**访问方式**：服务私有，匿名请求返回 302 跳 Google 登录。分两条路，按账号所属组织决定。
-
-- **`antgroup.com` 用户** —— 授 `roles/iap.httpsResourceAccessor` 后直接开
-  `https://mlobs-grafana-…run.app/d/mlobs-job?var-job_key=<JOB>`
-- **组织外用户** —— OAuth 同意屏幕是 Internal，IAP 登不进去。授 `roles/run.invoker`
-  后走代理：
-
-```bash
-gcloud run services proxy mlobs-grafana \
-  --project tpu-for-training --region us-central1 --port 8080
-# → http://localhost:8080/d/mlobs-job
-```
+访问方式与授权命令见 [§5 Grafana 面板](#5-grafana-面板)。
 
 **IAP 的两个前置条件，都踩过。**
 
@@ -576,7 +667,7 @@ gcloud 会警告这个 API 已于 2026-03-19 关停 —— 那只针对**新项�
 **所有**数据集（含 `defaultLink` 全量日志）。已收窄，并用一次实跑确认
 `mlobs-grafana` 查 `defaultLink` 会被拒绝。
 
-### 5.2 生产模型层规模
+### 6.2 生产模型层规模
 
 | 表 | 行数 |
 |---|---|
@@ -589,7 +680,7 @@ gcloud 会警告这个 API 已于 2026-03-19 关停 —— 那只针对**新项�
 > **历史深度只有 3 天**（`dim_pod` 最早 08-23），而 `_Default` 有 30 天可用。
 > 这是当前最大的缺口，见附录 A 的 TBD-1 / TBD-2。
 
-### 5.3 延迟预算（实测）
+### 6.3 延迟预算（实测）
 
 | 环节 | 实测 |
 |---|---|
@@ -603,7 +694,7 @@ gcloud 会警告这个 API 已于 2026-03-19 关停 —— 那只针对**新项�
 sink **不是**瓶颈，是全链路最快的一环。文档里「sink 有时间限制」指的是
 **不回溯**（只导出创建之后的日志），不是延迟。
 
-### 5.4 展示层每次刷新的扫描量
+### 6.4 展示层每次刷新的扫描量
 
 | TVF | 扫描量 | 优化前 |
 |---|---|---|
@@ -613,7 +704,7 @@ sink **不是**瓶颈，是全链路最快的一环。文档里「sink 有时间
 | `job_metrics(job_key)` | 1.68 MB | 45.6 MB |
 | **一次页面加载** | **~2.3 MB** | ~185 MB |
 
-### 5.5 平台产出的实例
+### 6.5 平台产出的实例
 
 **RCA** —— `falcon-job-jaytje07es`，2026-08-24：
 
@@ -645,9 +736,9 @@ ORDER BY a.first_seen DESC
 
 ---
 
-## 6. 成本
+## 7. 成本
 
-### 6.1 价格事实（Cloud Billing Catalog API，us-central1）
+### 7.1 价格事实（Cloud Billing Catalog API，us-central1）
 
 | SKU | 价格 |
 |---|---|
@@ -660,9 +751,9 @@ ORDER BY a.first_seen DESC
 | GMP `Prometheus Samples Ingested` | **$0.06/百万样本**（量大降到 $0.024） |
 | BigQuery Analysis | $6.25/TiB（前 1 TiB/月免费） |
 | BQ 存储 Physical | Active $0.040 / Long-Term $0.020 per GiB·月 |
-| TPU7x（Americas，OnDemand） | **$12.00/hour** —— ⚠️ 单位未核实，见 [Caveats](#10-caveats) |
+| TPU7x（Americas，OnDemand） | **$12.00/hour** —— ⚠️ 单位未核实，见 [Caveats](#11-caveats) |
 
-### 6.2 现状与增量
+### 7.2 现状与增量
 
 | | |
 |---|---|
@@ -680,7 +771,7 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 ---
 
-## 7. 待决策与进行中
+## 8. 待决策与进行中
 
 | # | 事项 | 影响 | 状态 |
 |---|---|---|---|
@@ -694,7 +785,7 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 ---
 
-## 8. 路线图
+## 9. 路线图
 
 **P0 — 生产化** ✅ **已完成 2026-08-26**
 - [x] `refresh.sh` 进 Cloud Run Job + Cloud Scheduler（每 30 分钟，含并发保护）
@@ -732,7 +823,7 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 ---
 
-## 9. 运行方式
+## 10. 运行方式
 
 ```bash
 export CLOUDSDK_AUTH_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
@@ -759,20 +850,8 @@ PROJECT_ID=<P> ./serve/grafana/deploy.sh            # 只重部署 dashboard
 
 ### 看 dashboard
 
-服务是私有的，匿名访问返回 403。查看者需要 `roles/run.invoker`：
-
-```bash
-gcloud run services add-iam-policy-binding mlobs-grafana \
-  --project <P> --region us-central1 \
-  --member=user:SOMEONE@example.com --role=roles/run.invoker
-```
-
-然后在自己**登录过 gcloud 的机器**上：
-
-```bash
-gcloud run services proxy mlobs-grafana --project <P> --region us-central1 --port 8080
-# → http://localhost:8080/d/mlobs-job?var-job_key=<JOB>
-```
+`antgroup.com` 用户直接开 URL，组织外用户走 `gcloud run services proxy`。
+两种方式的完整命令与授权见 [§5 Grafana 面板](#5-grafana-面板)。
 
 ### 日常运维
 
@@ -815,7 +894,7 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 10. Caveats
+## 11. Caveats
 
 **引用任何数字之前请先读这一节。**
 
@@ -836,7 +915,7 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 11. 踩过的坑
+## 12. 踩过的坑
 
 按类型归档。都是实测撞出来的，写在这里避免重犯。
 
@@ -899,7 +978,7 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 
 ---
 
-## 12. 附录
+## 13. 附录
 
 两个附录，各自自包含（大全 + 地图）：
 
