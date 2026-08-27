@@ -45,8 +45,8 @@
 信号只取自：容器日志、K8s 事件与对象、Cloud Monitoring 指标、ML Diagnostics API。
 **不接入任何客户自建系统的私有接口或内部指标。**
 
-`falcon-jobs` 的任务由 **kubemaker**（蚂蚁自建的类 Kubeflow 调度器）产出。我们认它
-产出的**标准 K8s 对象**——pod、Job、事件、label——但不碰它的调度队列、状态机、
+`falcon-jobs` 的任务由 **kubemaker**（蚂蚁自建的类 Kubeflow 调度器）产出。平台只认它
+产出的**标准 K8s 对象**——pod、Job、事件、label——不碰它的调度队列、状态机、
 内部 API。原因是可移植性：换个客户或 kubemaker 改版，标准对象仍然在。
 
 同一条原则决定了 `dim_pod` 的骨架是 **K8s 事件**而不是容器日志：事件是 Kubernetes
@@ -60,8 +60,9 @@ Director、Logs Explorer 四个入口，彼此没有共同实体。平台的核�
 
 ### 1.3 先盘点，再开发
 
-新增任何指标或图表之前，先查 [能力地图](#3-指标能力地图与分层漏斗)。这条规则是有
-代价换来的：我们用 tensorcore 利用率自建了 goodput 代理算法，而 GKE 本身就发布
+新增任何指标或图表之前，先查[能力地图](docs/metrics.md#45-全量能力地图167-个)。
+
+代价实例：本平台用 tensorcore 利用率自建了 goodput 代理算法，而 GKE 本身就发布
 `kubernetes.io/jobset/proxy_runtime_goodput`。
 
 ---
@@ -157,7 +158,7 @@ BigQuery 副本必需而非冗余的根本原因。
 
 | | **Job 视角** | **集群视角** |
 |---|---|---|
-| 问的是 | 「我这个任务跑得好不好」 | 「我们买的卡有没有在产出」 |
+| 回答 | 这个任务跑得好不好 | 买的卡有没有在产出 |
 | 使用者 | 算法同学 + SRE | 平台负责人、财务 |
 | 分母 | 这个 job 的墙钟时间 | **集群总芯片 × 时间**（不管有没有 job） |
 | 代表指标 | goodput、MFU、step time、中断次数 | 芯片占用率、空闲卡数、$/有效卡时 |
@@ -171,14 +172,14 @@ BigQuery 副本必需而非冗余的根本原因。
 
 | | **训练稳定性** | **训练效率** |
 |---|---|---|
-| 问的是 | 「会不会挂 / 是不是在发散」 | 「同样的卡能不能跑更快」 |
+| 回答 | 会不会挂 · 是不是在发散 | 同样的卡能不能跑更快 |
 | 时间尺度 | **秒级到分钟级**，要告警 | 小时级，看趋势 |
 | 看错的代价 | 烧几小时卡时训出一个废模型 | 慢 10% |
 | 最该盯 | `nan_iters`、`grad_norm`、重启次数 | `TFLOP/s/device`、MFU、step time 方差 |
 
 **紧急程度差一个量级**，所以稳定性做告警、效率做趋势图。
 
-好消息是稳定性最关键的三个信号**今天就在 sink 里流着，不用开任何开关** ——
+稳定性最关键的三个信号**今天就在 sink 里流着，不用开任何开关** ——
 一条 `completed step` 日志有 23 个字段，`nan_iters` / `skipped_iters` /
 `grad_norm` 都在里面。`mlobs_core.fact_step` 已经把它们建成表，
 Grafana 里是「训练稳定性与效率」那一行。详见[附录 A §7](docs/logs.md)。
@@ -188,18 +189,18 @@ Grafana 里是「训练稳定性与效率」那一行。详见[附录 A §7](doc
 硬件健康、任务连续性、中断归因 —— 主要靠 `fact_event` 的统一时间轴
 （6 个来源）和节点级指标。归属方式见[附录 A §3](docs/logs.md)。
 
-### 3.3 指标从哪来
+### 3.3 指标来源
 
 五个来源、全量能力地图（实测 **9,594 个描述符 → 167 个有数据 → 24 个真正要用**）、
 以及「新增指标放哪」的决策规则，全部在**[附录 B](docs/metrics.md)**。
 
-三条最该记住的：
+三条关键结论：
 
 - **框架的同一份指标有 6 个出口**（stdout、TensorBoard、本地文件、GCS、
-  ML Diagnostics、Cloud Monitoring），选哪条是纯配置问题。**我们现在走的是最差的
-  那条 —— 从 stdout 解析**，虽然它今天就能用。
+  ML Diagnostics、Cloud Monitoring），选哪条是纯配置问题。**当前走的是最差的
+  那条 —— 从 stdout 解析**，代价是要去重、无 schema、格式变更静默失效。
 - **按层展开的量永远不要进 Cloud Monitoring。** 生产里 771 个死描述符中 183 个是
-  `Router_*_layer_N`，全部零数据 —— 这条路开过又废弃了。
+  `Router_*_layer_N`，全部零数据 —— 该路径曾启用后废弃。
 - **集群视角要用 node 级指标。** 实测 `node/accelerator/tensorcore_utilization`
   有 504 条序列，容器级只有 456 条 —— 差的 48 条正是**没有 pod 的芯片**，
   在容器级指标里不是 0 而是根本不存在。
@@ -364,7 +365,7 @@ flowchart LR
 TPU 驱动的编译耗时（要开发）。粗框的 `fact_step` 同时喂两个问题，
 而且原料已经在 sink 里 —— 详见[附录 A](docs/logs.md)。
 
-### 4.3 为什么 `dim_pod` 是骨架
+### 4.3 `dim_pod`：pod → job 的映射
 
 Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job 必须有映射，
 三种做法只有一种可靠：
@@ -382,9 +383,9 @@ Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job �
 job 两样都不产生。加入 event 前后：生产可见 falcon job **589 → 1,540**，
 JobSet **65 → 201**。
 
-### 4.4 为什么要两个粒度
+### 4.4 两个粒度：`job_key` 与 `attempt_uid`
 
-| 键 | 含义 | 不这么做会怎样 |
+| 键 | 含义 | 缺失的后果 |
 |---|---|---|
 | `job_key` | 人所说的 job（JobSet 族取 JobSet 名，不是子 Job） | 用子 Job 名会和 MLDiag 的 workload 名对不上 |
 | `attempt_uid` | 一个 Job 对象 = 一次尝试（`batch.kubernetes.io/controller-uid`） | 同名复用会被合并：`henry-hlo-test` 7 周内跑了 **101 次** |
@@ -393,7 +394,7 @@ JobSet **65 → 201**。
 
 ### 4.5 四条收集路径
 
-| 路径 | 承载 | 不可替代的理由 |
+| 路径 | 承载 | 不可替代之处 |
 |---|---|---|
 | `defaultLink`（Log Analytics） | 全量，30 天 | 免费全保真；但重复扫描贵，受保留期限制。只用于一次性回填和人工排查 |
 | sink `mlobs-selective` | ERROR+、`completed step`、**k8s event**、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜（813 MB vs 303 GB）。~180 万行/天 |

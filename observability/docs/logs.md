@@ -1,13 +1,13 @@
 # 附录 A：日志
 
 一个 TPU 训练 job 相关的日志散落在 **27 个日志渠道 + 4 个 API 渠道**里。
-这份文档回答三件事：**有哪些、怎么归属到 job、每一条该留在 Cloud Logging 还是建模进 BigQuery。**
+内容为三部分：**渠道清单、到 job 的归属方式、每条渠道的路由决策**（留 Cloud Logging 还是建模进 BigQuery）。
 
 指标见[附录 B](metrics.md)。实测于 `tpu-for-training`，最后更新 2026-08-27。
 
 ---
 
-## 0. 判据：人读还是机器算
+## 0. 路由判据
 
 **决定一条日志去哪的，不是它重不重要，而是谁来读它。**
 
@@ -16,13 +16,13 @@
 | **人要「读」的原文** | Cloud Logging | Logs 面板，`$job` 变量实时过滤 |
 | **机器要「算」的事实** | BigQuery | Table / Time series，SQL 排序、聚合、跨渠道 join |
 
-这条判据取代了早期那条「读一次还是读多次」——后者没法落到操作上，前者可以：
+此判据取代早期的「读一次还是读多次」，因为后者无法落到操作上。可操作的形式是：
 **打开面板的人是在看字，还是在看排名 / 趋势 / 告警。**
 
 按内容重要性判断会出错，这是踩出来的：`sidecar-log-collector` 一度被判成噪声要加排除
 过滤器，实测发现 99.94% 是真正的 TPU 驱动输出，建议撤回（见 §5）。
 
-### 0.1 一个必须先讲清的事实
+### 0.1 sink 不降低 Cloud Logging 成本
 
 > **sink 到 BigQuery 不会让 Cloud Logging 便宜一分钱。**
 > ingest 的 $0.50/GiB 在日志产生的那一刻就付了，sink 是**复制**不是**搬迁**。
@@ -31,7 +31,7 @@
 （唯一的例外是 sink + `_Default` 排除过滤器，那确实能免掉 ingest ——
 但排除之后 Logs Explorer 里就查不到了，L0 那一层直接失效。见 TBD-10。）
 
-### 0.2 四层，不是两个选项
+### 0.2 四层处理模型
 
 | 层 | 处理 | 一行 = | 谁读 | 成本 |
 |---|---|---|---|---|
@@ -45,7 +45,7 @@
 > `mlobs_core` 里任何一张表，如果一行等于一条日志行，那它就放错层了。
 > `dim_*` 一行必须是一个实体，`fact_*` 一行必须是一个事件或一个度量点。
 
-由来是三次真实事故，形状完全一样——把 L1 的东西直接堆进 L2：
+三次真实事故形状相同，都是把 L1 的东西直接堆进 L2：
 
 | 事故 | 干了什么 | 不修的话 |
 |---|---|---|
@@ -149,7 +149,7 @@ TPU 驱动日志：250 万行原文留 L0，只把每小时 23,927 条 `END_TO_E
 
 ---
 
-## 3. 归属方式：怎么从 job 定位到渠道
+## 3. 归属方式：从 job 定位到渠道
 
 这决定了每个渠道能不能进 `fact_event`，以及进去之后 `job_key` 准不准。
 
@@ -229,9 +229,9 @@ REST API 的 `workloadDetails.gke.id` **就是** K8s workload 名（= `job_key`�
 
 ---
 
-## 5. 深挖：TPU 驱动日志（`sidecar-log-collector`）
+## 5. TPU 驱动日志（`sidecar-log-collector`）
 
-这个渠道**容易被误判为噪声**。实测拆开后 **99.94% 是真正的 TPU 驱动输出**：
+该渠道曾被判为噪声。实测拆开后 **99.94% 是真正的 TPU 驱动输出**：
 
 | 来源文件 | 3h 行数（集群级） | 说明 |
 |---|---|---|
@@ -251,7 +251,7 @@ REST API 的 `workloadDetails.gke.id` **就是** K8s workload 名（= `job_key`�
 | `tpu_chip_config.cc: Resolved chip config alias` | 46,438 | 芯片配置 / megachip 拓扑 |
 | `tpu_layout_assignment.cc: GetUnconstrained on: ...` | 116,575+ | 编译器 verbosity，价值低 |
 
-**每小时 2.4 万次编译**是一个值得单独监控的数字。
+集群每小时约 **2.4 万次编译**。
 
 > ⚠️ **抽指标之前先修 crash-loop**：`BackOff` 事件 **18,155 次全部集中在这个容器**。
 > 它在反复重启，意味着驱动日志本身可能是断续的，从中抽出的任何指标都有采样缺口。
@@ -259,9 +259,9 @@ REST API 的 `workloadDetails.gke.id` **就是** K8s workload 名（= `job_key`�
 
 ---
 
-## 6. 深挖：ML Diagnostics 是三条子渠道，不是一条
+## 6. ML Diagnostics 的三条子渠道
 
-我们一直只用 REST API。实测它下面有**三条互不重叠**的子渠道，另外两条在日志里。
+本平台此前只接了 REST API。实测其下有**三条互不重叠**的子渠道，另外两条在日志里。
 
 | 子渠道 | 载体 | 内容 | 用了吗 |
 |---|---|---|---|
@@ -293,7 +293,7 @@ REST API 的 `workloadDetails.gke.id` **就是** K8s workload 名（= `job_key`�
 ```
 
 实测值 0.926 / 0.709 / 0.805，**约 10 秒一个点**，6 小时内覆盖 166 个 run。
-对比我们自建的 goodput（5 分钟桶、tensorcore 代理）——**细 30 倍，而且是第一方的。**
+对比自建的 goodput（5 分钟桶、tensorcore 代理）：**细 30 倍，且是第一方数据。**
 目前完全没采集：sink 过滤器里只有 `ml_diagnostics_workload_event`。
 
 ### 6.3 analyzer 的可操作率只有 4.5%
@@ -311,7 +311,7 @@ REST API 的 `workloadDetails.gke.id` **就是** K8s workload 名（= `job_key`�
 
 ---
 
-## 7. 日志里的训练信号：`fact_step`
+## 7. `fact_step`：日志里的训练信号
 
 **算法同学要的稳定性数据不用开任何开关，今天就在 sink 里流着。**
 
@@ -337,11 +337,11 @@ grad_norm: 0.030, raw_grad_norm: 0.030, num_zeros: 666582257, skipped_iters: 0, 
 | **`skipped_iters`** | 梯度裁剪触发 / 坏 batch。持续增长说明数据或学习率有问题 |
 | **`grad_norm` / `raw_grad_norm`** | 突然飙高 = 梯度爆炸；接近 0 = 学不动。**两者之差反映裁剪强度** |
 
-### 7.2 两个建模时踩到的坑
+### 7.2 建模时的两个陷阱
 
 **straggler 只能看慢的一侧。** 原本用 `(max−min)/max`，在
 `falcon-job-7v57lgnxq1` step 7 上读出 0.999 报「灾难性 straggler」。查原始日志：
-63 个 rank 报 `56.047` 秒，**rank 24 报 `0.046` 秒**——它根本没干活，慢的一侧其实
+63 个 rank 报 `56.047` 秒，**rank 24 报 `0.046` 秒**——该 rank 未执行计算，慢的一侧
 完全齐步。改成 `straggler_ratio = max/p50` 后正确读出 1.0。
 `step_seconds_min` 保留，因为那个异常快的 rank 本身就是真信号。
 
@@ -385,10 +385,10 @@ grad_norm: 0.030, raw_grad_norm: 0.030, num_zeros: 666582257, skipped_iters: 0, 
 
 | # | 事项 | 现状 | 影响 | 需要决策 |
 |---|---|---|---|---|
-| **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，我们一个都没有** | 「历史所有 job 的启动/停止/占卡数」只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 补齐 30 天？** |
+| **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，平台一条未收** | 「历史所有 job 的启动/停止/占卡数」只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 补齐 30 天？** |
 | **TBD-2** | **`dim_pod` 会遗忘** | `CREATE OR REPLACE` + 30 天滚动窗口 | 补齐了第 31 天照样掉。**维度表不能滚动重建，必须 MERGE 累积** | 无（确定要改） |
 | **TBD-4** | **L-node 一跳归属没实现** | 21 个 L-node 渠道，`fact_event` 里一个都没接 | 17,710 条 `OOMKilling` 全落不到 job | 无（确定要做） |
-| **TBD-5** | **falcon-jobs 27% 事件归不到 job** | 12,211 未归属 / 33,597 已归属。其中 `SuccessfulCreate` 4,273 条其实可归属——pod 名在正文里，但 `involvedObject` 是 Job 不是 Pod | 事件进了时间轴却落不到 job | 无（确定要做） |
+| **TBD-5** | **falcon-jobs 27% 事件归不到 job** | 12,211 未归属 / 33,597 已归属。其中 `SuccessfulCreate` 4,273 条可归属——pod 名在正文里，但 `involvedObject` 是 Job 不是 Pod | 事件进了时间轴却落不到 job | 无（确定要做） |
 | **TBD-6** | **autoscaler 归属定性** | 3,365 条 100% 未归属。§1.3 说它是 L-cluster「不归属」，但 falcon 有专属节点池理论上能归属 | 两种说法自相矛盾 | **选一个：实现 node-pool 归属，还是承认只做时间对齐** |
 | **TBD-7** | **`sidecar-log-collector` crash-loop** | `BackOff` **18,155 次**全在这个容器 | TPU 驱动日志可能断续，**修好前从它抽的任何指标都有采样缺口** | 客户侧问题还是配置问题，要先定位 |
 | **TBD-8** | **sink 误收系统日志** | `fluentbit` 70,199 + `kube_proxy` 447 + `GCEGuestAgent` 456 + `run_googleapis_com_stdout`（平台自己的日志） | 存储浪费。**不污染模型** —— `app_error` 要求 `resource.labels.pod_name IS NOT NULL`，Cloud Run 日志没这字段 | 无（加排除条件） |
@@ -397,7 +397,7 @@ grad_norm: 0.030, raw_grad_norm: 0.030, num_zeros: 666582257, skipped_iters: 0, 
 **已完成**：TBD-3（`refresh.sh` 上 Cloud Scheduler，每 30 分钟，含事务化与并发保护）、
 TBD-9（Grafana 装 Cloud Logging 数据源，「原始日志」三面板）。
 
-### 客户侧 TBD（不在我们控制范围）
+### 客户侧 TBD（不在本平台控制范围）
 
 | 事项 | 状态 |
 |---|---|
@@ -408,7 +408,7 @@ TBD-9（Grafana 装 Cloud Logging 数据源，「原始日志」三面板）。
 
 ---
 
-## 10. 复现这份地图
+## 10. 复现方式
 
 ```sql
 -- 圈定一个 job 的 pod 与节点

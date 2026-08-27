@@ -5,13 +5,13 @@
 
 ---
 
-## 0. 两个视角，两套问题
+## 0. 两个视角
 
 后续开发按这两个视角分，因为使用者、分母和结论都不同。
 
 | | **Job 视角** | **集群视角** |
 |---|---|---|
-| 问的是 | 「我这个任务跑得好不好」 | 「我们买的卡有没有在产出」 |
+| 回答 | 这个任务跑得好不好 | 买的卡有没有在产出 |
 | 使用者 | 算法同学 + SRE | 平台负责人、财务 |
 | 分母 | 这个 job 的墙钟时间 | **集群总芯片 × 时间**（不管有没有 job） |
 | 代表指标 | goodput、MFU、step time | 芯片占用率、空闲卡数、$/有效卡时 |
@@ -42,7 +42,7 @@
 
 | 出口 | 开关 | fork 默认 | 去向 | 读得到吗 | 判断 |
 |---|---|---|---|---|---|
-| `log_metrics` | 无，**总是执行** | — | stdout/stderr | ✅ 已在 sink | **我们现在走这条** |
+| `log_metrics` | 无，**总是执行** | — | stdout/stderr | ✅ 已在 sink | **当前使用的路径** |
 | `write_metrics_to_tensorboard` | `enable_tensorboard` | **True** | GCS event 文件 | ❌ 要扫 protobuf | 开着，但没人接 |
 | `write_metrics_locally` | `metrics_file` | `""` 关 | pod 本地文件 | ❌ pod 死了就没了 | 只适合调试 |
 | `write_metrics_for_gcs` | `gcs_metrics` | **False** | GCS JSON | 可读，要自己扫 | 一般 |
@@ -53,7 +53,7 @@
 `report_{heartbeat,performance}_metric_for_gcp_monitoring`（都默认 False）
 → `compute.googleapis.com/workload/performance`。
 
-### 2.1 日志行其实很丰富
+### 2.1 日志行的字段覆盖
 
 一条 `completed step` 行有 **23 个字段**，覆盖了大部分 `learning/*` 和 `perf/*`：
 
@@ -70,11 +70,11 @@ skipped_iters, nan_iters
 从日志抠的代价：64 个 pod 打同样的行要去重、格式变了静默失效、链路最长。
 但**它今天就能用，不需要任何人配合** —— `fact_step` 就建在这上面（§5）。
 
-### 2.2 基数陷阱 —— 已经踩过
+### 2.2 基数陷阱
 
 生产里有 **771 个 `custom.googleapis.com` 描述符，758 个是 `maxtext/*`**，
 其中 **183 个是 `Router_*_layer_N`** 这种按层展开的。**全部零数据** ——
-这条路开过又废弃了。
+该路径曾启用后废弃。
 
 > **按层 / 按 rank / 按专家展开的诊断量，永远不要进 Cloud Monitoring，进 TensorBoard。**
 > Cloud Monitoring 按时序条数和 Metric Volume 计费，Metrics Explorer 会被
@@ -89,12 +89,12 @@ skipped_iters, nan_iters
 | `eval/*` + `evaluation/*` | 15 | `total_loss`、`avg_loss`、`mtp_acceptance_rate_percent`、`dpo_reward_accuracy`… | TensorBoard，少数关键项进 CM |
 | `Router_*` | **183** | 每层 MoE router bias / violation | **只进 TensorBoard** |
 
-`is_nan` / `is_inf` 值得单独拎出来：**训练发散的最早信号，且是布尔量，零基数成本**，
+`is_nan` / `is_inf` 是**训练发散的最早信号，且是布尔量，零基数成本**，
 非常适合 Cloud Monitoring 告警。
 
 > 「建议去向」这一列是判断，不是实测。哪些 `eval/*` 算关键取决于实际怎么用。
 
-### 2.4 ML Diagnostics 那条路只映射 8 个
+### 2.4 ML Diagnostics 出口映射的 8 个指标
 
 `_METRICS_TO_MANAGED`（`metric_logger.py:44`）：
 
@@ -114,21 +114,21 @@ learning/total_weights         → total_weights      perf/mfu                  
 
 基于 `ml-goodput-measurement` **0.2.3** 源码。
 
-### 3.1 为什么要它：我们的分母是错的
+### 3.1 代理算法的分母缺陷
 
 `mlobs_core.fact_goodput` 的公式是 `忙的桶数 / 有样本的桶数`。
 分母是**有指标样本的时间**，不是**总时间**。后果实测：
 
-| job | 我们报的 | 实际 |
+| job | 代理算法报的 | 实际 |
 |---|---|---|
 | `lossdif-flash-cp4-shardexp-500-r67` | **goodput 100.0%** | 采样覆盖 0.1 —— 64 张卡只有 10% 时间有样本 |
 | `l3p-remat-full-64-15-0826` | **goodput 95.8%** | 5 次尝试，每次跑 10 分钟就死，最后一次活了 47 秒 |
 | falcon 族 2,982 个 job | — | 只有 619 个（20.8%）有 goodput 数字 |
 
 崩溃循环看不见，是因为**每次尝试内部芯片确实是忙的**。
-我们量的是「芯片有活干的时候忙不忙」，不是「这段时间有没有在产出」。
+代理算法量的是「芯片有活干的时候忙不忙」，不是「这段时间有没有在产出」。
 
-### 3.2 框架的公式
+### 3.2 框架公式
 
 ```
 goodput = productive_training_time / total_job_time
@@ -156,9 +156,9 @@ goodput = productive_training_time / total_job_time
 | `CUSTOM_BADPUT_EVENTS` | 自定义 | 标签变成 `CUSTOM_BADPUT_EVENTS.<名字>` |
 
 > Orbax 的 checkpoint 日志**必须开**，否则 checkpoint badput 会被算成 **0**
-> ——不是缺失，是 0。这个区别很危险。
+> ——是 0 而不是 NULL，两者在下游无法区分。
 
-**从 step 序列推断（这三个最有意思，也正好补上我们最大的洞）：**
+**从 step 序列推断。** 这三项对应本平台当前最大的三处缺失：
 
 | BadputType | 算法 |
 |---|---|
@@ -194,7 +194,7 @@ ideal_step_time = mean(step_times 中 ≤ median + 3×MAD 的那些)
 
 **归属**：资源标签 `workload_id` + `replica_id` + `location`，
 `workload_id = job_name = config.run_name`（`monitoring.py:497`）
-= 我们的 `job_key`，**直接 join `dim_job`，不需要新映射表**。
+= `job_key`，**直接 join `dim_job`，不需要新映射表**。
 
 **语义**：累计秒数的 GAUGE，每 30 秒上报一次。要比例就除 `total_elapsed_time`，
 或直接用 `interval_goodput`。
@@ -202,7 +202,7 @@ ideal_step_time = mean(step_times 中 ≤ median + 3×MAD 的那些)
 **副作用**：新增一条 Cloud Logging 渠道 `goodput_<run_name>`，
 **只有 rank 0 写**，约 200 条/小时/job，可忽略。
 
-### 3.6 覆盖多少：按 job 数 6%，按钱 77%
+### 3.6 覆盖率：按 job 数 6%，按卡时 77%
 
 falcon 族 684 个 job 一条 `completed step` 都没有，不是 MaxText 训练循环，开了也没有。
 但卡时分布完全是另一回事（48 小时窗口）：
@@ -214,7 +214,7 @@ falcon 族 684 个 job 一条 `completed step` 都没有，不是 MaxText 训练
 | deployment | 19 | 3.5% | $8,387 |
 | job | 93 | 0.1% | $256 |
 
-### 3.7 它不覆盖什么
+### 3.7 覆盖边界
 
 框架 goodput 是**单个 workload 内部、从进程视角**算的，看不到：
 
@@ -260,7 +260,7 @@ tools/build_capability_map.py --project <P> --probe-days 1 \
 > 一条新序列。基数最高的是 `gcsfusecsi/fs_ops_latencies`（59,726）。
 > **这是 Grafana 面板必须按 pod 过滤、不能整指标拉的原因。**
 
-### 4.2 短名单：真正要用的 24 个，按两个视角切
+### 4.2 短名单：24 个，按两个视角分
 
 **Job 视角**（要能 join 到 job）
 
@@ -296,7 +296,7 @@ tools/build_capability_map.py --project <P> --probe-days 1 \
 
 **用法：加图表或告警先在这 24 个里找，找不到再走 §7 的决策漏斗。**
 
-### 4.3 关键发现：集群视角要用 node 级，不是 container 级
+### 4.3 集群视角须用 node 级指标
 
 同一 30 分钟窗口实测：
 
@@ -439,8 +439,8 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 | `kube_deployment_*` | 3 | `spec_replicas`、`status_replicas_{available,updated}` | 20 |
 | `scrape_*` + `up` | 5 | GMP 自身健康 | 508 |
 
-> **`kube_jobset_restarts` 值得注意** —— JobSet 重启次数的原生指标，
-> 和我们从 `dim_job_attempt` 数出来的应该能互相校验。
+> **`kube_jobset_restarts`** 是 JobSet 重启次数的原生指标，
+> 可与 `dim_job_attempt` 数出来的次数互相校验。
 
 **工作负载自报（5 个）** —— 全部已停写，见 §8
 
@@ -481,7 +481,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 ---
 
-## 6. 来源 E：缺口 —— 没有任何指标的地方
+## 6. 来源 E：缺口
 
 | 缺口 | 现在只有 | 影响 |
 |---|---|---|
@@ -509,7 +509,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 **L3 必须单独成层**：ML Diagnostics 的 run 是带生命周期的对象不是时序。当成指标
 处理会丢掉 `workloadDetails.gke.id` 这个 join key——而整个 L4 都靠它。
 
-### 7.2 新增指标放哪
+### 7.2 新增指标的落位规则
 
 按顺序过闸，命中即停。
 
@@ -520,7 +520,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 ② 短名单（§4.2 的 24 个）里有吗？        → 有 → 直接用           → L1/L2
 ③ 全量能力地图（§4.5）里有吗？           → 有 → 直接用           → L1/L2
 
-④ 它其实是「实体属性」而非时序吗？
+④ 它是「实体属性」而非时序吗？
    owner、模型名、超参、TPU 型号、提交时间 → dim_*                → L3
 
 ⑤ 要不要告警？
@@ -549,7 +549,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 > （前 150 MiB 免费，之后 $0.258/MiB）。$3,150 假设每样本约 30 字节，此假设未实测
 > 核实 —— 但相差两个数量级的结论不依赖精确取值。
 
-### 7.3 直读还是入 BigQuery
+### 7.3 直读与入 BigQuery 的取舍
 
 | | 直读 Cloud Monitoring | 导出到 BigQuery |
 |---|---|---|
@@ -570,7 +570,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 ## 8. 已废弃的 771 个自定义指标
 
-| 族 | 数量 | 最后有数据 | 能力 → 我们的对应 |
+| 族 | 数量 | 最后有数据 | 对应的替代实现 |
 |---|---|---|---|
 | `maxtext/*` | 758（其中 183 个是每层一个的 Router 诊断） | 2026-08-02 | loss/MFU/step_time → **`fact_step` ✅ 已做** |
 | `tpu_finance/*` | 9 | 2026-07-29 | `jobstat_mfu` → 同上；`month_reservation_utilization` → **仍是缺口** |
@@ -583,7 +583,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 ---
 
-## 9. 要客户打开的开关
+## 9. 待打开的开关（客户侧）
 
 按性价比排。**全部只需改提交参数，不改镜像、不改节点池**（节点池 scope 已实测满足
 `cloud-platform`，这一项不可变，不满足就得重建节点池）。
@@ -600,7 +600,7 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 另外确认 `DECOUPLE_GCLOUD` 没被设成 `TRUE`（会把整个集成 stub 掉）。
 
-### 9.1 打开后怎么验证
+### 9.1 验证 SQL
 
 ```sql
 -- ① badput_source 有哪些取值
@@ -618,7 +618,7 @@ FROM (SELECT DISTINCT JSON_VALUE(resource_labels,'$.workload_id') w
       WHERE metric_type LIKE 'compute.googleapis.com/workload/%') m
 JOIN `<P>.mlobs_core.dim_job` j ON j.job_key = m.w;
 
--- ③ 框架的 goodput 和我们的代理算法差多少
+-- ③ 框架 goodput 与代理算法的差值
 WITH fw AS (
   SELECT JSON_VALUE(resource_labels,'$.workload_id') job_key,
          MAX(IF(metric_type LIKE '%/goodput_time', value, 0)) good_s,
