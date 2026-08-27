@@ -295,51 +295,15 @@ flowchart TB
 
 哪个服务部署在哪、用什么身份、数据落在哪个 location。
 
-```mermaid
-flowchart TB
-  USER["算法同学 / SRE<br/>本地 gcloud run services proxy"]
+![部署视图](docs/diagrams/deployment.svg)
 
-  subgraph PRJ["GCP 项目 tpu-for-training"]
-
-    subgraph R1["区域 us-central1 —— 全部计算"]
-      direction LR
-      GKECL["GKE 集群<br/>tpu-training-antgroup<br/>122 节点 · 488 芯片"]
-      AR["Artifact Registry mlobs<br/>← Cloud Build<br/>grafana:v1 · refresh:v1"]
-      SCHED["Cloud Scheduler<br/>*/30 * * * *<br/>SA mlobs-scheduler"]
-      RUNJOB["Cloud Run job<br/>mlobs-refresh<br/>SA mlobs-refresh"]
-      RUNSVC["Cloud Run 服务<br/>mlobs-grafana<br/>私有 · 0→2 实例<br/>SA mlobs-grafana"]
-    end
-
-    subgraph GL["global —— 可观测面"]
-      direction LR
-      LOGBK["Cloud Logging _Default<br/>30 天 · Log Analytics 已开"]
-      CMON["Cloud Monitoring"]
-    end
-
-    subgraph US["BigQuery · US 多区域 —— 全部数据与建模"]
-      direction LR
-      DLINK["defaultLink<br/>逻辑计费 · 303 GB/天<br/>模型不读"]
-      RAWDS["mlobs_raw<br/>物理计费 · L1"]
-      COREDS["mlobs_core<br/>物理计费 · L2/L3<br/>建模在这里，纯 SQL"]
-    end
-
-  end
-
-  GKECL --> LOGBK
-  AR --> RUNJOB
-  AR --> RUNSVC
-  SCHED ==>|"run.invoker"| RUNJOB
-  USER ==>|"run.invoker"| RUNSVC
-  RUNJOB ==>|"WRITER"| RAWDS
-  RUNJOB ==>|"WRITER"| COREDS
-  RUNSVC ==>|"READER"| COREDS
-  RUNSVC --> CMON
-
-  style GKECL stroke-width:3px
-  style COREDS stroke-width:3px
-  style DLINK stroke-dasharray: 5 5
-  style US stroke-width:2px
-```
+> 这张图是**预渲染提交的 SVG**，本仓库唯一一张。原因是它用了真实的 Google Cloud
+> 图标，而图标来自 Iconify 图标包 —— 注册图标包要调 JavaScript，GitHub 的 Markdown
+> 渲染器没有这个机制，直接内联 mermaid 的话图标会是空白。
+> 源文件 [`docs/diagrams/deployment.mmd`](docs/diagrams/deployment.mmd) 一起提交，
+> 改完跑 `tools/render_diagrams.sh` 重新生成。
+>
+> `architecture-beta` 没有边标签语法，所以身份写在节点上，具体授权见下面的表。
 
 **location 是这张图里最容易出错的地方。** 计算全部在 `us-central1`，数据全部在
 **US 多区域** —— 因为 `defaultLink` 由 Cloud Logging 托管，固定在 US 多区域，而
@@ -533,13 +497,17 @@ observability/
 │       └── provisioning/           三个数据源：BQ / Cloud Monitoring / Cloud Logging
 ├── tools/
 │   ├── build_capability_map.py     生成能力地图
+│   ├── render_diagrams.sh          渲染带 GCP 图标的图
 │   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run；看清注释再跑）
-└── docs/
-    ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
-    ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
-    └── generated/                  工具产物，勿手改
-        ├── capability-map-prod.md
-        └── capability-map-prod.json
+├── docs/
+│   ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
+│   ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
+│   ├── diagrams/                   预渲染的图（带 GCP 图标，GitHub 画不了）
+│   │   ├── deployment.mmd          源
+│   │   └── deployment.svg          产物，由 tools/render_diagrams.sh 生成
+│   └── generated/                  工具产物，勿手改
+│       ├── capability-map-prod.md
+│       └── capability-map-prod.json
 
 ```
 
