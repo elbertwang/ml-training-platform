@@ -291,7 +291,92 @@ flowchart TB
 - **④ 的窗口替换是 BigQuery 事务。** 实测两次刷新重叠时，读者会看到 `fact_event`
   只有 273 行而不是 310 万行。事务 + ⑥ 的并发跳过，两层都要。
 
-### 4.2 指标与日志溯源
+### 4.2 部署视图：GCP 服务与身份
+
+哪个服务部署在哪、用什么身份、数据落在哪个 location。
+
+```mermaid
+flowchart TB
+  USER["算法同学 / SRE<br/>本地 gcloud run services proxy"]
+
+  subgraph PRJ["GCP 项目 tpu-for-training"]
+
+    subgraph R1["区域 us-central1 —— 全部计算"]
+      direction LR
+      GKECL["GKE 集群<br/>tpu-training-antgroup<br/>122 节点 · 488 芯片"]
+      AR["Artifact Registry mlobs<br/>← Cloud Build<br/>grafana:v1 · refresh:v1"]
+      SCHED["Cloud Scheduler<br/>*/30 * * * *<br/>SA mlobs-scheduler"]
+      RUNJOB["Cloud Run job<br/>mlobs-refresh<br/>SA mlobs-refresh"]
+      RUNSVC["Cloud Run 服务<br/>mlobs-grafana<br/>私有 · 0→2 实例<br/>SA mlobs-grafana"]
+    end
+
+    subgraph GL["global —— 可观测面"]
+      direction LR
+      LOGBK["Cloud Logging _Default<br/>30 天 · Log Analytics 已开"]
+      CMON["Cloud Monitoring"]
+    end
+
+    subgraph US["BigQuery · US 多区域 —— 全部数据与建模"]
+      direction LR
+      DLINK["defaultLink<br/>逻辑计费 · 303 GB/天<br/>模型不读"]
+      RAWDS["mlobs_raw<br/>物理计费 · L1"]
+      COREDS["mlobs_core<br/>物理计费 · L2/L3<br/>建模在这里，纯 SQL"]
+    end
+
+  end
+
+  GKECL --> LOGBK
+  AR --> RUNJOB
+  AR --> RUNSVC
+  SCHED ==>|"run.invoker"| RUNJOB
+  USER ==>|"run.invoker"| RUNSVC
+  RUNJOB ==>|"WRITER"| RAWDS
+  RUNJOB ==>|"WRITER"| COREDS
+  RUNSVC ==>|"READER"| COREDS
+  RUNSVC --> CMON
+
+  style GKECL stroke-width:3px
+  style COREDS stroke-width:3px
+  style DLINK stroke-dasharray: 5 5
+  style US stroke-width:2px
+```
+
+**location 是这张图里最容易出错的地方。** 计算全部在 `us-central1`，数据全部在
+**US 多区域** —— 因为 `defaultLink` 由 Cloud Logging 托管，固定在 US 多区域，而
+**BigQuery 不能跨 location join**。`mlobs_raw` / `mlobs_core` 必须跟着建在 US，
+建成 `us-central1` 会在第一次 join 时失败。`deploy.sh` 读 `defaultLink` 的
+location 并跟随，不写死。
+
+| 组件 | 服务 | Location | 身份 |
+|---|---|---|---|
+| 训练负载 | GKE `tpu-training-antgroup` | us-central1 | — |
+| 日志落地 | Cloud Logging `_Default` | global · 30 天 | — |
+| 精选导出 | Log Router sink `mlobs-selective` | global | `service-…@gcp-sa-logging` |
+| 原始层 | BigQuery `mlobs_raw` | **US** · 物理计费 | — |
+| 建模层 | BigQuery `mlobs_core`（纯 SQL） | **US** · 物理计费 | — |
+| 展示 | Cloud Run 服务 `mlobs-grafana` | us-central1 · 私有 | `mlobs-grafana` |
+| 刷新 | Cloud Run job `mlobs-refresh` | us-central1 | `mlobs-refresh` |
+| 触发 | Cloud Scheduler `mlobs-refresh` | us-central1 · 每 30 分钟 | `mlobs-scheduler` |
+| 镜像 | Artifact Registry `mlobs` | us-central1 | — |
+
+**三个服务账号，权限互不重叠**：
+
+| SA | 项目级 | 数据集级 |
+|---|---|---|
+| `mlobs-grafana` | `bigquery.jobUser` · `logging.viewer` · `monitoring.viewer` | `mlobs_raw` / `mlobs_core` **READER** |
+| `mlobs-refresh` | `bigquery.jobUser` · `monitoring.viewer` · `hypercomputecluster.viewer` · `run.viewer` | `mlobs_raw` / `mlobs_core` **WRITER** |
+| `mlobs-scheduler` | — | 仅 `mlobs-refresh` job 上的 `run.invoker` |
+
+读写分离是实测验证过的：以 `mlobs-grafana` 身份查 `mlobs_core` 成功，查
+`defaultLink` **被拒绝**。**建模层没有任何一个身份能读 `defaultLink`** ——
+那是每天 303 GB 的表面，模型只读 sink。
+
+**没有 VPC、没有负载均衡、没有持久卷。** Grafana 的 SQLite 是一次性的，dashboard
+和数据源都从镜像里 provision，所以服务可以缩到 0 实例、可以随时删了重建。
+
+---
+
+### 4.3 指标与日志溯源
 
 同一份数据可以从好几条通道拿到，选错通道的代价很大（见[附录 B](docs/metrics.md)）。
 这张图是**产生方 → 通道 → 我们的模型 → 要回答的问题**的完整链路，
@@ -365,7 +450,7 @@ flowchart LR
 TPU 驱动的编译耗时（要开发）。粗框的 `fact_step` 同时喂两个问题，
 而且原料已经在 sink 里 —— 详见[附录 A](docs/logs.md)。
 
-### 4.3 `dim_pod`：pod → job 的映射
+### 4.4 `dim_pod`：pod → job 的映射
 
 Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job 必须有映射，
 三种做法只有一种可靠：
@@ -383,7 +468,7 @@ Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job �
 job 两样都不产生。加入 event 前后：生产可见 falcon job **589 → 1,540**，
 JobSet **65 → 201**。
 
-### 4.4 两个粒度：`job_key` 与 `attempt_uid`
+### 4.5 两个粒度：`job_key` 与 `attempt_uid`
 
 | 键 | 含义 | 缺失的后果 |
 |---|---|---|
@@ -392,7 +477,7 @@ JobSet **65 → 201**。
 
 非 Job 工作负载（Deployment/DaemonSet）没有 controller_uid，回落到 controller 名。
 
-### 4.5 四条收集路径
+### 4.6 四条收集路径
 
 | 路径 | 承载 | 不可替代之处 |
 |---|---|---|
@@ -404,7 +489,7 @@ JobSet **65 → 201**。
 **`severity=WARNING` 刻意不入 sink**：9.33 亿行/天，几乎全是两次 gcsfuse 风暴。
 日志「量」的异常由免费的 `log_entry_count` 指标发现。
 
-### 4.6 目录结构
+### 4.7 目录结构
 
 三个部署脚本，各管一层，因为它们的爆炸半径和重部署频率都不同。
 `./deploy.sh` 默认把三层都装好，`STAGES=data` 只装数据面。
