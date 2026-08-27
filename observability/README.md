@@ -30,6 +30,7 @@
 11. [附录 A：踩过的坑](#11-附录-a踩过的坑)
 12. [附录 B：监控渠道分类地图](docs/channel-map.md) ← 单独文档
 13. [附录 C：日志路由方案](docs/log-routing.md) ← 单独文档
+14. [附录 D：Goodput 框架原生指标](docs/goodput.md) ← 单独文档
 
 ---
 
@@ -863,3 +864,25 @@ API 渠道**，按归属层级（pod / node / cluster / api）组织，并附一
 判据一句话：**人要「读」的原文留 Cloud Logging，机器要「算」的事实进 BigQuery。**
 两者在 Grafana 里是同一个页面的上下两层，用同一个 `$job` 变量联动，缺任何一层
 页面都不成立。附录 C 还列出了 10 条待决事项（TBD-1 ~ TBD-10）和落地顺序。
+
+---
+
+## 14. 附录 D：Goodput 框架原生指标
+
+单独成文：**[`docs/goodput.md`](docs/goodput.md)**
+
+MaxText 集成的 `ml-goodput-measurement` 能直接把 goodput 和 **14 类 badput 分解**
+写进 Cloud Monitoring（`compute.googleapis.com/workload/*`）。附录 D 逐条拆解了
+它的算法与含义，以及和我们自算指标的差距。
+
+三个要点：
+
+- **分母是真实墙钟**（`job_end − job_start`），分解闭合（残差进 `OTHER`），
+  所以中断时间必然被计为 badput。我们自己的 `fact_goodput` 分母是「有样本的时间」，
+  故障时间被排除在外 —— 实测有 job 报 **goodput 100% 而采样覆盖只有 0.1**。
+- **前提条件全部满足**（库已装、节点池 scope 正确、埋点齐全），只差 fork 里
+  `enable_goodput_recording` / `monitor_goodput` 两个开关，现在**零数据**。
+- 按 job 数只覆盖 6%，但**按卡时覆盖 77%**（198 个 JobSet = $185,878/48h）。
+
+它覆盖不了的部分正是本平台要守住的：集群级账本（实测 **488 张卡只有 298 张在忙**）、
+进程启动之前的排队与节点池创建、非 MaxText 负载、跨 job 关联、归因到具体硬件。

@@ -143,6 +143,7 @@
 | `ml_diagnostic_workload_performance` —— 10 秒 0–1 性能比 | 3,549 | **L1 → L2 `fact_metric`** | ⬜ **完全没采集**。比我们的 goodput 细 30 倍 |
 | `tpu.googleapis.com/runtime_monitor` | 649 | **L1 → L2** | ⬜ 已 sink 未建模 |
 | ML Diagnostics REST API | 15.2k runs | **L2 `dim_mlrun` / `fact_mlrun_event`** | ✅ poller 已随 `mlobs-refresh` 每 30 分钟运行 |
+| **MaxText goodput 埋点日志** `goodput_<run_name>` | 约 200 条/小时/job（只有 rank 0 写） | **L0** —— 原始事件留 Cloud Logging | ⬜ 未启用。框架会自己把它算成 `compute.googleapis.com/workload/*` 指标，那条路比我们重新解析日志好，见[附录 D](goodput.md) |
 | GKE Operations API —— 节点池修复事件 | — | **L2** | ⬜ falcon 有专属节点池，可归属 |
 
 ---
@@ -164,10 +165,12 @@
 
 ## 5. 待解决（TBD）
 
-按严重度排。**P0 两条互相咬合，要一起做，单做任何一条都会被另一条抵消。**
+按严重度排。TBD-0 代价最小收益最大，且不依赖其它任何一条。
+**TBD-1 / TBD-2 互相咬合，要一起做，单做任何一条都会被另一条抵消。**
 
 | # | 事项 | 现状 | 影响 | 需要决策 |
 |---|---|---|---|---|
+| **TBD-0** | **框架原生 goodput 没开** | fork 的 `base.yml` 里 `enable_goodput_recording` / `monitor_goodput` 都是 `False`，Cloud Monitoring 里 7 天零数据。前提条件（库、节点池 scope、埋点）**全部已满足** | 我们自算的 goodput 分母排除了故障时间，实测有 job 报 100% 而覆盖只有 0.1；崩溃循环 5 次重启报 95.8%。框架版分母是真实墙钟且分解闭合，还带 14 类 badput 归因 | **让客户在一个 JobSet 上加两个参数试跑**（不改镜像、不改节点池）。见[附录 D](goodput.md) |
 | **TBD-1** | **历史深度只有 3 天** | `dim_pod` 最早 08-23；`defaultLink` 有 07-27 起共 30 天；**08-20 单天就有 10,317 个 pod / 21.9 亿行，我们一个都没有** | 「历史所有 job 的启动/停止/占卡数」这个核心目标现在只能回答 3 天 | **要不要花 ~$56 一次性扫 8.9 TB 把 30 天补齐？** |
 | **TBD-2** | **`dim_pod` 会遗忘** | `CREATE OR REPLACE` + 30 天滚动窗口 | 就算补齐，第 31 天旧数据照样掉。**维度表不能滚动重建，必须 MERGE 累积** | 无（确定要改） |
 | **TBD-4** | **L-node 一跳归属完全没实现** | 21 个 L-node 渠道，`fact_event` 里一个都没接 | 17,710 条 `OOMKilling` 全部落不到 job | 无（确定要做） |
@@ -191,6 +194,9 @@
 ## 6. 落地顺序
 
 ```
+先做（代价接近零，不依赖任何其它条目）
+  TBD-0  让客户在一个 JobSet 上打开框架 goodput —— 77% 卡时立刻有真实归因
+
 第一批（互相咬合，一起做）
   TBD-2  dim_pod 改 MERGE 累积
   TBD-1  回填补到 30 天         ← 等 TBD-2 先改完，否则白花 $56
