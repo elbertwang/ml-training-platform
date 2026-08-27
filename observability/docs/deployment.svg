@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="675" viewBox="0 0 1180 675" font-family="Helvetica,Arial,sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6368"/></marker></defs>
+<rect width="1180" height="675" fill="white"/>
+<rect x="40" y="175" width="1100" height="295" rx="10" fill="#f8f9fa" stroke="#c9ccd1" stroke-dasharray="6 4"/>
+<text x="56" y="199" font-size="15" font-weight="600" fill="#5f6368">区域 us-central1 —— 全部计算</text>
+<rect x="40" y="508" width="500" height="147" rx="10" fill="#f8f9fa" stroke="#c9ccd1" stroke-dasharray="6 4"/>
+<text x="56" y="532" font-size="15" font-weight="600" fill="#5f6368">BigQuery · US 多区域 —— 全部数据与建模</text>
+<rect x="600" y="508" width="540" height="147" rx="10" fill="#f8f9fa" stroke="#c9ccd1" stroke-dasharray="6 4"/>
+<text x="616" y="532" font-size="15" font-weight="600" fill="#5f6368">global —— 可观测面</text>
+<line x1="951" y1="96" x2="473" y2="386" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="706" y="208" width="89" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="750" y="222" font-size="12" text-anchor="middle" fill="#1a73e8" font-weight="600">run.invoker</text>
+<line x1="170" y1="319" x2="170" y2="373" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="126" y="332" width="89" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="170" y="346" font-size="12" text-anchor="middle" fill="#1a73e8" font-weight="600">run.invoker</text>
+<line x1="389" y1="283" x2="194" y2="387" stroke="#5f6368" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<line x1="450" y1="319" x2="450" y2="373" stroke="#5f6368" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<line x1="162" y1="469" x2="153" y2="555" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="131" y="495" width="54" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="158" y="509" font-size="12" text-anchor="middle" fill="#1a73e8" font-weight="600">WRITER</text>
+<line x1="223" y1="444" x2="369" y2="565" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="257" y="485" width="54" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="284" y="499" font-size="12" text-anchor="middle" fill="#1a73e8" font-weight="600">WRITER</text>
+<line x1="428" y1="466" x2="398" y2="556" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#a)"/>
+<rect x="389" y="494" width="54" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="416" y="508" font-size="12" text-anchor="middle" fill="#1a73e8" font-weight="600">READER</text>
+<line x1="507" y1="439" x2="698" y2="567" stroke="#5f6368" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<rect x="560" y="482" width="54" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="587" y="496" font-size="12" text-anchor="middle" fill="#5f6368" font-weight="600">viewer</text>
+<line x1="523" y1="426" x2="887" y2="556" stroke="#5f6368" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<rect x="649" y="471" width="54" height="19" rx="4" fill="white" stroke="#c9ccd1"/>
+<text x="676" y="485" font-size="12" text-anchor="middle" fill="#5f6368" font-weight="600">viewer</text>
+<circle cx="1010" cy="60" r="15" fill="none" stroke="#5f6368" stroke-width="1.6"/><circle cx="1010" cy="55" r="5" fill="#5f6368"/><path d="M1002,71 a8,8 0 0,1 16,0" fill="#5f6368"/>
+<text x="1010" y="93.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">算法同学 / SRE</text>
+<text x="1010" y="108.0" font-size="12.5" text-anchor="middle" fill="#5f6368">gcloud run services proxy</text>
+<svg x="153.0" y="233.0" width="34" height="34" viewBox="0 0 24 24"><path fill="#669df6" d="M20 21a1 1 0 0 1-.7-.29l-2-2a1 1 0 0 1 1.41-1.41l2 2a1 1 0 0 1 0 1.41A1 1 0 0 1 20 21M4 21a1 1 0 0 1-.7-1.71l2-2a1 1 0 0 1 1.42 0a1 1 0 0 1 0 1.41l-2 2A1 1 0 0 1 4 21"/><path fill="#4285f4" d="m5.47 17.13l-1.22 1.22a11 11 0 0 0 1.42 1.41l1.22-1.22Zm14.26 1.18l-1-1a1.2 1.2 0 0 0-.23-.16l-1.34 1.34a1.2 1.2 0 0 0 .16.23l1 1a11 11 0 0 0 1.41-1.41"/><path fill="none" d="M0 0h24v24H0z"/><path fill="#669df6" d="M12 21a9 9 0 1 1 9-9a9 9 0 0 1-9 9m0-2a7 7 0 1 0-7-7a7 7 0 0 0 7 7"/><path fill="#4285f4" d="M12 17a5 5 0 0 0 5-5a5 5 0 0 0-5-5v5l-4.08 2.91A5 5 0 0 0 12 17"/><path fill="#aecbfa" d="M4 6.07a1 1 0 0 1-.71-1.71l2-2a1 1 0 0 1 1.42 0a1 1 0 0 1 0 1.41l-2 2a1 1 0 0 1-.71.3m16 0a1 1 0 0 1-.71-.3l-2-2a1 1 0 0 1 0-1.41a1 1 0 0 1 1.42 0l2 2A1 1 0 0 1 20 6.07"/></svg>
+<text x="170" y="283.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Cloud Scheduler</text>
+<text x="170" y="298.0" font-size="12.5" text-anchor="middle" fill="#5f6368">每 30 分钟</text>
+<svg x="433.0" y="233.0" width="34" height="34" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path fill="#5c85de" fill-rule="evenodd" d="m6 2.4l-5.2 3v13.7l5.2 3v-2.6l-3-1.7V6.7L6 5z"/><path fill="#3367d6" fill-rule="evenodd" d="M.8 8v8.5L3 17.8V6.7z"/><path fill="#3367d6" fill-rule="evenodd" d="M.8 8L3 7.5v-.8z"/><path fill="#5c85de" fill-rule="evenodd" d="M18 2.4V5l3 1.7v11.1l-3 1.7v2.6l5.2-3V5.4z"/><path fill="#3367d6" fill-rule="evenodd" d="m21 17.8l2.2-1.3V8L21 6.7z"/><path fill="#3367d6" fill-rule="evenodd" d="m21 7.5l2.2.5L21 6.7zm0 9.6v.7l2.2-1.3z"/><g fill-rule="evenodd"><path fill="#5c85de" d="M12 5.5L9 7.1l3 1.6l3-1.6z"/><path fill="#3367d6" d="m12.4 12.4l2.9-1.6V7.7l-2.9 1.6zm-.7-3.1l-3-1.6v3.1l3 1.6z"/><path fill="#5c85de" d="m8.56 11.376l-2.9 1.6l2.9 1.6l2.8-1.6z"/><path fill="#3367d6" d="m8.76 18.276l2.9-1.6v-3.2l-2.9 1.6zm-.5-3.2l-2.9-1.6v3.2l2.9 1.6z"/><path fill="#5c85de" d="m15.52 11.376l-2.9 1.6l2.9 1.6l2.9-1.6z"/><path fill="#3367d6" d="m15.82 18.276l2.9-1.6v-3.2l-2.9 1.6zm-.6-3.2l-2.9-1.6v3.2l2.9 1.6z"/></g></svg>
+<text x="450" y="283.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Artifact Registry</text>
+<text x="450" y="298.0" font-size="12.5" text-anchor="middle" fill="#5f6368">grafana:v1 · refresh:v1</text>
+<svg x="153.0" y="383.0" width="34" height="34" viewBox="0 0 24 24"><g fill-rule="evenodd"><path fill="#aecbfa" d="M8.9 2.63L12.02 12h9.36z"/><path fill="#4285f4" d="M21.38 12h-9.36L8.9 21.38zM3.44 21.38l3.13-1.57L8.9 12H5.78z"/><path fill="#aecbfa" d="M3.44 2.63L5.78 12H8.9L6.57 4.19z"/></g></svg>
+<text x="170" y="433.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Cloud Run job</text>
+<text x="170" y="448.0" font-size="12.5" text-anchor="middle" fill="#5f6368">mlobs-refresh</text>
+<svg x="433.0" y="383.0" width="34" height="34" viewBox="0 0 24 24"><g fill-rule="evenodd"><path fill="#aecbfa" d="M8.9 2.63L12.02 12h9.36z"/><path fill="#4285f4" d="M21.38 12h-9.36L8.9 21.38zM3.44 21.38l3.13-1.57L8.9 12H5.78z"/><path fill="#aecbfa" d="M3.44 2.63L5.78 12H8.9L6.57 4.19z"/></g></svg>
+<text x="450" y="433.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Cloud Run 服务</text>
+<text x="450" y="448.0" font-size="12.5" text-anchor="middle" fill="#5f6368">mlobs-grafana · 私有</text>
+<svg x="813.0" y="383.0" width="34" height="34" viewBox="0 0 24 24"><path fill="#4285f4" fill-rule="evenodd" d="m14.68 13.06l4.55 2.63v.99l-4.94-2.85z"/><path fill="#669df6" fill-rule="evenodd" d="m9.98 13.65l-5.21 3.01l-.32-.8l5.08-2.94z"/><path fill="#aecbfa" d="M11.55 3.29h.86v5.78h-.86z"/><path fill="#aecbfa" fill-rule="evenodd" d="M3.25 7v10L12 22l8.74-5V7L12 2Zm15.63 8.89L12 19.78l-6.88-3.89V8.11L12 4.22l6.87 3.89v7.78Z"/><path fill="#aecbfa" fill-rule="evenodd" d="m11.98 11.5l3.98-2.29l-3.98-2.3l-3.97 2.3z"/><path fill="#669df6" fill-rule="evenodd" d="m11.52 12.3l-3.86-2.29v4.59l3.86 2.29z"/><path fill="#4285f4" fill-rule="evenodd" d="M12.48 12.3v4.59l3.86-2.29v-4.59z"/></svg>
+<text x="830" y="433.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">GKE tpu-training-antgroup</text>
+<text x="830" y="448.0" font-size="12.5" text-anchor="middle" fill="#5f6368">122 节点 · 488 芯片</text>
+<svg x="133.0" y="565.0" width="34" height="34" viewBox="0 0 24 24"><g fill-rule="evenodd"><path fill="#aecbfa" d="M6.73 10.83v2.63a4.9 4.9 0 0 0 1.71 1.74v-4.37Z"/><path fill="#669df6" d="M9.89 8.41v7.53A8 8 0 0 0 11 16a8 8 0 0 0 1 0V8.41Z"/><path fill="#aecbfa" d="M13.64 11.86v3.29a5 5 0 0 0 1.7-1.82v-1.47Z"/><path fill="#4285f4" d="m17.74 16.32l-1.42 1.42a.42.42 0 0 0 0 .6l3.54 3.54a.42.42 0 0 0 .59 0l1.43-1.43a.42.42 0 0 0 0-.59l-3.54-3.54a.42.42 0 0 0-.6 0"/><path fill="#669df6" d="M11 2a9 9 0 1 0 9 9a9 9 0 0 0-9-9m0 15.69A6.68 6.68 0 1 1 17.69 11A6.68 6.68 0 0 1 11 17.69"/></g></svg>
+<text x="150" y="615.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">mlobs_raw</text>
+<text x="150" y="630.0" font-size="12.5" text-anchor="middle" fill="#5f6368">L1 原样落地</text>
+<svg x="373.0" y="565.0" width="34" height="34" viewBox="0 0 24 24"><g fill-rule="evenodd"><path fill="#aecbfa" d="M6.73 10.83v2.63a4.9 4.9 0 0 0 1.71 1.74v-4.37Z"/><path fill="#669df6" d="M9.89 8.41v7.53A8 8 0 0 0 11 16a8 8 0 0 0 1 0V8.41Z"/><path fill="#aecbfa" d="M13.64 11.86v3.29a5 5 0 0 0 1.7-1.82v-1.47Z"/><path fill="#4285f4" d="m17.74 16.32l-1.42 1.42a.42.42 0 0 0 0 .6l3.54 3.54a.42.42 0 0 0 .59 0l1.43-1.43a.42.42 0 0 0 0-.59l-3.54-3.54a.42.42 0 0 0-.6 0"/><path fill="#669df6" d="M11 2a9 9 0 1 0 9 9a9 9 0 0 0-9-9m0 15.69A6.68 6.68 0 1 1 17.69 11A6.68 6.68 0 0 1 11 17.69"/></g></svg>
+<text x="390" y="615.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">mlobs_core</text>
+<text x="390" y="630.0" font-size="12.5" text-anchor="middle" fill="#5f6368">L2/L3 建模，纯 SQL</text>
+<svg x="703.0" y="565.0" width="34" height="34" viewBox="0 0 24 24"><path fill="#4285f4" d="M6 11h4v2H6zm-2 7h6v2H4z"/><path fill="none" d="M0 0h24v24H0z"/><path fill="#4285f4" d="M4 18h2V6H4z"/><path fill="#669df6" d="M9 7h13V3H9zm0 7h13v-4H9zm0 7h13v-4H9z"/><path fill="#aecbfa" d="M2 8h6V2H2z"/></svg>
+<text x="720" y="615.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Cloud Logging _Default</text>
+<text x="720" y="630.0" font-size="12.5" text-anchor="middle" fill="#5f6368">30 天 · Log Analytics</text>
+<svg x="943.0" y="565.0" width="34" height="34" viewBox="0 0 24 24"><path fill="#669df6" d="M10.83 15.84h2.33v2.64h-2.33z"/><path fill="#4285f4" d="M18.48 13.87a.56.56 0 0 1-.4-.17L14 9.47l-2.74 2.89a.57.57 0 0 1-.76.05l-2.08-1.68l-2.2 2.92a.56.56 0 0 1-.45.22H2v1.71a.75.75 0 0 0 .74.75h18.52a.75.75 0 0 0 .74-.75v-1.71Z"/><path fill="#669df6" d="M5.5 12.76L7.88 9.6a.55.55 0 0 1 .37-.22a.63.63 0 0 1 .42.12l2.12 1.72l2.8-2.94a.54.54 0 0 1 .4-.17a.54.54 0 0 1 .4.17l4.33 4.48H22V6a.74.74 0 0 0-.74-.74H2.74A.74.74 0 0 0 2 6v6.81Z"/><rect width="6.67" height=".61" x="8.67" y="18.18" fill="#4285f4" rx=".3"/></svg>
+<text x="960" y="615.0" font-size="12.5" text-anchor="middle" fill="#202124" font-weight="600">Cloud Monitoring</text>
+</svg>

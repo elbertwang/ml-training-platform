@@ -295,51 +295,11 @@ flowchart TB
 
 哪个服务部署在哪、用什么身份、数据落在哪个 location。
 
-```mermaid
-flowchart TB
-  USER["算法同学 / SRE<br/>本地 gcloud run services proxy"]
+![部署视图](docs/deployment.svg)
 
-  subgraph PRJ["GCP 项目 tpu-for-training"]
+> 由 `tools/render_deployment.py` 生成，图标是 Google 官方 Cloud icon set。
+> 改完重新跑一次即可。
 
-    subgraph R1["区域 us-central1 —— 全部计算"]
-      direction LR
-      GKECL["GKE 集群<br/>tpu-training-antgroup<br/>122 节点 · 488 芯片"]
-      AR["Artifact Registry mlobs<br/>← Cloud Build<br/>grafana:v1 · refresh:v1"]
-      SCHED["Cloud Scheduler<br/>*/30 * * * *<br/>SA mlobs-scheduler"]
-      RUNJOB["Cloud Run job<br/>mlobs-refresh<br/>SA mlobs-refresh"]
-      RUNSVC["Cloud Run 服务<br/>mlobs-grafana<br/>私有 · 0→2 实例<br/>SA mlobs-grafana"]
-    end
-
-    subgraph GL["global —— 可观测面"]
-      direction LR
-      LOGBK["Cloud Logging _Default<br/>30 天 · Log Analytics 已开"]
-      CMON["Cloud Monitoring"]
-    end
-
-    subgraph US["BigQuery · US 多区域 —— 全部数据与建模"]
-      direction LR
-      DLINK["defaultLink<br/>逻辑计费 · 303 GB/天<br/>模型不读"]
-      RAWDS["mlobs_raw<br/>物理计费 · L1"]
-      COREDS["mlobs_core<br/>物理计费 · L2/L3<br/>建模在这里，纯 SQL"]
-    end
-
-  end
-
-  GKECL --> LOGBK
-  AR --> RUNJOB
-  AR --> RUNSVC
-  SCHED ==>|"run.invoker"| RUNJOB
-  USER ==>|"run.invoker"| RUNSVC
-  RUNJOB ==>|"WRITER"| RAWDS
-  RUNJOB ==>|"WRITER"| COREDS
-  RUNSVC ==>|"READER"| COREDS
-  RUNSVC --> CMON
-
-  style GKECL stroke-width:3px
-  style COREDS stroke-width:3px
-  style DLINK stroke-dasharray: 5 5
-  style US stroke-width:2px
-```
 
 **计算全部在 `us-central1`，数据全部在 US 多区域，这是被迫的。**
 `defaultLink` 由 Cloud Logging 托管、固定在 US 多区域，而 **BigQuery 不能跨
@@ -531,10 +491,12 @@ observability/
 │       └── provisioning/           三个数据源：BQ / Cloud Monitoring / Cloud Logging
 ├── tools/
 │   ├── build_capability_map.py     生成能力地图
+│   ├── render_deployment.py        画部署视图（官方 GCP 图标）
 │   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run；看清注释再跑）
 └── docs/
     ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
     ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
+    ├── deployment.svg              部署视图，由 tools/render_deployment.py 生成
     └── generated/                  工具产物，勿手改
         ├── capability-map-prod.md
         └── capability-map-prod.json
