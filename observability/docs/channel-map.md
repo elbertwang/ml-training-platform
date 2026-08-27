@@ -15,7 +15,8 @@
 
 ---
 
-> **这份是实测底数**——一个 jobset 到底能查到多少渠道。
+> **这份是实测底数**——一个 jobset 到底能查到多少**日志**渠道。
+> **指标**渠道见[附录 E](metric-map.md)。
 > **每个渠道该留 Cloud Logging 还是建模进 BigQuery，见 [`log-routing.md`](log-routing.md)。**
 
 ## 1. 全渠道清单（按归属层级）

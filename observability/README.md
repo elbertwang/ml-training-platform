@@ -31,6 +31,7 @@
 12. [附录 B：监控渠道分类地图](docs/channel-map.md) ← 单独文档
 13. [附录 C：日志路由方案](docs/log-routing.md) ← 单独文档
 14. [附录 D：Goodput 框架原生指标](docs/goodput.md) ← 单独文档
+15. [附录 E：指标渠道地图](docs/metric-map.md) ← 单独文档
 
 ---
 
@@ -886,3 +887,25 @@ MaxText 集成的 `ml-goodput-measurement` 能直接把 goodput 和 **14 类 bad
 
 它覆盖不了的部分正是本平台要守住的：集群级账本（实测 **488 张卡只有 298 张在忙**）、
 进程启动之前的排队与节点池创建、非 MaxText 负载、跨 job 关联、归因到具体硬件。
+
+---
+
+## 15. 附录 E：指标渠道地图
+
+单独成文：**[`docs/metric-map.md`](docs/metric-map.md)**
+
+附录 B 盘的是日志渠道，这份盘的是**指标**渠道：五个来源（框架自带、Goodput 库、
+GCP 原生、日志派生、缺口）× **两个视角**（job / 集群）。
+
+三个最该记住的：
+
+- **框架的同一份指标有 6 个出口**（stdout、TensorBoard、本地文件、GCS、
+  ML Diagnostics、Cloud Monitoring），选哪条是纯配置问题。**我们现在走的是最差的
+  那条 —— 从 stdout 解析。**
+- **按层展开的量永远不要进 Cloud Monitoring。** 生产里 771 个死描述符中有 183 个是
+  `Router_*_layer_N`，全部零数据 —— 这条路开过又废弃了。
+- **集群视角要用 node 级指标，不是 container 级。** 实测
+  `node/accelerator/tensorcore_utilization` 有 504 条序列，容器级只有 456 条 ——
+  差的 48 条正是**没有 pod 的芯片**，在容器级指标里不是 0 而是根本不存在。
+
+§7 是「新增指标放哪」的五步决策规则，§8 是建议的开发顺序。

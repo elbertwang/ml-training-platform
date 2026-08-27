@@ -1,6 +1,7 @@
 # Goodput：框架原生指标的算法与含义
 
-> 附录 D。基于 `ml-goodput-measurement` **0.2.3** 源码，与 fork
+> 附录 D。指标渠道的整体分类见[附录 E](metric-map.md)。
+> 基于 `ml-goodput-measurement` **0.2.3** 源码，与 fork
 > `github.com/primatrix/maxtext` 的集成代码（`src/maxtext/common/goodput.py`）。
 > 生产实测于 `tpu-for-training`，2026-08-27。
 
