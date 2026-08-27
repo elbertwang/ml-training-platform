@@ -281,35 +281,70 @@ flowchart TB
 
 判据与逐渠道决策见[附录 A](docs/logs.md)，指标侧见[附录 B](docs/metrics.md)。
 
-**图里三个刻意的设计：**
+**图例：**
 
-- **`dim_pod` 是骨架（粗框）。** Cloud Monitoring 只给 `pod_name`，日志只给 pod/node，
+- **粗框 `dim_pod` 是骨架。** Cloud Monitoring 只给 `pod_name`，日志只给 pod/node，
   ML Diagnostics 只给自己的 run id —— **没有任何一个渠道知道「job」是什么**。
   `dim_pod` 是唯一回答「这个 pod 属于哪个 job」的地方，所有东西都从它 join 出去。
-- **`defaultLink` 是虚线。** 全保真、$0，但**每天 303 GB**，只用于一次性回填和人工排查。
-  模型永远不读它 —— 早期版本读了，$1,240/月。
-- **④ 的窗口替换是 BigQuery 事务。** 实测两次刷新重叠时，读者会看到 `fact_event`
-  只有 273 行而不是 310 万行。事务 + ⑥ 的并发跳过，两层都要。
+- **虚线 `defaultLink`** 全保真、$0，但**每天 303 GB**，只用于一次性回填和人工排查。
+  模型不读它：早期版本读了，$1,240/月。
+- **④ 的窗口替换是 BigQuery 事务。** 两次刷新重叠时，读者会看到 `fact_event`
+  只有 273 行而不是 310 万行（实测）。事务 + ⑥ 的并发跳过，两层都需要。
 
 ### 4.2 部署视图：GCP 服务与身份
 
 哪个服务部署在哪、用什么身份、数据落在哪个 location。
 
-![部署视图](docs/diagrams/deployment.svg)
+```mermaid
+flowchart TB
+  USER["算法同学 / SRE<br/>本地 gcloud run services proxy"]
 
-> 这张图是**预渲染提交的 SVG**，本仓库唯一一张。原因是它用了真实的 Google Cloud
-> 图标，而图标来自 Iconify 图标包 —— 注册图标包要调 JavaScript，GitHub 的 Markdown
-> 渲染器没有这个机制，直接内联 mermaid 的话图标会是空白。
-> 源文件 [`docs/diagrams/deployment.mmd`](docs/diagrams/deployment.mmd) 一起提交，
-> 改完跑 `tools/render_diagrams.sh` 重新生成。
->
-> `architecture-beta` 没有边标签语法，所以身份写在节点上，具体授权见下面的表。
+  subgraph PRJ["GCP 项目 tpu-for-training"]
 
-**location 是这张图里最容易出错的地方。** 计算全部在 `us-central1`，数据全部在
-**US 多区域** —— 因为 `defaultLink` 由 Cloud Logging 托管，固定在 US 多区域，而
-**BigQuery 不能跨 location join**。`mlobs_raw` / `mlobs_core` 必须跟着建在 US，
-建成 `us-central1` 会在第一次 join 时失败。`deploy.sh` 读 `defaultLink` 的
-location 并跟随，不写死。
+    subgraph R1["区域 us-central1 —— 全部计算"]
+      direction LR
+      GKECL["GKE 集群<br/>tpu-training-antgroup<br/>122 节点 · 488 芯片"]
+      AR["Artifact Registry mlobs<br/>← Cloud Build<br/>grafana:v1 · refresh:v1"]
+      SCHED["Cloud Scheduler<br/>*/30 * * * *<br/>SA mlobs-scheduler"]
+      RUNJOB["Cloud Run job<br/>mlobs-refresh<br/>SA mlobs-refresh"]
+      RUNSVC["Cloud Run 服务<br/>mlobs-grafana<br/>私有 · 0→2 实例<br/>SA mlobs-grafana"]
+    end
+
+    subgraph GL["global —— 可观测面"]
+      direction LR
+      LOGBK["Cloud Logging _Default<br/>30 天 · Log Analytics 已开"]
+      CMON["Cloud Monitoring"]
+    end
+
+    subgraph US["BigQuery · US 多区域 —— 全部数据与建模"]
+      direction LR
+      DLINK["defaultLink<br/>逻辑计费 · 303 GB/天<br/>模型不读"]
+      RAWDS["mlobs_raw<br/>物理计费 · L1"]
+      COREDS["mlobs_core<br/>物理计费 · L2/L3<br/>建模在这里，纯 SQL"]
+    end
+
+  end
+
+  GKECL --> LOGBK
+  AR --> RUNJOB
+  AR --> RUNSVC
+  SCHED ==>|"run.invoker"| RUNJOB
+  USER ==>|"run.invoker"| RUNSVC
+  RUNJOB ==>|"WRITER"| RAWDS
+  RUNJOB ==>|"WRITER"| COREDS
+  RUNSVC ==>|"READER"| COREDS
+  RUNSVC --> CMON
+
+  style GKECL stroke-width:3px
+  style COREDS stroke-width:3px
+  style DLINK stroke-dasharray: 5 5
+  style US stroke-width:2px
+```
+
+**计算全部在 `us-central1`，数据全部在 US 多区域，这是被迫的。**
+`defaultLink` 由 Cloud Logging 托管、固定在 US 多区域，而 **BigQuery 不能跨
+location join**。`mlobs_raw` / `mlobs_core` 必须跟着建在 US；建成 `us-central1`
+会在第一次 join 时失败。`deploy.sh` 读 `defaultLink` 的 location 并跟随，不写死。
 
 | 组件 | 服务 | Location | 身份 |
 |---|---|---|---|
@@ -331,20 +366,19 @@ location 并跟随，不写死。
 | `mlobs-refresh` | `bigquery.jobUser` · `monitoring.viewer` · `hypercomputecluster.viewer` · `run.viewer` | `mlobs_raw` / `mlobs_core` **WRITER** |
 | `mlobs-scheduler` | — | 仅 `mlobs-refresh` job 上的 `run.invoker` |
 
-读写分离是实测验证过的：以 `mlobs-grafana` 身份查 `mlobs_core` 成功，查
-`defaultLink` **被拒绝**。**建模层没有任何一个身份能读 `defaultLink`** ——
-那是每天 303 GB 的表面，模型只读 sink。
+**没有任何身份能读 `defaultLink`**（每天 303 GB，模型只读 sink）。
+以 `mlobs-grafana` 身份实跑确认：查 `mlobs_core` 成功，查 `defaultLink` 被拒绝。
 
 **没有 VPC、没有负载均衡、没有持久卷。** Grafana 的 SQLite 是一次性的，dashboard
-和数据源都从镜像里 provision，所以服务可以缩到 0 实例、可以随时删了重建。
+和数据源都从镜像 provision，所以服务能缩到 0 实例，也能删了重建。
 
 ---
 
 ### 4.3 指标与日志溯源
 
 同一份数据可以从好几条通道拿到，选错通道的代价很大（见[附录 B](docs/metrics.md)）。
-这张图是**产生方 → 通道 → 我们的模型 → 要回答的问题**的完整链路，
-按算法同学最关心的两个问题组织。虚线是当前的缺口。
+链路是**产生方 → 通道 → 模型 → 要回答的问题**，按算法同学关心的两个问题组织。
+虚线是当前的缺口。
 
 ```mermaid
 flowchart LR
@@ -411,8 +445,8 @@ flowchart LR
 ```
 
 三条虚线是全部缺口：Goodput 库（**开关**）、ML Diagnostics 指标流（**开关**）、
-TPU 驱动的编译耗时（要开发）。粗框的 `fact_step` 同时喂两个问题，
-而且原料已经在 sink 里 —— 详见[附录 A](docs/logs.md)。
+TPU 驱动的编译耗时（要开发）。粗框 `fact_step` 同时喂两个问题，原料已在 sink 里，
+详见[附录 A](docs/logs.md)。
 
 ### 4.4 `dim_pod`：pod → job 的映射
 
@@ -497,17 +531,13 @@ observability/
 │       └── provisioning/           三个数据源：BQ / Cloud Monitoring / Cloud Logging
 ├── tools/
 │   ├── build_capability_map.py     生成能力地图
-│   ├── render_diagrams.sh          渲染带 GCP 图标的图
 │   └── deprecate_legacy_metrics.sh 废弃自定义指标（dry-run；看清注释再跑）
-├── docs/
-│   ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
-│   ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
-│   ├── diagrams/                   预渲染的图（带 GCP 图标，GitHub 画不了）
-│   │   ├── deployment.mmd          源
-│   │   └── deployment.svg          产物，由 tools/render_diagrams.sh 生成
-│   └── generated/                  工具产物，勿手改
-│       ├── capability-map-prod.md
-│       └── capability-map-prod.json
+└── docs/
+    ├── logs.md                     附录 A：日志（大全 + 地图 + 路由 + 待办）
+    ├── metrics.md                  附录 B：指标（大全 + 地图 + goodput + 开关）
+    └── generated/                  工具产物，勿手改
+        ├── capability-map-prod.md
+        └── capability-map-prod.json
 
 ```
 
@@ -549,7 +579,7 @@ gcloud run services proxy mlobs-grafana \
 所有请求，包括 IAM 直连的**，报 `Invalid IAP credentials: Invalid JWT audience`
 —— 所以半配好的 IAP 会让两条路同时不通。`ENABLE_IAP=1` 可以开回去，前提是先配好同意屏幕。
 
-**权限是按最小面给的，并且实测验证过**（以各自 SA 身份在 Cloud Run 里实跑）：
+**权限按最小面给**，以各自 SA 身份在 Cloud Run 里实跑确认过：
 
 | SA | 项目级 | 数据集级 |
 |---|---|---|
