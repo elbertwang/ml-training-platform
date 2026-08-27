@@ -26,6 +26,7 @@ Design notes that are not obvious from the JSON:
 
 import argparse
 import json
+import os
 
 # Validated categorical palette, first six slots, fixed order.
 # Sources are listed alphabetically so the assignment is stable across edits.
@@ -685,6 +686,10 @@ if __name__ == "__main__":
     ap.add_argument("--project", required=True)
     ap.add_argument("--out", default="dashboards/job.json")
     args = ap.parse_args()
+    # The dashboards directory is generated output, so it is not in git. Create
+    # it rather than failing: on a fresh clone deploy.sh calls this before
+    # `gcloud builds submit`, and the Dockerfile COPYs the directory.
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(build(args.project), fh, indent=2, ensure_ascii=False)
     print(f"wrote {args.out}")
