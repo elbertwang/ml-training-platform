@@ -143,11 +143,19 @@ def stat(overview_sql, title, x, y, w, h, field, unit=None, decimals=None,
 
 
 OVERVIEW_SQL_TEMPLATE = """SELECT
-  goodput_pct, peak_chips, chip_hours, est_usd, est_usd_observed,
+  goodput_pct, goodput_source, goodput_pct_proxy, disruptions,
+  peak_chips, chip_hours, est_usd, est_usd_observed,
   est_usd_wasted, attempts, error_lines, error_signatures, mldiag_events,
   min_sample_coverage, peak_nodes, tpu_model, run_phase, owner, exp_id,
   namespace_name, cluster_name, job_family, logs_available
 FROM `{project}.mlobs_core.job_overview`('${{job_key}}')"""
+
+# The badput decomposition, one row per category, largest first. Empty for a job
+# that did not record goodput -- the panel then shows "No data", which is the
+# honest answer and is what the 口径 stat next to it explains.
+BADPUT_SQL_TEMPLATE = """SELECT b.source, ROUND(b.seconds) AS seconds
+FROM `{project}.mlobs_core.job_overview`('${{job_key}}'), UNNEST(badput) b
+ORDER BY b.seconds DESC"""
 
 
 def build(project):
@@ -162,8 +170,13 @@ def build(project):
 
     panels += [
         stat(overview_sql, "Goodput", 0, y, 4, 4, "goodput_pct", unit="percent", decimals=1,
-             desc="5 分钟均值 tensorcore > 10% 的时间占比。代理指标：不代表训练有效，"
-                  "一个发散的 run 跑满 100% 也算满分。",
+             desc="有效时间占比。口径见右边那张卡：\n\n"
+                  "**measured** —— 训练进程自己上报（ml-goodput-measurement），"
+                  "分母是墙钟，配套有 badput 分解。\n\n"
+                  "**tensorcore_proxy** —— 回落算法：5 分钟均值 tensorcore > 10% "
+                  "的桶占比。它不代表训练有效（发散的 run 跑满 100% 也满分），"
+                  "而且分母只是**有采样的时间** —— 芯片被回收的那段根本不在分母里，"
+                  "所以系统性高报。实测同一个 job：measured 8.1% vs proxy 22.1%。",
              steps=[{"color": STATUS["critical"], "value": None},
                     {"color": STATUS["warning"], "value": 25},
                     {"color": STATUS["good"], "value": 60}]),
@@ -186,6 +199,50 @@ def build(project):
              desc="同名 job 跑过几次。生产环境里 henry-hlo-test 有 101 次。"),
     ]
     y += 4
+
+    # ---- row 1b: where the time went, when the job reported it -------------
+    # Only a job running with enable_goodput_recording fills this in. The 口径
+    # stat is deliberately next to the breakdown rather than next to the Goodput
+    # number: an empty breakdown and a proxy reading explain each other.
+    panels += [
+        stat(overview_sql, "Goodput 口径", 0, y, 4, 5, "goodput_source",
+             desc="measured = 训练进程自报，有下面的分解。\n"
+                  "tensorcore_proxy = 回落算法，没有分解，且系统性高报。\n\n"
+                  "拿不到 measured 的三种情况：任务不走 scripts/submit（falcon/"
+                  "kubemaker）、提交端代码早于 primatrix/maxtext#958、"
+                  "或显式关掉了开关（CI 的 loss-validation 就是）。"),
+        stat(overview_sql, "代理口径对照", 4, y, 4, 5, "goodput_pct_proxy",
+             unit="percent", decimals=1,
+             desc="同一个 job 用 tensorcore 代理算法会得到的数。两个数都在，"
+                  "是为了用有 measured 的任务校准那些永远拿不到 measured 的任务。"),
+        stat(overview_sql, "中断次数", 8, y, 3, 5, "disruptions",
+             desc="goodput 库记录的中断次数。一次中断可能吃掉几个小时的"
+                  "INFRASTRUCTURE_RECOVERY。",
+             steps=[{"color": STATUS["good"], "value": None},
+                    {"color": STATUS["warning"], "value": 1},
+                    {"color": STATUS["critical"], "value": 3}]),
+        {
+            "type": "bargauge", "title": "Badput 分解（秒）",
+            "description": "时间去哪了。elapsed = goodput + Σbadput，是闭合的，"
+                           "所以查不出原因的时间会落进 OTHER 而不是消失。"
+                           "空的说明这个 job 没有 measured 口径。",
+            "gridPos": {"x": 11, "y": y, "w": 13, "h": 5},
+            "datasource": DS,
+            "targets": [sql(BADPUT_SQL_TEMPLATE.format(project=project))],
+            "options": {
+                "displayMode": "gradient", "orientation": "horizontal",
+                "showUnfilled": True,
+                "reduceOptions": {"calcs": ["lastNotNull"], "values": True,
+                                  "fields": "/^seconds$/"},
+            },
+            "fieldConfig": {"defaults": {
+                "unit": "s", "decimals": 0,
+                "thresholds": {"mode": "absolute", "steps": [
+                    {"color": STATUS["warning"], "value": None}]},
+            }, "overrides": []},
+        },
+    ]
+    y += 5
 
     # ---- row 2: identity + the deep links ----------------------------------
     panels.append({

@@ -193,3 +193,103 @@ JOIN mlobs_core.dim_job_attempt a USING (attempt_uid)
 LEFT JOIN mlobs_core.dim_tpu_price p
   ON p.tpu_model = r.tpu_model AND p.usage_type = 'OnDemand'
 LEFT JOIN mlobs_core.dim_job m ON m.job_key = r.job_key;
+
+
+-- fact_goodput_measured: goodput as the training process itself reports it,
+-- rather than inferred from chip utilisation.
+--
+-- fact_goodput above is a proxy and says so: it scores a diverging run at 100%
+-- and cannot say *why* time was lost. This table is the real thing, published by
+-- ml-goodput-measurement when a job runs with enable_goodput_recording and
+-- monitor_goodput on (primatrix/maxtext#958 made that the default in the
+-- submission path). Its decomposition is closed --
+--
+--     total_elapsed = goodput + SUM(badput by category)
+--
+-- -- so unexplained time shows up as the OTHER category instead of vanishing.
+--
+-- Grain is job_key, not attempt_uid. The library keys on workload_id, which is
+-- MaxText's run_name, which the submit flow sets to the job name; it has no
+-- notion of the Job objects a JobSet creates on retry. Its counters are
+-- cumulative across the whole run, which is the more useful grain for "how much
+-- of this run was productive" anyway.
+--
+-- Two ways a job legitimately has no row here, and they are worth telling apart
+-- before assuming a bug:
+--   * it predates the switches being on, or was submitted from a checkout that
+--     predates them -- resolve_config runs on the submitter's machine;
+--   * it does not come through scripts/submit at all (falcon/kubemaker), or
+--     pins the switches off (the CI loss-validation jobsets).
+-- job_hub falls back to the proxy for those, and labels which one it used.
+--
+-- The counters reset when a run name is reused, so this takes the *latest*
+-- point per series rather than the max. A max would silently blend two runs and
+-- read high.
+CREATE OR REPLACE TABLE mlobs_core.fact_goodput_measured
+CLUSTER BY job_key
+AS
+WITH latest AS (
+  -- One row per (workload, metric, category): the most recent cumulative value.
+  -- metric_type is listed explicitly rather than matched with LIKE so that
+  -- metric_samples' CLUSTER BY metric_type prunes.
+  SELECT
+    JSON_VALUE(resource_labels, '$.workload_id') AS job_key,
+    metric_type,
+    COALESCE(JSON_VALUE(metric_labels, '$.badput_source'),
+             JSON_VALUE(metric_labels, '$.goodput_source'),
+             JSON_VALUE(metric_labels, '$.window_type'))  AS category,
+    ARRAY_AGG(value ORDER BY point_time DESC LIMIT 1)[OFFSET(0)] AS value,
+    MAX(point_time) AS last_point,
+    MIN(point_time) AS first_point
+  FROM mlobs_raw.metric_samples
+  WHERE metric_type IN (
+          'compute.googleapis.com/workload/goodput_time',
+          'compute.googleapis.com/workload/badput_time',
+          'compute.googleapis.com/workload/total_elapsed_time',
+          'compute.googleapis.com/workload/disruptions')
+    AND JSON_VALUE(resource_labels, '$.workload_id') IS NOT NULL
+  GROUP BY job_key, metric_type, category
+),
+rolled AS (
+  SELECT
+    job_key,
+    MIN(first_point) AS first_point,
+    MAX(last_point)  AS last_point,
+    MAX(IF(metric_type LIKE '%/total_elapsed_time', value, NULL)) AS elapsed_s,
+    MAX(IF(metric_type LIKE '%/goodput_time',       value, NULL)) AS goodput_s,
+    MAX(IF(metric_type LIKE '%/disruptions',        value, NULL)) AS disruptions,
+    SUM(IF(metric_type LIKE '%/badput_time',        value, 0))    AS badput_s,
+    -- Full fidelity kept alongside the scalars: the categories are the point of
+    -- the table, and which ones exist grows as a run progresses.
+    ARRAY_AGG(
+      IF(metric_type LIKE '%/badput_time' AND value > 0,
+         STRUCT(category AS source, ROUND(value, 1) AS seconds), NULL)
+      IGNORE NULLS ORDER BY value DESC) AS badput
+  FROM latest
+  GROUP BY job_key
+)
+SELECT
+  job_key,
+  first_point,
+  last_point,
+  ROUND(elapsed_s, 1)  AS elapsed_s,
+  ROUND(goodput_s, 1)  AS goodput_s,
+  ROUND(badput_s, 1)   AS badput_s,
+  CAST(disruptions AS INT64) AS disruptions,
+  ROUND(100 * SAFE_DIVIDE(goodput_s, elapsed_s), 1) AS goodput_pct,
+  -- The single biggest reason time was lost, which is the first thing anyone
+  -- asks. The full breakdown stays in `badput`.
+  badput[SAFE_OFFSET(0)].source  AS top_badput_source,
+  badput[SAFE_OFFSET(0)].seconds AS top_badput_s,
+  badput,
+  -- elapsed - goodput - SUM(badput). The decomposition is supposed to close, so
+  -- this is the library's own accounting error, published rather than hidden.
+  --
+  -- It is not an artefact of how this table samples. All four metrics carry the
+  -- same timestamps, and reading every category at one pinned timestamp gives a
+  -- residual identical to taking each series' latest point -- measured at -173.5s
+  -- on 24,840s elapsed, or -0.7%, for the first job to report. Treat a residual
+  -- of a few percent as noise and anything larger as a reason to distrust the
+  -- split rather than the total.
+  ROUND(elapsed_s - goodput_s - badput_s, 1) AS unaccounted_s
+FROM rolled;

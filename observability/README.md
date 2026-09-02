@@ -819,7 +819,8 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 | # | 事项 | 影响 | 状态 |
 |---|---|---|---|
-| 0 | **提交流默认打开 goodput 两个开关 + checkpoint cloud logger** | 合并前所有生产 job 的 goodput 只能靠 tensorcore 代理算法；合并后新启动的 job 有 14 类 badput 归因。见[附录 B §9](docs/metrics.md) | 🚧 `primatrix/maxtext` **PR #958 待 review** |
+| 0 | ~~提交流默认打开 goodput 开关~~ + 平台侧接入 | `primatrix/maxtext#958` 08-31 合并，平台已采 4 个 workload 指标并建 `fact_goodput_measured`，首个任务实测 measured 8.1% vs 代理 22.1%。见[附录 B §9](docs/metrics.md) | ✅ 已完成 |
+| 0b | **通知提交者拉取 main** | `resolve_config()` 跑在提交端，不拉取就还是旧默认值。09-01 集群里只有 1 个 job 是 `ENABLE_GOODPUT=true` | ⏳ **待推动，这是现在唯一的瓶颈** |
 | 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [附录 A](docs/logs.md) §4 | ❌ 已撤回 |
 | 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | ⏳ 待决策 |
 | 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效**（filter 要求 `pod_name=~"-worker-"`，falcon pod 名对不上） | ⏳ 待决策（改现有生产告警） |
@@ -949,8 +950,13 @@ FROM `<P>.mlobs_core.fact_mlrun_event`, UNNEST(detected) d GROUP BY 1 ORDER BY n
 - **挂牌价，未计承诺使用/预留折扣。**
 - **`min_sample_coverage` 低于 0.5 时 `est_usd` 是外推不是实测**，这时看
   `est_usd_observed`。测试环境里曾出现两者差 112 倍的情况。
-- **Goodput 是代理指标。** 定义是「5 分钟均值 tensorcore > 10% 的时间占比」，不代表
-  训练是否有效 —— 发散的 run 跑满 100% tensorcore 也算满分。JobSet 族应改用原生指标。
+- **Goodput 有两种口径，`goodput_source` 说明用的哪种。** `measured` 来自训练进程
+  自报（`ml-goodput-measurement`），分母是墙钟，配套 14 类 badput 分解。
+  `tensorcore_proxy` 是回落算法「5 分钟均值 tensorcore > 10% 的桶占比」，两个已知
+  缺陷：它不判断训练是否有效（发散的 run 跑满 100% 也满分），且**分母只是有采样的
+  时间** —— 芯片被回收那段不进分母，所以系统性高报。实测同一个 job：measured 8.1%
+  vs proxy 22.1%，差 2.7 倍，差额几乎全是 5.2 小时的
+  `INFRASTRUCTURE_RECOVERY_FROM_DISRUPTION`。**代理值只在拿不到 measured 时用**。
 - **历史深度受两处限制**：回填窗口（生产做了 2 天）和 Log Analytics 的 30 天保留。
 - **ML Diagnostics 有效历史约 2 个月**：13,400 个 run 中只有 3 个早于 2026-07-01。
 - **能力地图有 16 个指标探测未决**，工具会在输出里显式标 `INCOMPLETE`。

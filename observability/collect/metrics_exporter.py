@@ -70,6 +70,35 @@ METRICS = [
     # log-storm events on the fact_event timeline; joins to dim_pod
     ("logging.googleapis.com/log_entry_count",
      "k8s_container", 300, "ALIGN_SUM"),
+
+    # ---- measured goodput, from the ml-goodput-measurement library ----
+    #
+    # These four are the closed decomposition: elapsed = goodput + sum(badput),
+    # with disruptions counting the interruptions that produced it. They replace
+    # the tensorcore proxy above for any job that records them, and calibrate it
+    # for the jobs that cannot -- see fact_goodput_measured in
+    # model/06_fact_goodput.sql.
+    #
+    # They join on workload_id (= MaxText's run_name = the submitted job name),
+    # NOT on pod_name: resource.type is compute.googleapis.com/Workload and
+    # carries no pod. That is why they bypass fact_metric, whose whole purpose is
+    # the dim_pod join.
+    #
+    # Cumulative GAUGEs written every goodput_upload_interval_seconds (30s by
+    # default), so ALIGN_MAX over the bucket keeps the running total rather than
+    # averaging it down. Do not switch to ALIGN_RATE: these are not counters, and
+    # a run that reuses a name restarts them from zero.
+    #
+    # Volume is negligible next to the per-container metrics -- one series per
+    # (workload, badput category) instead of one per chip.
+    ("compute.googleapis.com/workload/goodput_time",
+     "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
+    ("compute.googleapis.com/workload/badput_time",
+     "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
+    ("compute.googleapis.com/workload/total_elapsed_time",
+     "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
+    ("compute.googleapis.com/workload/disruptions",
+     "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
 ]
 
 # Removed: tpu.googleapis.com/instance/interruption_count. It always returned
@@ -154,11 +183,21 @@ def to_rows(series_list, metric_type, ingested_at):
     return rows
 
 
-def clear_window(project, dataset, start, end):
-    """Delete the point_time range we are about to rewrite, so re-runs are exact."""
-    sql = (f"DELETE FROM `{project}.{dataset}.metric_samples` "
-           f"WHERE point_time >= TIMESTAMP('{start}') "
-           f"AND point_time < TIMESTAMP('{end}')")
+def clear_window(project, dataset, start, end, metric_types=None):
+    """Delete the point_time range we are about to rewrite, so re-runs are exact.
+
+    metric_types narrows the delete to the metrics this run will re-insert. It
+    has to move in lockstep with the --only filter: deleting the whole window
+    while reloading a subset would drop every other metric in it. Backfilling a
+    newly added metric over a wide window is the case that needs this -- a full
+    reload of a day of tensorcore samples is thousands of series for no reason.
+    """
+    where = (f"point_time >= TIMESTAMP('{start}') "
+             f"AND point_time < TIMESTAMP('{end}')")
+    if metric_types:
+        quoted = ", ".join("'" + m.replace("'", "") + "'" for m in metric_types)
+        where += f" AND metric_type IN ({quoted})"
+    sql = f"DELETE FROM `{project}.{dataset}.metric_samples` WHERE {where}"
     result = subprocess.run(
         ["bq", f"--project_id={project}", "query", "--use_legacy_sql=false", sql],
         capture_output=True, text=True)
@@ -205,7 +244,17 @@ def main():
                     help="window to export, ending now")
     ap.add_argument("--chunk-hours", type=float, default=6.0,
                     help="split the window; the API caps points per response")
+    ap.add_argument("--only", default="",
+                    help="substring of metric_type; export just the matching "
+                         "metrics and clear only those. For backfilling a "
+                         "newly added metric over a wide window without "
+                         "reloading everything else in it.")
     args = ap.parse_args()
+
+    selected = [m for m in METRICS if args.only in m[0]]
+    if not selected:
+        sys.exit(f"--only {args.only!r} matched none of: "
+                 + ", ".join(m[0] for m in METRICS))
 
     token = access_token()
     end_dt = dt.datetime.now(dt.timezone.utc)
@@ -213,12 +262,14 @@ def main():
     ingested_at = end_dt.isoformat()
     iso = lambda d: d.isoformat().replace("+00:00", "Z")
 
-    # One DELETE for the whole window across all metrics, before any load.
-    print(f"clearing {iso(start_dt)} .. {iso(end_dt)}", flush=True)
-    clear_window(args.project, args.dataset, iso(start_dt), iso(end_dt))
+    # One DELETE before any load, scoped to exactly the metrics being reloaded.
+    print(f"clearing {iso(start_dt)} .. {iso(end_dt)} "
+          f"({len(selected)}/{len(METRICS)} metrics)", flush=True)
+    clear_window(args.project, args.dataset, iso(start_dt), iso(end_dt),
+                 metric_types=[m[0] for m in selected] if args.only else None)
 
     total = 0
-    for metric_type, resource_type, alignment, aligner in METRICS:
+    for metric_type, resource_type, alignment, aligner in selected:
         print(f"{metric_type} ({aligner} @ {alignment}s)", flush=True)
         rows = []
         cursor = start_dt

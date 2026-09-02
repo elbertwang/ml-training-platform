@@ -590,22 +590,63 @@ kubernetes.io/jobset/startup_duration        实测 55s / 119s
 
 | # | 开关 | 状态 | 得到 | 代价 |
 |---|---|---|---|---|
-| **1** | `enable_goodput_recording=True`<br>`monitor_goodput=True` | 🚧 PR #958 待合并 | **14 类 badput 归因** + 真实分母的 goodput + `disruptions`。覆盖 **77% 卡时** | 一条日志流 ~200 条/小时/job |
-| **2** | `enable_checkpoint_cloud_logger=True` | 🚧 PR #958 待合并 | checkpoint 读写耗时。**不开的话 goodput 把它算成 0 而不是缺失** | 极小 |
+| **1** | `enable_goodput_recording=True`<br>`monitor_goodput=True` | ✅ 已合并（#958，08-31） | **14 类 badput 归因** + 真实分母的 goodput + `disruptions`。上限 **81% 卡时** | 一条日志流 ~200 条/小时/job |
+| **2** | `enable_checkpoint_cloud_logger=True` | ✅ 已合并（#958） | checkpoint 读写耗时。**不开的话 goodput 把它算成 0 而不是缺失** | 极小 |
 | **3** | `managed_mldiagnostics=True` | ❌ 未开 | 8 个核心指标进 ML Diagnostics 的 **10 秒粒度**流 | 小 |
 | 4 | `enable_cloud_monitoring=true`<br>**必须配白名单**，只留 `perf/*` 和 `learning/{loss,grad_norm,is_nan,is_inf}` | ❌ 未设 | 结构化时序，替代日志解析 | ⚠️ **不做白名单会重演 758 个死描述符** |
 
-**1 和 2 由 `primatrix/maxtext` PR #958 在提交流里默认打开**（已提，未合并）：
-`presets.py` 的 `enable_goodput` / `enable_checkpoint_cloud_logger` 默认 `True`，
-经 pod 环境变量 `ENABLE_GOODPUT` / `ENABLE_CHECKPOINT_CLOUD_LOGGER` 传给
-`pretrain_ling3_*.sh`，落到那两个 MaxText 参数上。管线本来就通，PR 改的只是每一层
-的默认值 —— 此前少数几个 overlay 各自打开，其余生产任务 goodput 是黑的。
-
-`base.yml` 里的默认值仍是 `False` 且 PR 没动它 —— 那属于上游 MaxText，被测试和不走
+**1 和 2 由 `primatrix/maxtext` PR #958 在提交流里默认打开**（2026-08-31 合并）：
+`presets.py` 的 `enable_goodput` 默认 `True`，`enable_checkpoint_cloud_logger` 派生自
+`enable_goodput AND enable_checkpointing`，经 pod 环境变量传给 `pretrain_ling3_*.sh`。
+`base.yml` 的默认值仍是 `False` 且 PR 没动 —— 那属于上游 MaxText，被测试和不走
 `scripts/submit/` 的调用方依赖。任何 overlay 仍可显式关闭。
 
-**只有在 PR 合并之后启动的 job 才有数据**，此前的 job 查不到 goodput 指标。合并后
-用 §9.1 的验证 SQL 确认 `badput_source` 有值再改这一行。
+### 9.0 生效范围：不是「合并即生效」
+
+`resolve_config()` 跑在**提交者自己的机器上**，所以每个人得先拉取 main。合并次日
+（09-01）集群里创建的 Job 中，`ENABLE_GOODPUT=true` 的只有 1 个，34 个 false
+（全是 CI loss-validation，设计如此）。
+
+三类任务永远拿不到，合起来是覆盖上限：
+
+| 提交路径 | 近 7 天卡时 | 占比 | measured |
+|---|---|---|---|
+| `scripts/submit/` | 65,608 | **81.0%** | ✅ 拉取后 |
+| falcon（kubemaker） | 14,269 | 17.6% | ❌ 不走提交流，见 README §8 #4 |
+| CI | 1,095 | 1.4% | ❌ 故意关闭 |
+
+### 9.2 平台侧的接入（已完成）
+
+开关打开不等于平台能看到 —— 指标落在 Cloud Monitoring 的
+`compute.googleapis.com/Workload` 上，**没有 `pod_name`**，`fact_metric` 那条
+`JOIN dim_pod ON pod_name` 会把它们全丢掉。所以：
+
+- `collect/metrics_exporter.py` 采 4 个 workload 指标（`goodput_time` /
+  `badput_time` / `total_elapsed_time` / `disruptions`），`ALIGN_MAX @ 300s` ——
+  它们是累计型 GAUGE，用 `ALIGN_RATE` 会算错；
+- `model/06_fact_goodput.sql` 建 `fact_goodput_measured`，粒度是 **job_key**
+  （`workload_id` = `run_name` = 提交的 job 名，库不知道 JobSet 重试出的 Job 对象）；
+- `job_hub` 的 `goodput_pct` 优先 measured、回落 proxy，`goodput_source` 标明用的哪个，
+  `goodput_pct_proxy` 保留以便校准。
+
+新增 `--only` 参数用于回填新加的指标：它把 `clear_window` 一并收窄到选中的指标，
+否则宽窗口回填会把窗口内其它指标删掉不补。
+
+**首个实测结果**（`mtc-plus256-pure-0901a`，256 芯片，6.9 小时）：
+
+| | |
+|---|---|
+| measured goodput | **8.1%** |
+| tensorcore 代理 | 22.1% |
+| 最大 badput | `INFRASTRUCTURE_RECOVERY_FROM_DISRUPTION` **18,668s**（5.2 小时） |
+| disruptions | 1 |
+| 残差 `unaccounted_s` | -173.5s（-0.7%） |
+
+代理高报 2.7 倍，差额几乎全是那 5.2 小时 —— 芯片被回收期间没有采样，那段时间在代理
+算法的**分母里根本不存在**。这是代理口径的系统性偏差，不是个例。
+
+残差不是采样方式造成的：四个指标的时间戳完全一致，钉在同一时刻读得到相同的
+-173.5s，是库自身账目的误差，已作为 `unaccounted_s` 列公开。
 
 **4 可以缓** —— `fact_step` 已经能从日志拿到同样的字段。
 

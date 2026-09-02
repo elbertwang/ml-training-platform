@@ -78,6 +78,7 @@ agg AS (
   FROM mlobs_core.fact_goodput g
   GROUP BY g.job_key
 ),
+meas AS (SELECT * FROM mlobs_core.fact_goodput_measured),
 ev AS (
   SELECT
     job_key,
@@ -105,7 +106,18 @@ SELECT
   a.peak_chips,
   a.tpu_model,
   ROUND(a.chip_hours, 2)          AS chip_hours,
-  ROUND(a.goodput_ratio * 100, 1) AS goodput_pct,
+  -- Measured when the job reported it, the tensorcore proxy otherwise. Both are
+  -- kept: goodput_source says which one goodput_pct is, and having the pair on
+  -- the jobs that have both is how the proxy gets calibrated for the jobs that
+  -- never will (falcon/kubemaker does not go through the submit flow).
+  COALESCE(meas.goodput_pct, ROUND(a.goodput_ratio * 100, 1)) AS goodput_pct,
+  IF(meas.goodput_pct IS NOT NULL, 'measured', 'tensorcore_proxy') AS goodput_source,
+  ROUND(a.goodput_ratio * 100, 1) AS goodput_pct_proxy,
+  meas.elapsed_s          AS goodput_elapsed_s,
+  meas.disruptions,
+  meas.top_badput_source,
+  meas.top_badput_s,
+  meas.badput,
   a.est_usd,
   a.est_usd_wasted,
   a.est_usd_observed,
@@ -138,8 +150,9 @@ SELECT
                                   AS cluster_director_url
 FROM mlobs_core.dim_job j
 CROSS JOIN cfg
-LEFT JOIN agg a USING (job_key)
-LEFT JOIN ev  USING (job_key);
+LEFT JOIN agg  a USING (job_key)
+LEFT JOIN meas   USING (job_key)
+LEFT JOIN ev     USING (job_key);
 
 
 -- ---- Table functions for the reporting layer ----
