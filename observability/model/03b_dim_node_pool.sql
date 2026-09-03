@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS mlobs_core.dim_node_pool
   location       STRING,
   node_pool      STRING,
   ig_hash        STRING,
+  -- Which pot of money the pool draws on: reserved / on_demand / flex / spot.
+  -- Finance counts reserved only, and this is what keeps flex-start work out
+  -- of a numerator whose denominator is the reservation.
+  reservation_affinity STRING,
+  reservation_name     STRING,
+  capacity_class       STRING,
   machine_type   STRING,
   tpu_topology   STRING,
   node_version   STRING,
@@ -55,6 +61,9 @@ USING (
     ig_hash,
     ANY_VALUE(location)      AS location,
     ANY_VALUE(node_pool)     AS node_pool,
+    ANY_VALUE(reservation_affinity) AS reservation_affinity,
+    ANY_VALUE(reservation_name)     AS reservation_name,
+    ANY_VALUE(capacity_class)       AS capacity_class,
     ANY_VALUE(machine_type)  AS machine_type,
     ANY_VALUE(tpu_topology)  AS tpu_topology,
     -- version and status change over the pool's life; keep the newest
@@ -75,13 +84,18 @@ WHEN MATCHED THEN UPDATE SET
   last_seen    = GREATEST(T.last_seen, S.last_seen),
   node_pool    = S.node_pool,
   location     = S.location,
+  reservation_affinity = S.reservation_affinity,
+  reservation_name = S.reservation_name,
+  capacity_class = S.capacity_class,
   machine_type = S.machine_type,
   tpu_topology = S.tpu_topology,
   node_version = S.node_version,
   pool_status  = S.pool_status
 WHEN NOT MATCHED THEN INSERT
-  (cluster_name, location, node_pool, ig_hash, machine_type, tpu_topology,
+  (cluster_name, location, node_pool, ig_hash, reservation_affinity,
+   reservation_name, capacity_class, machine_type, tpu_topology,
    node_version, pool_status, first_seen, last_seen)
 VALUES
-  (S.cluster_name, S.location, S.node_pool, S.ig_hash, S.machine_type,
+  (S.cluster_name, S.location, S.node_pool, S.ig_hash, S.reservation_affinity,
+   S.reservation_name, S.capacity_class, S.machine_type,
    S.tpu_topology, S.node_version, S.pool_status, S.first_seen, S.last_seen);

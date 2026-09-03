@@ -34,7 +34,7 @@ import urllib.request
 
 DEFAULT_PROJECT = os.environ.get("MLOBS_PROJECT", "tpu-for-training")
 DEFAULT_DATASET = os.environ.get("MLOBS_RAW_DATASET", "mlobs_raw")
-DEFAULT_CLUSTER = os.environ.get("GKE_CLUSTER", "tpu-training-antgroup")
+DEFAULT_CLUSTER = os.environ.get("GKE_CLUSTER", "")   # empty = discover
 DEFAULT_LOCATION = os.environ.get("GKE_LOCATION", "us-central1")
 
 # gke-tpu-for-trainin-tpu-256chips-p-aad6ce9c-grp -> aad6ce9c
@@ -49,6 +49,23 @@ def access_token() -> str:
         ["gcloud", "auth", "application-default", "print-access-token"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
+
+
+def fetch_clusters(token, project, location):
+    """Every cluster in the location.
+
+    Discovered rather than configured. The project went from one cluster to
+    three without this collector noticing, and a finance number that silently
+    covers a subset of the fleet is worse than one that is missing.
+    """
+    url = (f"https://container.googleapis.com/v1/projects/{project}"
+           f"/locations/{location}/clusters")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        body = json.load(urllib.request.urlopen(req, timeout=120))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"clusters.list failed: HTTP {e.code} {e.read()[:300]}")
+    return [c["name"] for c in body.get("clusters", [])]
 
 
 def fetch_pools(token, project, location, cluster):
@@ -71,11 +88,33 @@ def to_rows(pools, cluster, location, observed_at):
             if not m:
                 continue
             cfg = p.get("config", {})
+            # Which pot of money this pool draws on. Finance counts reserved
+            # capacity only, so this is what keeps an on-demand or flex-start
+            # job out of a ratio whose denominator is the reservation -- without
+            # it the numerator can exceed the denominator and the ratio goes
+            # over 100%.
+            #   SPECIFIC_RESERVATION  consumes a named reservation
+            #   NO_RESERVATION        on-demand, or flex-start
+            #   NONE / absent         no affinity expressed; treated as on-demand
+            ra = cfg.get("reservationAffinity") or {}
+            affinity = ra.get("consumeReservationType") or "NONE"
+            # values[0] is either a bare reservation name or a full path down to
+            # a reservation sub-block; the reservation is the first segment
+            # after /reservations/, and both spellings occur in this cluster.
+            target = (ra.get("values") or [""])[0]
+            if "/reservations/" in target:
+                target = target.split("/reservations/", 1)[1].split("/", 1)[0]
             rows.append({
                 "cluster_name": cluster,
                 "location": location,
                 "node_pool": p["name"],
                 "ig_hash": m.group(1),
+                "reservation_affinity": affinity,
+                "reservation_name": target or None,
+                "capacity_class": ("reserved" if affinity == "SPECIFIC_RESERVATION"
+                                   else "spot" if cfg.get("spot")
+                                   else "flex" if "flex" in p["name"]
+                                   else "on_demand"),
                 "machine_type": cfg.get("machineType"),
                 "tpu_topology": (p.get("placementPolicy", {}).get("tpuTopology")
                                  or cfg.get("placementPolicy", {}).get("tpuTopology")),
@@ -102,6 +141,7 @@ def bq_load(project, dataset, rows):
         "--clustering_fields=node_pool",
         f"{dataset}.node_pool_snapshot", path,
         ("cluster_name:STRING,location:STRING,node_pool:STRING,ig_hash:STRING,"
+         "reservation_affinity:STRING,reservation_name:STRING,capacity_class:STRING,"
          "machine_type:STRING,tpu_topology:STRING,node_version:STRING,"
          "initial_node_count:INTEGER,pool_status:STRING,observed_at:TIMESTAMP"),
     ]
@@ -117,7 +157,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", default=DEFAULT_PROJECT)
     ap.add_argument("--dataset", default=DEFAULT_DATASET)
-    ap.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    ap.add_argument("--cluster", default=DEFAULT_CLUSTER,
+                    help="comma-separated; empty discovers every cluster "
+                         "in the location")
     ap.add_argument("--location", default=DEFAULT_LOCATION)
     ap.add_argument("--print", dest="print_only", action="store_true",
                     help="write the rows to stdout as NDJSON instead of loading "
@@ -126,13 +168,20 @@ def main():
 
     token = access_token()
     observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    pools = fetch_pools(token, a.project, a.location, a.cluster)
-    rows = to_rows(pools, a.cluster, a.location, observed_at)
+    clusters = ([c.strip() for c in a.cluster.split(",") if c.strip()]
+                or fetch_clusters(token, a.project, a.location))
+    rows = []
+    for cluster in clusters:
+        pools = fetch_pools(token, a.project, a.location, cluster)
+        got = to_rows(pools, cluster, a.location, observed_at)
+        rows.extend(got)
+        if not a.print_only:
+            print(f"  {cluster}: {len(pools)} pools -> {len(got)} instance groups",
+                  flush=True)
     if a.print_only:
         for r in rows:
             print(json.dumps(r, ensure_ascii=False))
         return
-    print(f"{a.cluster}: {len(pools)} pools -> {len(rows)} instance groups", flush=True)
     bq_load(a.project, a.dataset, rows)
 
 

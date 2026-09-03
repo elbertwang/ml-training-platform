@@ -1025,6 +1025,186 @@ ORDER BY window_start""")],
     }
 
 
+def build_finance(project):
+    """The finance sheet. Four ratios, one denominator.
+
+    Replaces two Cloud Monitoring dashboards whose numbers the customer
+    reported as inaccurate, and they were, for two separate reasons recorded in
+    model/09_fin_utilization.sql: the denominator excluded capacity that was
+    paid for but idle, and TensorCore occupancy was labelled MFU. Every panel
+    here shows its formula in the description, because a finance number that
+    cannot be re-derived is not auditable.
+    """
+    fin = f"`{project}.mlobs_core.fin_daily`"
+    panels, y = [], 0
+
+    panels.append({"type": "row", "title": "大盘 Overview", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    def num(title, x, w, field, sql_extra, unit, dec, desc, steps=None):
+        return {
+            "type": "stat", "title": title, "description": desc,
+            "gridPos": {"x": x, "y": y, "w": w, "h": 5},
+            "datasource": DS,
+            "targets": [sql(f"""SELECT {sql_extra} AS {field}
+FROM {fin} WHERE day_coverage >= 0.9
+  AND day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())""")],
+            "options": {"reduceOptions": {"calcs": ["lastNotNull"],
+                                          "fields": f"/^{field}$/", "values": False},
+                        "textMode": "auto", "colorMode": "value", "graphMode": "none"},
+            "fieldConfig": {"defaults": {
+                "unit": unit, "decimals": dec,
+                "thresholds": {"mode": "absolute",
+                               "steps": steps or [{"color": "text", "value": None}]},
+            }, "overrides": []},
+        }
+
+    panels += [
+        num("① 预留占用率", 0, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2)",
+            "percent", 2,
+            "**公式** scheduled_chip_hours / paid_chip_hours\n\n"
+            "买下的芯片有多少发给了 VM。分子分母都对预留积分，不是读瞬时值 —— "
+            "预留会扩缩，读一个时刻会把它触及的每一天都改写。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 70},
+             {"color": STATUS["good"], "value": 90}]),
+        num("② 卡利用率", 5, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(busy_chip_hours),SUM(paid_chip_hours)),2)",
+            "percent", 2,
+            "**公式** busy_chip_hours / paid_chip_hours\n\n"
+            "busy = Σ(tensorcore% / 100 × 300 秒 × 芯片数)，只算预留节点池上的。\n\n"
+            "**与 GCP 看板的差别就在分母**：那边是 `avg(node_accelerator_duty_cycle)`，"
+            "分母是「有序列上报的芯片」。空闲的预留芯片没有 pod、没有容器指标、"
+            "因此没有序列，于是它被排除而不是记 0。同一周实测：那边 18.62%，这里 12.57%，"
+            "高报 48% —— 付费产能里有三分之一从没进过它的算式。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 30},
+             {"color": STATUS["good"], "value": 60}]),
+        num("③ MFU（真实）", 10, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(flops_chip_hours),SUM(paid_chip_hours)),2)",
+            "percent", 2,
+            "**公式** Σ(tflops_p50 / 1153.5 × step 秒 × 芯片) / paid_chip_hours\n\n"
+            "分子是训练进程自己打的 TFLOP/s，分母是 TPU7x bf16 峰值（每芯片 2307，"
+            "1 芯片 = 2 个 JAX device，故每 device 1153.5）。\n\n"
+            "**GCP 看板那个「MFU」不是 MFU** —— 它是 tensorcore 占用率，即"
+            "「张量核在发射指令的时间占比」。一个 kernel 可以让张量核一直忙着，"
+            "却只跑出峰值的零头。两者量纲不同。\n\n"
+            "⚠️ 按 bf16 峰值算。跑 fp8 的任务峰值是两倍，这里会读出约一半的真值。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 20},
+             {"color": STATUS["good"], "value": 40}]),
+        num("已付费芯片小时", 15, 5, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
+            "**公式** ∫ reservation/reserved dt，仅预留\n\n"
+            "按需与 flex-start 两侧都不计入 —— 它们不在 reservation/reserved 里，"
+            "capacity_class 也把它们的负载挡在分子外。不挡的话一波 flex 任务"
+            "能把比率顶到 100% 以上。"),
+        num("闲置成本", 20, 4, "v", "ROUND(SUM(idle_usd),0)", "currencyUSD", 0,
+            "**公式** (paid_chip_hours − busy_chip_hours) × 挂牌单价\n\n"
+            "挂牌价，未经账单核实 —— 单价口径（每芯片 vs 每主机）仍是待办，"
+            "可能有 4 倍偏差。比率不受影响，绝对金额受。"),
+    ]
+    y += 5
+
+    panels.append({"type": "row", "title": "趋势 Daily", "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+    panels.append({
+        "type": "timeseries", "title": "三个比率（同一分母，可直接相减）",
+        "description": "同一分母意味着它们可比、可相减。GCP 看板上每个指标各自对"
+                       "「上报了自己的那批芯片」取平均，于是会出现 MFU 高于 duty cycle "
+                       "这种不可能的组合。",
+        "gridPos": {"x": 0, "y": y, "w": 16, "h": 9},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
+  reservation_utilization_pct AS `预留占用率`,
+  chip_utilization_pct        AS `卡利用率`,
+  mfu_pct                     AS `MFU`
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9
+ORDER BY day""")],
+        "fieldConfig": {"defaults": {"unit": "percent",
+                                     "custom": {"lineWidth": 2, "fillOpacity": 0}},
+                        "overrides": []},
+    })
+    panels.append({
+        "type": "timeseries", "title": "芯片小时构成",
+        "description": "付费 ≥ 调度 ≥ 忙碌 ≥ FLOPs 等效，逐层收窄。"
+                       "每一层之间的落差就是一类浪费。",
+        "gridPos": {"x": 16, "y": y, "w": 8, "h": 9},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
+  paid_chip_hours      AS `已付费`,
+  scheduled_chip_hours AS `已调度`,
+  busy_chip_hours      AS `忙碌`,
+  flops_chip_hours     AS `FLOPs 等效`
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9
+ORDER BY day""")],
+        "fieldConfig": {"defaults": {"custom": {"lineWidth": 2, "fillOpacity": 10}},
+                        "overrides": []},
+    })
+    y += 9
+
+    panels.append({"type": "row", "title": "对账与导出 Reconciliation",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+    panels.append({
+        "type": "table", "title": "逐日明细（每个数都有公式，可直接对账）",
+        "description": "同一份数据在 `mlobs_core.fin_export` 里是长表，每行自带 "
+                       "formula 与 unit 两列，供内部系统直接拉取：\n\n"
+                       "`SELECT * FROM mlobs_core.fin_export WHERE day >= '2026-09-01'`\n\n"
+                       "`day_coverage` 低于 0.9 的日子是残日（采集中断或当天未过完）："
+                       "比率仍可用，绝对芯片小时会偏低。\n\n"
+                       "`unresolved_busy_chip_hours` 是归不到产能类别的负载 —— "
+                       "falcon 的临时节点池在下次快照前就被删了，池没了就再也解析不出来。"
+                       "这部分不计入分子但产能在分母里，所以它让利用率偏低而不是偏高。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 12},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT * FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+ORDER BY day DESC""")],
+        "options": {"showHeader": True, "cellHeight": "sm"},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "right", "filterable": True}},
+            "overrides": [
+                {"matcher": {"id": "byRegexp", "options": ".*_pct$"},
+                 "properties": [{"id": "unit", "value": "percent"},
+                                {"id": "decimals", "value": 2}]},
+                {"matcher": {"id": "byRegexp", "options": ".*_usd$"},
+                 "properties": [{"id": "unit", "value": "currencyUSD"},
+                                {"id": "decimals", "value": 0}]},
+                {"matcher": {"id": "byName", "options": "day_coverage"},
+                 "properties": [
+                     {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+                     {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                         {"color": STATUS["critical"], "value": None},
+                         {"color": STATUS["warning"], "value": 0.9},
+                         {"color": STATUS["good"], "value": 0.99}]}}]},
+            ],
+        },
+    })
+    y += 12
+
+    return {
+        "uid": "mlobs-finance",
+        "title": "ML Training — TPU 财务口径",
+        "description": "已付费产能，以及它换来了什么。每个指标都带公式。",
+        "tags": ["mlobs", "finance"],
+        "timezone": "utc",
+        "editable": True,
+        "schemaVersion": 39,
+        "refresh": "30m",
+        "time": {"from": "now-30d", "to": "now"},
+        "templating": {"list": []},
+        "panels": panels,
+    }
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True)
@@ -1036,7 +1216,8 @@ if __name__ == "__main__":
     os.makedirs(os.path.abspath(args.out_dir), exist_ok=True)
     for name, doc in (("index.json", build_index(args.project)),
                       ("job.json", build(args.project)),
-                      ("events.json", build_events(args.project))):
+                      ("events.json", build_events(args.project)),
+                      ("finance.json", build_finance(args.project))):
         path = os.path.join(args.out_dir, name)
         with open(path, "w") as fh:
             json.dump(doc, fh, indent=2, ensure_ascii=False)

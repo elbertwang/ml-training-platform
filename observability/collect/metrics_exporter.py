@@ -99,6 +99,26 @@ METRICS = [
      "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
     ("compute.googleapis.com/workload/disruptions",
      "compute.googleapis.com/Workload", 300, "ALIGN_MAX"),
+
+    # ---- the finance denominator ----
+    #
+    # Reserved capacity is what gets paid for whether or not anything runs on
+    # it, so every finance ratio divides by it. It has to be integrated over
+    # time rather than read as a level -- reserved chips change when a
+    # reservation is resized, and a spot reading would silently restate history.
+    #
+    # ALIGN_MEAN over the bucket, not ALIGN_MAX: the value is a level, and the
+    # mean of a level over a bucket is exactly the chip-hours contributed by
+    # that bucket once multiplied by its width. MAX would round every partial
+    # change up.
+    #
+    # Unit is chips. Confirmed against the hardware rather than assumed:
+    # ghostfish-luwqsqv4va7tk reports one block of 32 hosts, and TPU7x carries
+    # four chips per host, which matches its reserved series of ~128.
+    ("compute.googleapis.com/reservation/reserved",
+     "compute.googleapis.com/Reservation", 300, "ALIGN_MEAN"),
+    ("compute.googleapis.com/reservation/used",
+     "compute.googleapis.com/Reservation", 300, "ALIGN_MEAN"),
 ]
 
 # Removed: tpu.googleapis.com/instance/interruption_count. It always returned
