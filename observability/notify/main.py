@@ -79,7 +79,12 @@ def bq(sql, params=None):
         f"{BQ}/projects/{PROJECT}/queries", data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {_token()}",
                  "Content-Type": "application/json"})
-    res = json.load(urllib.request.urlopen(req, timeout=90))
+    try:
+        res = json.load(urllib.request.urlopen(req, timeout=90))
+    except urllib.error.HTTPError as e:
+        # urllib raises before anyone reads the body, so an unadorned 400 says
+        # nothing at all about which of these queries was malformed. Read it.
+        raise RuntimeError(f"BigQuery {e.code}: {e.read()[:400].decode()}") from None
     fields = [f["name"] for f in res.get("schema", {}).get("fields", [])]
     out = []
     for row in res.get("rows", []):
@@ -100,6 +105,24 @@ def p_str(name, value):
 # --------------------------------------------------------------------------- #
 # Normalisation: three log shapes -> one event
 
+def _ts(raw):
+    """Cloud Logging timestamps down to a precision BigQuery accepts.
+
+    An entry pushed straight off the Log Router carries nanoseconds --
+    2026-09-03T06:38:20.123456789Z -- and BigQuery's TIMESTAMP() stops at
+    microseconds, so passing it through returns a bare HTTP 400. The poll path
+    never hit this because it formats the timestamp in SQL on the way out; the
+    push path is the raw entry, which is exactly the kind of difference two
+    triggers sharing one downstream is supposed to surface.
+    """
+    if not raw:
+        return raw
+    if "." in raw:
+        head, frac = raw.split(".", 1)
+        return f"{head}.{frac.rstrip('Z')[:6]}Z"
+    return raw
+
+
 def normalise(entry):
     """A Cloud Logging entry -> the fields the rest of the path needs, or None.
 
@@ -108,7 +131,7 @@ def normalise(entry):
     """
     log_id = entry.get("logName", "").rsplit("/", 1)[-1]
     log_id = urllib.parse.unquote(log_id)
-    ts = entry.get("timestamp")
+    ts = _ts(entry.get("timestamp"))
     insert_id = entry.get("insertId")
 
     if log_id == "maintenance.googleapis.com/maintenance_events":
