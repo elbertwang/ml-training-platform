@@ -890,6 +890,141 @@ ORDER BY first_seen DESC""")],
     }
 
 
+def build_events(project):
+    """Cluster-level infrastructure events: what GKE did, and to whose job.
+
+    Separate from the per-job dashboard because these events are not about a
+    job -- an upgrade targets a node pool, a group maintenance targets a
+    reservation. The job list is the *consequence*, resolved through
+    jobs_on_target, and it is the column that makes the page worth opening:
+    every other view of this data stops at the pool name.
+    """
+    panels, y = [], 0
+
+    panels.append({"type": "row", "title": "节点池事件 Node pool events",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels.append({
+        "type": "table", "title": "节点池上发生过什么",
+        "description":
+            "升级、创建/删除、autorepair、以及失败的原因。一行是一次操作的完整生命周期，"
+            "不是一条日志 —— `log_entries` 是它产生了多少条原始日志，四位数说明有东西在"
+            "猛撞 API（falcon 重试删除是常客）。\n\n"
+            "`affected_jobs` 是事件发生时刻在该目标上的 job，按节点池→节点→pod→job "
+            "解析。空不一定是没影响：临时节点池被删掉之后就再也解析不出来了。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 14},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  occurred_at,
+  kind,
+  category,
+  state,
+  target,
+  duration_s,
+  log_entries,
+  ARRAY_LENGTH(affected_jobs) AS jobs,
+  (SELECT STRING_AGG(job_key, ', ' ORDER BY pods DESC)
+   FROM UNNEST(affected_jobs)) AS affected_jobs,
+  reason
+FROM `{project}.mlobs_core.fact_incident`
+WHERE target_kind IN ('node_pool', 'node')
+  AND occurred_at BETWEEN $__timeFrom() AND $__timeTo()
+ORDER BY occurred_at DESC""")],
+        "options": {"showHeader": True, "cellHeight": "sm"},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": "state"},
+                 "properties": [
+                     {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+                     {"id": "mappings", "value": [{"type": "value", "options": {
+                         "FAILED":    {"color": STATUS["critical"], "index": 0},
+                         "CANCELLED": {"color": STATUS["warning"],  "index": 1},
+                         "RUNNING":   {"color": STATUS["warning"],  "index": 2},
+                         "SUCCEEDED": {"color": STATUS["good"],     "index": 3}}}]}]},
+                {"matcher": {"id": "byName", "options": "duration_s"},
+                 "properties": [{"id": "unit", "value": "s"},
+                                {"id": "custom.align", "value": "right"}]},
+                {"matcher": {"id": "byName", "options": "log_entries"},
+                 "properties": [{"id": "custom.align", "value": "right"}]},
+                {"matcher": {"id": "byName", "options": "jobs"},
+                 "properties": [{"id": "custom.align", "value": "right"},
+                                {"id": "custom.cellOptions",
+                                 "value": {"type": "color-text"}},
+                                {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                                    {"color": "text", "value": None},
+                                    {"color": STATUS["warning"], "value": 1}]}}]},
+            ],
+        },
+    })
+    y += 14
+
+    panels.append({"type": "row", "title": "计划中的维护 Upcoming maintenance",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+
+    panels.append({
+        "type": "table", "title": "还没发生的维护窗口",
+        "description":
+            "All Capacity 模式的组维护：通知在窗口开始前约 90 天到达，最短 90 天一轮。"
+            "目标是 reservation / block / sub-block，不是节点池。\n\n"
+            "**空是正常的。** 本项目 All Capacity 已启用（`ghostfish-luwqsqv4va7tk` "
+            "的 schedulingType 是 GROUPED，1 个 block 32 卡全 HEALTHY），但保留窗口内"
+            "还没有排过组维护。通道已接入 sink，事件一到就会出现在这里。\n\n"
+            "注意这条通路和上面那张表不是同一个来源：上面是 "
+            "`maintenance.googleapis.com` 加 GKE 审计日志，这里是 compute 审计日志的 "
+            "`*GroupMaintenance` 方法。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  window_start,
+  window_end,
+  TIMESTAMP_DIFF(window_start, CURRENT_TIMESTAMP(), DAY) AS days_away,
+  target_kind,
+  target,
+  state,
+  reason AS schedule_type,
+  title
+FROM `{project}.mlobs_core.fact_incident`
+WHERE kind = 'group_maintenance'
+  AND (window_start IS NULL OR window_start >= CURRENT_TIMESTAMP())
+ORDER BY window_start""")],
+        "options": {"showHeader": True, "cellHeight": "sm"},
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left", "filterable": True}},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": "days_away"},
+                 "properties": [{"id": "unit", "value": "d"},
+                                {"id": "custom.align", "value": "right"},
+                                {"id": "custom.cellOptions",
+                                 "value": {"type": "color-text"}},
+                                {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                                    {"color": STATUS["critical"], "value": None},
+                                    {"color": STATUS["warning"], "value": 7},
+                                    {"color": "text", "value": 30}]}}]},
+            ],
+        },
+    })
+    y += 10
+
+    return {
+        "uid": "mlobs-events",
+        "title": "ML Training — 集群事件",
+        "description": "基础设施事件与它们打到了谁身上。",
+        "tags": ["mlobs"],
+        "timezone": "utc",
+        "editable": True,
+        "schemaVersion": 39,
+        "refresh": "5m",
+        "time": {"from": "now-7d", "to": "now"},
+        "templating": {"list": []},
+        "panels": panels,
+    }
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True)
@@ -900,7 +1035,8 @@ if __name__ == "__main__":
     # `gcloud builds submit`, and the Dockerfile COPYs the directory.
     os.makedirs(os.path.abspath(args.out_dir), exist_ok=True)
     for name, doc in (("index.json", build_index(args.project)),
-                      ("job.json", build(args.project))):
+                      ("job.json", build(args.project)),
+                      ("events.json", build_events(args.project))):
         path = os.path.join(args.out_dir, name)
         with open(path, "w") as fh:
             json.dump(doc, fh, indent=2, ensure_ascii=False)

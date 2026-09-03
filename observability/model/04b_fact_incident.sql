@@ -51,6 +51,8 @@ WITH maint AS (
               ORDER BY timestamp DESC LIMIT 1)[OFFSET(0)]       AS state,
     CAST(NULL AS STRING)                                        AS reason,
     COUNT(*)                                                    AS log_entries,
+    CAST(NULL AS TIMESTAMP) AS window_start,
+    CAST(NULL AS TIMESTAMP) AS window_end,
     ANY_VALUE(JSON_VALUE(resource, '$.labels.cluster_name'))    AS cluster_name
   FROM mlobs_core.v_sink_logs
   WHERE log_id = 'maintenance_googleapis_com_maintenance_events'
@@ -91,6 +93,8 @@ ops AS (
     -- How many raw entries this operation produced. A four-figure count is
     -- itself the finding: it means something is hammering the API.
     COUNT(*)                                                    AS log_entries,
+    CAST(NULL AS TIMESTAMP) AS window_start,
+    CAST(NULL AS TIMESTAMP) AS window_end,
     ANY_VALUE(JSON_VALUE(resource, '$.labels.cluster_name'))    AS cluster_name
   FROM mlobs_core.v_sink_logs
   WHERE log_id = 'cloudaudit_googleapis_com_activity'
@@ -113,14 +117,70 @@ repairs AS (
     'SUCCEEDED'    AS state,
     CAST(NULL AS STRING) AS reason,
     COUNT(*)             AS log_entries,
+    CAST(NULL AS TIMESTAMP) AS window_start,
+    CAST(NULL AS TIMESTAMP) AS window_end,
     ANY_VALUE(JSON_VALUE(resource, '$.labels.cluster_name'))    AS cluster_name
   FROM mlobs_core.v_sink_logs
   WHERE log_id = 'cloudaudit_googleapis_com_system_event'
     AND JSON_VALUE(proto_payload, '$.methodName') LIKE 'compute.instances.%'
   GROUP BY incident_uid, kind
 ),
+group_maint AS (
+  -- All Capacity group maintenance on a reservation, block or sub-block. The
+  -- notice arrives about 90 days before the window and recurs no more often
+  -- than every 90 days, so this is the one channel where the interesting row
+  -- is in the future rather than the past -- upcomingGroupMaintenance carries
+  -- windowGroupStartTime, and startGroupMaintenance / completedGroupMaintenance
+  -- close it out later.
+  --
+  -- Matched on the method name across both audit logs and without pinning
+  -- serviceName: these are compute.googleapis.com, not container, so the GKE
+  -- clause above does not see them.
+  --
+  -- Nothing has landed here yet. All Capacity is enabled -- reservation
+  -- ghostfish-luwqsqv4va7tk reports schedulingType GROUPED with one healthy
+  -- block of 32 -- but no group maintenance has been scheduled in the retained
+  -- window. Empty is the honest state, not a bug.
+  SELECT
+    JSON_VALUE(operation, '$.id')                               AS incident_uid,
+    'group_maintenance'                                         AS kind,
+    REGEXP_EXTRACT(ANY_VALUE(JSON_VALUE(proto_payload, '$.methodName')),
+                   r'([^.]+)$')                                 AS category,
+    ANY_VALUE(JSON_VALUE(proto_payload, '$.status.message'))     AS title,
+    -- reservations / reservations.blocks / reservations.blocks.subblocks
+    CASE
+      WHEN ANY_VALUE(JSON_VALUE(proto_payload, '$.methodName')) LIKE '%.blocks.subblocks.%'
+        THEN 'reservation_subblock'
+      WHEN ANY_VALUE(JSON_VALUE(proto_payload, '$.methodName')) LIKE '%.blocks.%'
+        THEN 'reservation_block'
+      ELSE 'reservation'
+    END                                                         AS target_kind,
+    ANY_VALUE(REGEXP_EXTRACT(JSON_VALUE(proto_payload, '$.resourceName'),
+                             r'/reservations/(.+)$'))           AS target,
+    MIN(IF(JSON_VALUE(operation, '$.first') = 'true', timestamp, NULL)) AS started_at,
+    MAX(IF(JSON_VALUE(operation, '$.last')  = 'true', timestamp, NULL)) AS ended_at,
+    ARRAY_AGG(COALESCE(JSON_VALUE(proto_payload, '$.metadata.maintenanceGroupStatus'),
+                       JSON_VALUE(proto_payload, '$.metadata.maintenanceStatus'),
+                       'PENDING')
+              ORDER BY timestamp DESC LIMIT 1)[OFFSET(0)]       AS state,
+    ANY_VALUE(JSON_VALUE(proto_payload, '$.metadata.type'))      AS reason,
+    COUNT(*)                                                    AS log_entries,
+    MIN(SAFE_CAST(COALESCE(
+      JSON_VALUE(proto_payload, '$.metadata.windowGroupStartTime'),
+      JSON_VALUE(proto_payload, '$.metadata.windowStartTime')) AS TIMESTAMP)) AS window_start,
+    MAX(SAFE_CAST(COALESCE(
+      JSON_VALUE(proto_payload, '$.metadata.windowGroupEndTime'),
+      JSON_VALUE(proto_payload, '$.metadata.windowEndTime')) AS TIMESTAMP))   AS window_end,
+    CAST(NULL AS STRING)                                        AS cluster_name
+  FROM mlobs_core.v_sink_logs
+  WHERE log_id IN ('cloudaudit_googleapis_com_activity',
+                   'cloudaudit_googleapis_com_system_event')
+    AND JSON_VALUE(proto_payload, '$.methodName') LIKE '%GroupMaintenance'
+  GROUP BY incident_uid, kind
+),
 all_inc AS (
   SELECT * FROM maint UNION ALL SELECT * FROM ops UNION ALL SELECT * FROM repairs
+  UNION ALL SELECT * FROM group_maint
 )
 SELECT
   i.incident_uid,
@@ -133,6 +193,8 @@ SELECT
   i.state,
   i.reason,
   i.log_entries,
+  i.window_start,
+  i.window_end,
   i.started_at,
   i.ended_at,
   COALESCE(i.started_at, i.ended_at) AS occurred_at,

@@ -81,6 +81,19 @@ FILTER='
       AND (operation.first=true OR operation.last=true))
   OR (log_id("cloudaudit.googleapis.com/system_event")
       AND protoPayload.methodName:"compute.instances.")
+  -- All Capacity group maintenance: the reservation / block / sub-block notice
+  -- that arrives ~90 days ahead, plus its start and completion. Matched across
+  -- both audit logs and without pinning serviceName, because these are
+  -- compute.googleapis.com rather than container.googleapis.com and the clause
+  -- above is scoped to GKE -- an earlier version only looked at system_event
+  -- and would have missed the notice entirely if it lands in activity.
+  -- Nothing to observe in this project yet: All Capacity is on
+  -- (schedulingType GROUPED on ghostfish-luwqsqv4va7tk) but no group
+  -- maintenance has been scheduled in the retained window, and the cadence is
+  -- no more than once every 90 days.
+  OR ((log_id("cloudaudit.googleapis.com/system_event")
+       OR log_id("cloudaudit.googleapis.com/activity"))
+      AND protoPayload.methodName:"GroupMaintenance")
   OR log_id("mlobs-smoketest")
 )
 '
