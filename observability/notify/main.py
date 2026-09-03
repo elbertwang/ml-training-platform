@@ -49,6 +49,8 @@ DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET", "")
 AT_USER_IDS = [u.strip() for u in os.environ.get("AT_USER_IDS", "").split(",") if u.strip()]
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 POLL_MINUTES = int(os.environ.get("POLL_MINUTES", "30"))
+# Required by the DingTalk robot's keyword allowlist; see compose().
+KEYWORD = os.environ.get("DINGTALK_KEYWORD", "MaxText")
 
 BQ = "https://bigquery.googleapis.com/bigquery/v2"
 SEVERITY_COLOR = {"CRITICAL": "#FF0000", "ERROR": "#FF6600", "WARNING": "#FFAA00"}
@@ -132,9 +134,19 @@ def normalise(entry):
         op = entry.get("operation", {}) or {}
         method = pp.get("methodName", "")
         status = pp.get("status", {}) or {}
+        if not op.get("id"):
+            # No operation id means this is not an operation boundary, it is an
+            # intermediate rejection -- falcon retrying a delete against a busy
+            # cluster produces about a thousand of these a day, each its own API
+            # call with its own insertId. Keying on insertId would make every
+            # one a distinct incident that deduplication cannot collapse, so
+            # enabling delivery would have sent a thousand messages a day.
+            # fact_incident already drops them for the same reason; the count is
+            # kept in fact_event as an occurrences total instead.
+            return None
         return {
             "kind": "node_repair_pool" if method.endswith("RepairNodePool") else "gke_op",
-            "incident_uid": op.get("id") or insert_id,
+            "incident_uid": op["id"],
             "state": "FAILED" if status.get("message") else "SUCCEEDED",
             "category": method.rsplit(".", 1)[-1],
             "title": method, "reason": status.get("message"),
@@ -278,9 +290,15 @@ def compose(ev, jobs, why):
         # otherwise, and the whole point of this service is the attribution.
         job_block = "**受影响的 job**：无（该目标上当时没有已知的 pod）"
 
-    title = f"[{ev['kind']}] {ev.get('category')} {ev.get('state')} — {ev.get('target')}"
+    # The robot enforces a keyword allowlist. A message without it is rejected
+    # with errcode 310000 and never reaches the group -- which is how the first
+    # real send failed, and why the ledger records failures rather than assuming
+    # a 200 from our own code means delivery. Both existing senders carry
+    # "MaxText" for the same reason.
+    title = (f"{KEYWORD} [{ev['kind']}] {ev.get('category')} "
+             f"{ev.get('state')} — {ev.get('target')}")
     text = (
-        f"### <font color=\"{color}\">{ev.get('state')}</font> "
+        f"### {KEYWORD} <font color=\"{color}\">{ev.get('state')}</font> "
         f"{ev.get('category')}\n\n"
         f"**目标**：{ev.get('target_kind')} `{ev.get('target')}`\n\n"
         f"**说明**：{ev.get('title') or '-'}\n\n"
