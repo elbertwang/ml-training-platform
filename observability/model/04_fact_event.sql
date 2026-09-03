@@ -226,6 +226,116 @@ JOIN mlobs_core.dim_pod p
   ON p.pod_name = JSON_VALUE(s.resource_labels, '$.pod_name')
 WHERE s.point_time >= window_start AND s.point_time < window_end
   AND s.metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
-  AND s.value < 5.0;
+  AND s.value < 5.0
+
+UNION ALL
+
+-- 7. GKE maintenance. A node pool upgrade or a planned VM maintenance, as the
+--    state machine the log actually publishes: one row per transition, keyed by
+--    the resourceMaintenances id so fact_incident can pair them up.
+--
+--    job_key stays NULL on purpose. The event is about a pool or a VM, which
+--    generally holds several pods from several jobs; picking one of them here
+--    would be a guess. The fan-out to jobs is fact_incident's job, and it keeps
+--    a list rather than a single value.
+SELECT
+  l.timestamp AS event_time,
+  CAST(NULL AS STRING) AS job_key,
+  CAST(NULL AS STRING) AS attempt_uid,
+  JSON_VALUE(l.resource, '$.labels.cluster_name') AS cluster_name,
+  CAST(NULL AS STRING) AS namespace_name,
+  'maintenance' AS source,
+  CASE JSON_VALUE(l.json_payload, '$.state')
+    WHEN 'CANCELLED' THEN 'WARNING' ELSE 'NOTICE' END AS severity,
+  CONCAT(JSON_VALUE(l.json_payload, '$.maintenance.category'), '_',
+         JSON_VALUE(l.json_payload, '$.state')) AS event_type,
+  SUBSTR(JSON_VALUE(l.json_payload, '$.maintenance.title'), 1, 500) AS summary,
+  CAST(NULL AS STRING) AS pod_name,
+  -- SERVICE_UPDATE targets a node pool and carries nodepool_name; INFRASTRUCTURE
+  -- targets one VM, whose resourceName is the node. Only the second can fill
+  -- node_name, and the pool lands in detail either way.
+  REGEXP_EXTRACT(JSON_VALUE(l.json_payload, '$.resource.resourceName'),
+                 r'/instances/([^/]+)$') AS node_name,
+  1 AS occurrences,
+  -- The node pool, and only the node pool. An earlier version fell back to the
+  -- maintenance id here, which made one column mean two different things
+  -- depending on the category. The id belongs to fact_incident, which is keyed
+  -- on it and reads the same log directly.
+  JSON_VALUE(l.resource, '$.labels.nodepool_name') AS detail
+FROM mlobs_core.v_sink_logs l
+WHERE l.timestamp >= window_start AND l.timestamp < window_end
+  AND l.log_id = 'maintenance_googleapis_com_maintenance_events'
+
+UNION ALL
+
+-- 8. Cluster operations from the audit log: node pool create/delete/upgrade and
+--    RepairNodePool, which is what AUTO_REPAIR_NODES looks like here.
+--
+--    Folded by (operation id, method, status) and counted. Falcon retries a
+--    delete against a busy cluster about a thousand times a day and every
+--    rejection is its own ERROR row; one row per rejection would let that
+--    drown the table the way gcsfuse did before app_error was folded. The
+--    count is the signal -- a thousand retries a day is worth seeing once.
+SELECT
+  MIN(l.timestamp) AS event_time,
+  CAST(NULL AS STRING) AS job_key,
+  CAST(NULL AS STRING) AS attempt_uid,
+  JSON_VALUE(ANY_VALUE(l.resource), '$.labels.cluster_name') AS cluster_name,
+  CAST(NULL AS STRING) AS namespace_name,
+  'gke_op' AS source,
+  MAX(l.severity) AS severity,
+  REGEXP_EXTRACT(JSON_VALUE(ANY_VALUE(l.proto_payload), '$.methodName'),
+                 r'([^.]+)$') AS event_type,
+  SUBSTR(COALESCE(JSON_VALUE(ANY_VALUE(l.proto_payload), '$.status.message'),
+                  JSON_VALUE(ANY_VALUE(l.proto_payload), '$.methodName')), 1, 500) AS summary,
+  CAST(NULL AS STRING) AS pod_name,
+  CAST(NULL AS STRING) AS node_name,
+  COUNT(*) AS occurrences,
+  -- resourceName ends in the node pool for pool-scoped operations
+  REGEXP_EXTRACT(JSON_VALUE(ANY_VALUE(l.proto_payload), '$.resourceName'),
+                 r'/nodePools/([^/]+)$') AS detail
+FROM mlobs_core.v_sink_logs l
+WHERE l.timestamp >= window_start AND l.timestamp < window_end
+  AND l.log_id = 'cloudaudit_googleapis_com_activity'
+  AND JSON_VALUE(l.proto_payload, '$.serviceName') = 'container.googleapis.com'
+GROUP BY JSON_VALUE(l.operation, '$.id'),
+         JSON_VALUE(l.proto_payload, '$.methodName'),
+         JSON_VALUE(l.proto_payload, '$.status.message')
+
+UNION ALL
+
+-- 9. VM-level auto-repair, which is a different layer from RepairNodePool
+--    above: the managed instance group recreating one node rather than GKE
+--    repairing a pool. Measured over a week, every one of 152 landed on a CPU
+--    pool and none on a TPU training pool, so this is routine churn that is
+--    worth recording and not worth paging anyone about. The notifier's rules
+--    decide that; this branch just records it.
+SELECT
+  l.timestamp AS event_time,
+  p.job_key,
+  p.attempt_uid,
+  JSON_VALUE(l.resource, '$.labels.cluster_name') AS cluster_name,
+  p.namespace_name,
+  'node_repair' AS source,
+  'WARNING' AS severity,
+  REGEXP_EXTRACT(JSON_VALUE(l.proto_payload, '$.methodName'), r'([^.]+)$') AS event_type,
+  SUBSTR(JSON_VALUE(l.proto_payload, '$.methodName'), 1, 500) AS summary,
+  p.pod_name,
+  REGEXP_EXTRACT(JSON_VALUE(l.proto_payload, '$.resourceName'),
+                 r'/instances/([^/]+)$') AS node_name,
+  1 AS occurrences,
+  JSON_VALUE(l.operation, '$.id') AS detail
+FROM mlobs_core.v_sink_logs l
+-- A repair names a node, and a node holds many pods. Joining dim_pod fans the
+-- event out to one row per pod that was on it -- which is the point: a repair
+-- with no pods is noise, a repair under a 256-chip job is an incident.
+LEFT JOIN mlobs_core.dim_pod p
+  ON p.node_name = REGEXP_EXTRACT(JSON_VALUE(l.proto_payload, '$.resourceName'),
+                                  r'/instances/([^/]+)$')
+ AND p.last_seen >= TIMESTAMP_SUB(l.timestamp, INTERVAL 2 HOUR)
+ AND p.first_seen <= l.timestamp
+WHERE l.timestamp >= window_start AND l.timestamp < window_end
+  AND l.log_id = 'cloudaudit_googleapis_com_system_event'
+  AND JSON_VALUE(l.proto_payload, '$.methodName') LIKE 'compute.instances.%';
 
 COMMIT TRANSACTION;

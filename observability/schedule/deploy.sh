@@ -46,11 +46,14 @@ echo "  ${SCHED_SA}"
 #   hypercomputecluster.viewer the ML Diagnostics REST API
 #   run.viewer                 the entrypoint's own overlap check, which lists
 #                              this job's executions before starting work
+#   container.viewer           nodePools.list, for the node pool -> instance
+#                              group hash mapping that turns a maintenance
+#                              event's pool name into the jobs running on it
 # Deliberately NOT bigquery.dataViewer project-wide: the model never reads
 # defaultLink, it is built entirely off the sink tables.
 grant_project_roles "$PROJECT_ID" "$SA" \
   roles/bigquery.jobUser roles/monitoring.viewer \
-  roles/hypercomputecluster.viewer roles/run.viewer
+  roles/hypercomputecluster.viewer roles/run.viewer roles/container.viewer
 grant_dataset_access "$PROJECT_ID" "$SA" WRITER mlobs_raw mlobs_core
 
 echo "=== Image ==="

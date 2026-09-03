@@ -41,6 +41,15 @@ COLUMNS = {
     "resource":          (["resource"],                        "TO_JSON", "JSON"),
     "labels":            (["labels"],                          "TO_JSON", "JSON"),
     "json_payload":      (["jsonPayload", "json_payload"],     "TO_JSON", "JSON"),
+    # Audit logs carry no jsonPayload at all -- the sink writes the payload into
+    # a typed STRUCT named protopayload_auditlog, and the operation id that
+    # pairs an operation's first and last entry into its own `operation` STRUCT.
+    # Without these two the audit branches of v_sink_logs come through with
+    # every payload column NULL, which reads exactly like "the sink delivered
+    # nothing" rather than "the view cannot see it".
+    "proto_payload":     (["protopayload_auditlog", "protoPayload", "proto_payload"],
+                                                              "TO_JSON", "JSON"),
+    "operation":         (["operation"],                       "TO_JSON", "JSON"),
     "text_payload":      (["textPayload", "text_payload"],     None,      "STRING"),
     "severity":          (["severity"],                        None,      "STRING"),
     "insert_id":         (["insertId", "insert_id"],           None,      "STRING"),

@@ -27,6 +27,10 @@ echo "=== Collect ==="
 "${HERE}/collect/mldiag_poller.py"    --project "$PROJECT_ID" \
                                       --locations "$MLDIAG_LOCATIONS" --since-hours 6
 "${HERE}/collect/metrics_exporter.py" --project "$PROJECT_ID" --hours "$METRIC_HOURS"
+# Node pool -> instance group hashes. Cheap (40 pools, one API call) and it has
+# to run often: falcon creates and deletes a pool inside one job, so a pool
+# missed between snapshots can never be resolved afterwards.
+python3 "${HERE}/collect/node_pool_snapshot.py" --project "$PROJECT_ID"
 
 # The sink materialises one table per log id, and new ones appear over time
 # (a new component starts logging, a new log id shows up). Rediscover cheaply
@@ -34,7 +38,7 @@ echo "=== Collect ==="
 python3 "${HERE}/model/build_v_sink_logs.py" --project "$PROJECT_ID"
 
 echo "=== Model ==="
-for f in 01_dim_pod 04_fact_event 06_fact_goodput 07_fact_step 08_views; do
+for f in 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views; do
   printf "  %-18s " "$f"
   if out=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
              < "${HERE}/model/${f}.sql" 2>&1); then

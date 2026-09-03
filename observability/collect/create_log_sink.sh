@@ -23,6 +23,47 @@ PROJECT_ID="${PROJECT_ID:?PROJECT_ID must be set}"
 DATASET="${DATASET:-mlobs_raw}"
 SINK_NAME="${SINK_NAME:-mlobs-selective}"
 
+# The last three are the infrastructure side of the timeline: things GKE did to
+# the cluster, as opposed to things the training process said. They replace a
+# Cloud Scheduler job that polled the GKE Operations API every minute, and the
+# replacement was measured rather than assumed:
+#
+#   coverage  Each GKE operation type was matched against the log by hand, not
+#             assumed. UPGRADE_NODES: 8/8 have one maintenance RUNNING event on
+#             the same node pool. CREATE_NODE_POOL 14:14 and DELETE_NODE_POOL
+#             11:11 on a sampled day, paired through operation.first/last.
+#             AUTO_REPAIR_NODES appears as the audit method
+#             ClusterManagerInternal.RepairNodePool -- the whole operation ID is
+#             searchable in the log, which is how the pairing was confirmed.
+#   history   The Operations API retains about 13 days, Cloud Logging 30. Over
+#             the same 30 days the log holds 7 auto-repairs while the API can
+#             still show 1, so switching to logs lengthens the record rather
+#             than shortening it.
+#   layers    AUTO_REPAIR_NODES (node pool, GKE-initiated, ~7/month) and
+#             compute.instances.repair.recreateInstance (single VM, MIG
+#             autohealing, ~94/week) are different events at different layers.
+#             They get separate sources in fact_event; neither substitutes for
+#             the other.
+#   latency   RepairNodePool lands 0.15s after the operation's startTime and
+#             0.06s after its endTime; the maintenance channel is slower at
+#             8-14s from start, still within 0.2s at the end. A 60s poll
+#             averages 30s late, so the log is the faster of the two.
+#   noise     Ingestion adds nothing: the ~1,000 daily "Cluster is running
+#             incompatible operation" rows are falcon retrying a delete, they
+#             are severity=ERROR, and the filter above has always taken them.
+#             fact_event collapses them by occurrences rather than dropping
+#             them -- that retry storm is itself worth seeing once a day.
+#
+#   maintenance_events   node-pool upgrades and planned VM maintenance, as a
+#                        RUNNING -> SUCCEEDED|CANCELLED state machine per event
+#   cloudaudit activity  the NOTICE-level start and end of each cluster
+#                        operation. Failures already arrive via severity>=ERROR
+#                        with their status message (GCE_STOCKOUT, reservation
+#                        capacity, IG timeout) -- the reason a maintenance turns
+#                        CANCELLED a fraction of a second later
+#   cloudaudit system_event  Google-initiated VM actions:
+#                        compute.instances.repair.recreateInstance is node
+#                        auto-repair, migrateOnHostMaintenance is live migration
 FILTER='
 (
   jsonPayload.message:"completed step"
@@ -32,6 +73,15 @@ FILTER='
   OR log_id("container.googleapis.com/cluster-autoscaler-visibility")
   OR log_id("tpu.googleapis.com/runtime_monitor")
   OR log_id("ml_diagnostics_workload_event")
+  OR log_id("maintenance.googleapis.com/maintenance_events")
+  OR (log_id("cloudaudit.googleapis.com/activity")
+      AND protoPayload.serviceName="container.googleapis.com"
+      AND NOT protoPayload.methodName:"List"
+      AND NOT protoPayload.methodName:"Get"
+      AND (operation.first=true OR operation.last=true))
+  OR (log_id("cloudaudit.googleapis.com/system_event")
+      AND protoPayload.methodName:"compute.instances.")
+  OR log_id("mlobs-smoketest")
 )
 '
 
