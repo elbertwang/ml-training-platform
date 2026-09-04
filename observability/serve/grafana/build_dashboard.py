@@ -1146,7 +1146,12 @@ def build_finance(project):
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
     y += 1
 
-    def num(title, x, w, field, sql_extra, unit, dec, desc, steps=None):
+    # Each tile filters on the gates its own metric depends on. Sharing one
+    # WHERE across all of them made the reservation figure disappear whenever
+    # capacity attribution was unavailable, which is a different metric's
+    # problem.
+    def num(title, x, w, field, sql_extra, unit, dec, desc, steps=None,
+            gate="day_coverage >= 0.9"):
         return {
             "type": "stat", "title": title, "description": desc,
             "gridPos": {"x": x, "y": y, "w": w, "h": 5},
@@ -1154,7 +1159,7 @@ def build_finance(project):
             "targets": [sql(f"""SELECT {sql_extra} AS {field}
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9 AND work_coverage >= 0.9""")],
+  AND {gate}""")],
             "options": {"reduceOptions": {"calcs": ["lastNotNull"],
                                           "fields": f"/^{field}$/", "values": False},
                         "textMode": "auto", "colorMode": "value", "graphMode": "none"},
@@ -1187,7 +1192,8 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             "下面的「产能漏斗」逐层显示流失在哪一环。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
-             {"color": STATUS["good"], "value": 60}]),
+             {"color": STATUS["good"], "value": 60}],
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9"),
         num("③ MFU", 12, 6, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(flops_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
@@ -1200,7 +1206,8 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             "⚠️ 峰值按 bf16 取。fp8 任务的峰值是两倍，其 MFU 在此约为真实值的一半。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 20},
-             {"color": STATUS["good"], "value": 40}]),
+             {"color": STATUS["good"], "value": 40}],
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9"),
         num("已付费芯片小时", 18, 6, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
             "**公式** ∫ reservation/reserved dt\n\n"
             "已付费的产能总量，是本页所有比率的**统一分母**。四个比率同分母，"
@@ -1259,13 +1266,19 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
                        "相减。曲线之间的垂直距离就是各环节的损耗。",
         "gridPos": {"x": 0, "y": y, "w": 16, "h": 9},
         "datasource": DS,
+        # No row filter here. The model already NULLs each ratio that its own
+        # coverage gate rejects, so a row-level WHERE just deletes the columns
+        # that were fine -- reservation utilisation needs no capacity
+        # attribution and has thirty days of history, but a shared
+        # `work_coverage >= 0.9` dropped it down to the two days the other two
+        # series happen to have. A NULL renders as a gap, which is what a series
+        # with no trustworthy value should look like.
         "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
   reservation_utilization_pct AS `预留占用率`,
   chip_utilization_pct        AS `卡利用率`,
   mfu_pct                     AS `MFU`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9 AND work_coverage >= 0.9
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"unit": "percent",
                                      "custom": {"lineWidth": 2, "fillOpacity": 0}},
@@ -1284,7 +1297,7 @@ ORDER BY day""")],
   flops_chip_hours     AS `FLOPs 等效`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9 AND work_coverage >= 0.9
+  AND day_coverage >= 0.9
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"custom": {"lineWidth": 2, "fillOpacity": 10}},
                         "overrides": []},
