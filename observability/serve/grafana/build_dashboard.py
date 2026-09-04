@@ -185,7 +185,7 @@ def build(project):
         stat(overview_sql, "Est. cost (wallclock)", 10, y, 4, 4, "est_usd",
              unit="currencyUSD", decimals=0,
              desc="按墙钟时间 × 芯片数 × 挂牌价。价格单位（每芯片 vs 每主机）"
-                  "未经账单核实，可能高 4 倍。coverage 低时看 observed 那个数。"),
+                  "未与账单核对：没有 Cloud Billing 导出，这是费率不是发票。coverage 低时看 observed 那个数。"),
         stat(overview_sql, "Est. cost (observed)", 14, y, 4, 4, "est_usd_observed",
              unit="currencyUSD", decimals=0,
              desc="只按实际有采样的时间算。这个数是实测，不是外推。"),
@@ -1102,9 +1102,17 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             "capacity_class 也把它们的负载挡在分子外。不挡的话一波 flex 任务"
             "能把比率顶到 100% 以上。"),
         num("闲置成本", 20, 4, "v", "ROUND(SUM(idle_usd),0)", "currencyUSD", 0,
-            "**公式** (paid_chip_hours − busy_chip_hours) × 挂牌单价\n\n"
-            "挂牌价，未经账单核实 —— 单价口径（每芯片 vs 每主机）仍是待办，"
-            "可能有 4 倍偏差。比率不受影响，绝对金额受。"),
+            "**公式** (paid_chip_hours − busy_chip_hours) × 费率\n\n"
+            "费率取 **3 年承诺价**，不是按需价 —— 本集群的预留产能全部由 ACTIVE 的 "
+            "36 个月承诺覆盖（经预留的 linkedCommitments 与承诺自身的芯片数核对），"
+            "用按需价计价会把金额高报整整一个承诺折扣。\n\n"
+            "单位是**每芯片**，不是每主机。该区域的 TPU SKU 是一族，其中三个较老"
+            "世代与各自公开的每芯片小时价完全吻合；本项目承诺的计量单位也写作 "
+            "ACCELERATOR，数量与预留芯片数相等。\n\n"
+            "实际费率见 `rate_usd_per_chip_hour` 列。费率本身不在代码仓库里，"
+            "由 `collect/load_tpu_price.sh` 从外部 CSV 载入。\n\n"
+            "仍未与账单核对：两个项目都没有 Cloud Billing 导出，所以这是费率不是"
+            "发票，折扣与抵扣未反映。"),
     ]
     y += 5
 

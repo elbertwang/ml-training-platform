@@ -1,31 +1,56 @@
--- dim_tpu_price: TPU rate card, joined to fact_goodput to turn chip-hours into
--- money. A table rather than a hard-coded CASE so it can be corrected without a
--- model change.
+-- dim_tpu_price: the TPU rate card, joined wherever chip-hours become money.
 --
--- `tpu_model` must match the `model` metric label on
--- kubernetes.io/container/accelerator/* exactly. Those values are GKE
--- accelerator names, not the marketing names used in the price list -- observed
--- values are `tpu7x`, `tpu-v5-lite-podslice`, `tpu-v6e-slice`, `tpu-v5p-slice`.
--- A first version keyed on 'v6e'/'v5p' and silently joined to nothing, leaving
--- every cost column NULL.
+-- **The rates are not in this repository.** They are commercial terms, so the
+-- table is created empty here and populated out of band -- see
+-- collect/load_tpu_price.sh, which loads a CSV from a GCS path given at deploy
+-- time. Nothing in git, in the mirror under primatrix/maxtext, or in a code
+-- review carries a number.
 --
--- On-demand list prices from the Cloud Billing Catalog API, us-central1,
--- 2026-08-24.
+-- CREATE TABLE IF NOT EXISTS, deliberately. Every model file is re-run on each
+-- deploy and a CREATE OR REPLACE would silently empty the rate card on a
+-- routine deploy, turning every cost column NULL with no error anywhere.
 --
--- !! VERIFY BEFORE TRUSTING ANY COST COLUMN !!
--- The SKU reads "TPU7x running in Americas ... usageUnit: h" and does not say
--- whether the hour is per chip or per host. We assume per chip-hour, consistent
--- with the v6e SKU ($2.70/h) matching its published per-chip price. A
--- tpu7x-standard-4t host carries 4 chips, so if the SKU is per host then every
--- cost figure is 4x too high. Neither project has a Cloud Billing BigQuery
--- export to reconcile against -- creating one is the fix.
+-- An empty table is the safe failure: costs come out NULL rather than wrong.
+-- A fresh project therefore shows chip-hours and ratios -- which need no rate
+-- card -- and no currency until someone loads one.
+--
+-- ---------------------------------------------------------------------------
+-- What the columns mean, which is the part worth writing down:
+--
+--   tpu_model   must match the `model` metric label on
+--               kubernetes.io/container/accelerator/* exactly. Those are GKE
+--               accelerator names, not the marketing names on the price list:
+--               observed values are tpu7x, tpu-v5-lite-podslice, tpu-v6e-slice,
+--               tpu-v5p-slice. A first version keyed on 'v6e'/'v5p' and joined
+--               to nothing, leaving every cost column NULL.
+--
+--   usage_type  OnDemand, Commit1Yr, Commit3Yr, CalendarReserved, Preemptible.
+--               Which one applies is a property of how the capacity was bought,
+--               not of the workload. Reserved capacity backed by a commitment
+--               does not bill on demand, and pricing it that way overstates the
+--               figure by the whole commitment discount -- fin_daily selects
+--               Commit3Yr because this fleet's reservations are covered by
+--               ACTIVE 36-month commitments, verified through the reservation's
+--               linkedCommitments and the commitments' own accelerator counts.
+--
+--   usd_per_chip_hour
+--               Per chip, not per host. The SKU description gives only
+--               "usageUnit: h" and this was open for weeks. It is settled by
+--               four independent checks: the region's on-demand TPU SKUs form a
+--               single family whose three older generations each match their
+--               published per-chip-hour list price, and this project's
+--               commitments are denominated in ACCELERATOR with amounts equal
+--               to the reservations' chip counts.
+--
+-- Not reconciled to an invoice. No Cloud Billing BigQuery export exists in
+-- either project, so whatever is loaded here is a rate card and not a bill:
+-- discounts, credits and mid-period commitment changes are not reflected.
+-- Creating that export is the fix, and until it exists every currency column
+-- is an estimate that happens to be precise.
 
-CREATE OR REPLACE TABLE mlobs_core.dim_tpu_price AS
-SELECT * FROM UNNEST([
-  STRUCT('tpu7x'                AS tpu_model, 'OnDemand'    AS usage_type, 12.0000 AS usd_per_chip_hour),
-  STRUCT('tpu7x',                              'Preemptible',  4.3320),
-  STRUCT('tpu-v6e-slice',                      'OnDemand',     2.7000),
-  STRUCT('tpu-v5p-slice',                      'OnDemand',     4.2000),
-  STRUCT('tpu-v5-lite-podslice',               'OnDemand',     1.2000),
-  STRUCT('tpu-v4-podslice',                    'OnDemand',     3.2200)
-]);
+CREATE TABLE IF NOT EXISTS mlobs_core.dim_tpu_price
+(
+  tpu_model         STRING,
+  usage_type        STRING,
+  usd_per_chip_hour FLOAT64
+);

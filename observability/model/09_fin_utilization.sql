@@ -294,9 +294,17 @@ work AS (
   GROUP BY day
 ),
 price AS (
+  -- The committed rate, not the on-demand one. Every reserved chip in this
+  -- fleet is covered by an ACTIVE 36-month commitment -- confirmed through the
+  -- reservations' linkedCommitments and the commitments' accelerator counts --
+  -- so on-demand is the wrong card to price it from. It was, and the daily
+  -- figure was overstated by the whole commitment discount.
+  --
+  -- Rates come from dim_tpu_price, which this repository creates empty and
+  -- never populates; see collect/load_tpu_price.sh.
   SELECT ANY_VALUE(usd_per_chip_hour) AS usd_per_chip_hour
   FROM mlobs_core.dim_tpu_price
-  WHERE tpu_model = 'tpu7x' AND usage_type = 'OnDemand'
+  WHERE tpu_model = 'tpu7x' AND usage_type = 'Commit3Yr'
 )
 SELECT
   c.day,
@@ -333,6 +341,9 @@ SELECT
      ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
            * (SELECT usd_per_chip_hour FROM price), 0))          AS idle_usd,
   ROUND(c.paid_chip_hours * (SELECT usd_per_chip_hour FROM price), 0) AS paid_usd,
+  -- The rate travels with the money so any figure here can be re-derived, and
+  -- so a change of rate card is visible rather than silent.
+  (SELECT usd_per_chip_hour FROM price)                          AS rate_usd_per_chip_hour,
   -- Trust markers, published beside the numbers rather than in a footnote.
   c.day_coverage,
   -- Share of that day's pods that could be attributed to a capacity class.
@@ -391,7 +402,7 @@ FROM (
      STRUCT('mfu_pct', mfu_pct, 'percent',
             'flops_chip_hours / paid_chip_hours; bf16 peak, so fp8 jobs read ~half'),
      STRUCT('paid_usd', paid_usd, 'USD',
-            'paid_chip_hours * dim_tpu_price.usd_per_chip_hour (list, OnDemand)'),
+            'paid_chip_hours * dim_tpu_price.usd_per_chip_hour (Commit3Yr)'),
      STRUCT('idle_usd', idle_usd, 'USD',
             '(paid_chip_hours - busy_chip_hours) * usd_per_chip_hour')
     ] AS metrics
