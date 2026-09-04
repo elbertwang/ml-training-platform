@@ -84,6 +84,42 @@ else
   echo "  created"
 fi
 
+# ---------------------------------------------------------------------------
+# The node pool snapshot runs on its own, far more often than the model.
+#
+# falcon creates a node pool per job and deletes it when the job ends, so a pool
+# missed between two snapshots can never be resolved afterwards -- the audit log
+# records the create and the delete but carries no instance group, which is the
+# only bridge from a node name to its pool. At a 30-minute cadence 39% of busy
+# chip-hours landed in an "unresolved" capacity class; five minutes narrows the
+# window it can hide in. It reuses the refresh image and overrides the command,
+# so there is nothing extra to build: one API call and a small load, a few
+# seconds per run.
+POOLSNAP="${POOLSNAP:-mlobs-poolsnap}"
+SNAP_ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE"
+           --service-account "$SA"
+           --command python3
+           --args "/app/collect/node_pool_snapshot.py,--project,${PROJECT_ID}"
+           --set-env-vars "PROJECT_ID=${PROJECT_ID}"
+           --memory 512Mi --cpu 1 --task-timeout 5m --max-retries 1 --quiet)
+if gcloud run jobs describe "$POOLSNAP" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
+  gcloud run jobs update "$POOLSNAP" "${SNAP_ARGS[@]}" >/dev/null && echo "  ${POOLSNAP} updated"
+else
+  gcloud run jobs create "$POOLSNAP" "${SNAP_ARGS[@]}" >/dev/null && echo "  ${POOLSNAP} created"
+fi
+gcloud run jobs add-iam-policy-binding "$POOLSNAP" --project "$PROJECT_ID" \
+  --region "$REGION" --member="serviceAccount:${SCHED_SA}" \
+  --role=roles/run.invoker --quiet >/dev/null 2>&1 || true
+SNAP_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${POOLSNAP}:run"
+SNAP_SARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "*/5 * * * *"
+            --uri "$SNAP_URI" --http-method POST --time-zone UTC
+            --oauth-service-account-email "$SCHED_SA" --attempt-deadline 5m --quiet)
+if gcloud scheduler jobs describe "$POOLSNAP" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+  gcloud scheduler jobs update http "$POOLSNAP" "${SNAP_SARGS[@]}" >/dev/null && echo "  ${POOLSNAP} schedule updated: */5"
+else
+  gcloud scheduler jobs create http "$POOLSNAP" "${SNAP_SARGS[@]}" >/dev/null && echo "  ${POOLSNAP} schedule created: */5"
+fi
+
 echo "=== Scheduler ==="
 # The scheduler gets its own identity holding nothing but run.invoker. Reusing
 # the refresh account would mean anything able to impersonate the writer could

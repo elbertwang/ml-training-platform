@@ -10,14 +10,17 @@
 --   paid_chip_hours     = INTEGRAL(reservation/reserved) dt        [chips x h]
 --   scheduled_chip_hours= INTEGRAL(reservation/used)     dt
 --   busy_chip_hours     = SUM(tensorcore_pct/100 x interval x chips)
---   flops_chip_hours    = SUM(tflops_p50 / peak_tflops x step_seconds x devices/2)
---   productive_chip_hours = SUM(goodput_seconds x chips) / 3600
+--   flops_chip_hours    = SUM(tflops_p50 / peak_tflops x step_seconds x chips)
 --
 --   reservation_utilization = scheduled / paid      "bought it, handed it out?"
 --   chip_utilization        = busy      / paid      "handed out, doing work?"
 --   mfu                     = flops     / paid      "doing work, how fast?"
---   goodput                 = productive/ paid      "work that was not wasted"
---   wasted_usd              = (paid - productive) x usd_per_chip_hour
+--   idle_usd                = (paid - busy) x usd_per_chip_hour
+--
+-- A goodput row belongs in this set and is not here yet: it needs
+-- fact_goodput_measured, which covers a handful of jobs so far because the
+-- switches only landed on 2026-08-31. Left out rather than published against a
+-- denominator it cannot fill.
 --
 -- ============================ WHAT CHANGED AND WHY ====================
 --
@@ -133,7 +136,25 @@ WITH pod_class AS (
     p.pod_name,
     p.job_key,
     p.cluster_name,
-    COALESCE(np.capacity_class, 'unresolved') AS capacity_class,
+    COALESCE(
+      np.capacity_class,
+      -- falcon creates a node pool per job and deletes it when the job ends,
+      -- often inside one 5-minute snapshot interval, so a large share of its
+      -- pods can never be resolved to a pool that still exists. Dropping them
+      -- is not neutral: they were 39% of all busy chip-hours, and excluding
+      -- reserved work from the numerator while its capacity stays in the
+      -- denominator understates utilisation by about that much.
+      --
+      -- They are reserved. Of 90 CreateNodePool audit entries for falcon pools
+      -- in one week, 87 requested SPECIFIC_RESERVATION and 3 did not, so this
+      -- fallback is right about 97% of the time and its weight is published as
+      -- assumed_busy_chip_hours rather than folded in silently.
+      --
+      -- Checking one entry is how this nearly went the other way: the first
+      -- falcon pool sampled happened to be one of the three NO_RESERVATION
+      -- ones, which argued for excluding the lot.
+      IF(p.job_family = 'falcon', 'reserved_assumed', 'unresolved')
+    ) AS capacity_class,
     np.reservation_name
   FROM mlobs_core.dim_pod p
   LEFT JOIN mlobs_core.dim_node_pool np
@@ -151,6 +172,28 @@ busy AS (
   JOIN pod_class c USING (pod_name)
   WHERE m.metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
   GROUP BY day, c.capacity_class
+),
+pool_coverage AS (
+  -- What share of that day's pods can be attributed to a capacity class at all.
+  --
+  -- dim_node_pool is built from snapshots and a snapshot is not retroactive, so
+  -- a pool that was deleted before the collector existed can never be resolved.
+  -- Measured on the day this was written: 100% for 2026-09-03 and 09-04, 98%
+  -- for 09-02, 57-77% across 08-28..09-01, and 3-8% for 08-27 and earlier.
+  --
+  -- That gradient is the collector's start date, not a change in the fleet. A
+  -- 30-day chart of chip_utilization built without this column shows
+  -- utilisation climbing from 1% to 15% and reads as a dramatic improvement;
+  -- every point of that climb is an artefact.
+  SELECT
+    DATE(p.first_seen) AS day,
+    ROUND(COUNTIF(np.ig_hash IS NOT NULL OR p.job_family = 'falcon')
+          / COUNT(*), 3) AS work_coverage
+  FROM mlobs_core.dim_pod p
+  LEFT JOIN mlobs_core.dim_node_pool np
+    ON np.ig_hash = mlobs_core.node_ig_hash(p.node_name)
+  WHERE p.node_name IS NOT NULL
+  GROUP BY day
 ),
 job_class AS (
   -- One row per job, not per pod. Joining fact_step to a per-pod table fans
@@ -187,13 +230,18 @@ flops AS (
     DATE(s.step_time) AS day,
     c.capacity_class,
     SUM(SAFE_DIVIDE(s.tflops_p50, pk.peak_tflops_per_device)
-        * s.step_seconds_p50 * s.ranks_reporting * sh.chips_per_rank / 3600)
+        * s.step_seconds_p50 * s.ranks_reporting * COALESCE(sh.chips_per_rank, 4.0) / 3600)
                                                              AS flops_chip_hours,
-    SUM(s.step_seconds_p50 * s.ranks_reporting * sh.chips_per_rank / 3600)
+    SUM(s.step_seconds_p50 * s.ranks_reporting * COALESCE(sh.chips_per_rank, 4.0) / 3600)
                                                              AS stepping_chip_hours
   FROM mlobs_core.fact_step s
   JOIN job_class c  USING (job_key)
-  JOIN job_shape sh USING (job_key)
+  -- LEFT, with a fallback. An inner join dropped 167 of 807 jobs that have
+  -- TFLOP/s but no peak_chips in job_hub -- a silent 21% cut of the MFU
+  -- numerator. Every job where the ratio *can* be measured comes out at exactly
+  -- 4.0, which is TPU7x's four chips per host, so that is the fallback and the
+  -- jobs relying on it are counted in fin_daily.
+  LEFT JOIN job_shape sh USING (job_key)
   CROSS JOIN (SELECT peak_tflops_per_device FROM mlobs_core.dim_chip_peak
               WHERE tpu_model = 'tpu7x' AND dtype = 'bf16') pk
   WHERE s.tflops_p50 IS NOT NULL AND s.ranks_reporting > 0
@@ -202,12 +250,14 @@ flops AS (
 SELECT
   COALESCE(b.day, f.day)                       AS day,
   COALESCE(b.capacity_class, f.capacity_class) AS capacity_class,
+  pc.work_coverage,
   ROUND(b.busy_chip_hours, 2)                  AS busy_chip_hours,
   b.chips_seen,
   ROUND(f.flops_chip_hours, 2)                 AS flops_chip_hours,
   ROUND(f.stepping_chip_hours, 2)              AS stepping_chip_hours
 FROM busy b
-FULL OUTER JOIN flops f ON f.day = b.day AND f.capacity_class = b.capacity_class;
+FULL OUTER JOIN flops f ON f.day = b.day AND f.capacity_class = b.capacity_class
+LEFT JOIN pool_coverage pc ON pc.day = COALESCE(b.day, f.day);
 
 
 -- The finance sheet. One row per day; every column has a formula in the header.
@@ -224,9 +274,18 @@ WITH cap AS (
 ),
 work AS (
   SELECT day,
-         SUM(IF(capacity_class = 'reserved', busy_chip_hours, 0))  AS busy_chip_hours,
-         SUM(IF(capacity_class = 'reserved', flops_chip_hours, 0)) AS flops_chip_hours,
-         SUM(IF(capacity_class = 'unresolved', busy_chip_hours, 0)) AS unresolved_busy_chip_hours
+         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
+                busy_chip_hours, 0))                              AS busy_chip_hours,
+         SUM(IF(capacity_class = 'reserved_assumed', busy_chip_hours, 0))
+                                                                  AS assumed_busy_chip_hours,
+         -- SUM of a filtered IF() yields 0 when nothing matched, and 0 reads as
+         -- "MFU was zero" rather than "no job logged TFLOP/s that day". NULLIF
+         -- on the row count keeps the distinction; 2026-08-28 and 08-29 had no
+         -- such steps at all and were publishing 0.00%.
+         NULLIF(SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
+                       COALESCE(flops_chip_hours, 0), 0)), 0)     AS flops_chip_hours,
+         SUM(IF(capacity_class = 'unresolved', busy_chip_hours, 0)) AS unresolved_busy_chip_hours,
+         MIN(work_coverage) AS work_coverage
   FROM mlobs_core.fin_work_daily
   GROUP BY day
 ),
@@ -241,18 +300,40 @@ SELECT
   ROUND(c.scheduled_chip_hours, 1)                               AS scheduled_chip_hours,
   ROUND(w.busy_chip_hours, 1)                                    AS busy_chip_hours,
   ROUND(w.flops_chip_hours, 1)                                   AS flops_chip_hours,
-  -- scheduled / paid
-  ROUND(100 * SAFE_DIVIDE(c.scheduled_chip_hours, c.paid_chip_hours), 2) AS reservation_utilization_pct,
-  -- busy / paid
-  ROUND(100 * SAFE_DIVIDE(w.busy_chip_hours, c.paid_chip_hours), 2)      AS chip_utilization_pct,
-  -- flops / paid, bf16 peak
-  ROUND(100 * SAFE_DIVIDE(w.flops_chip_hours, c.paid_chip_hours), 2)     AS mfu_pct,
+  -- Every ratio is NULL below 0.9 day coverage, rather than published small.
+  --
+  -- The chip-hour columns above are honest partial sums; a ratio built on a
+  -- partial denominator is not approximately right, it is arbitrary. Observed
+  -- while reviewing this model: the scheduled refresh was still running an
+  -- image without the reservation collector, so paid_chip_hours stopped at
+  -- 2026-09-03 06:29 while busy_chip_hours kept accruing to 09-04 01:32, and
+  -- 2026-09-03 published 60.64% chip utilisation against a real figure near
+  -- 18%. day_coverage recorded 0.271 that whole time and was simply read past.
+  -- Suppressing the ratio makes that unreadable rather than merely documented.
+  IF(c.day_coverage < 0.9, NULL,
+     ROUND(100 * SAFE_DIVIDE(c.scheduled_chip_hours, c.paid_chip_hours), 2))
+                                                                 AS reservation_utilization_pct,
+  IF(c.day_coverage < 0.9 OR w.work_coverage < 0.9, NULL,
+     ROUND(100 * SAFE_DIVIDE(w.busy_chip_hours, c.paid_chip_hours), 2))
+                                                                 AS chip_utilization_pct,
+  -- bf16 peak
+  IF(c.day_coverage < 0.9 OR w.work_coverage < 0.9, NULL,
+     ROUND(100 * SAFE_DIVIDE(w.flops_chip_hours, c.paid_chip_hours), 2))
+                                                                 AS mfu_pct,
   -- (paid - busy) x price
   ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
         * (SELECT usd_per_chip_hour FROM price), 0)              AS idle_usd,
   ROUND(c.paid_chip_hours * (SELECT usd_per_chip_hour FROM price), 0) AS paid_usd,
   -- Trust markers, published beside the numbers rather than in a footnote.
   c.day_coverage,
+  -- Share of that day's pods that could be attributed to a capacity class.
+  -- The numerators only see this fraction of the work; below 0.9 the two
+  -- work-based ratios above are suppressed rather than published low.
+  w.work_coverage,
+  -- How much of busy_chip_hours rests on the falcon assumption above, and how
+  -- much is still unattributable. Both published so a reader can re-derive the
+  -- conservative figure by subtracting.
+  ROUND(w.assumed_busy_chip_hours, 1)                            AS assumed_busy_chip_hours,
   ROUND(w.unresolved_busy_chip_hours, 1)                         AS unresolved_busy_chip_hours
 FROM cap c
 LEFT JOIN work w USING (day);

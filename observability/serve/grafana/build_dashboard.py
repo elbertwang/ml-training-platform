@@ -1048,8 +1048,9 @@ def build_finance(project):
             "gridPos": {"x": x, "y": y, "w": w, "h": 5},
             "datasource": DS,
             "targets": [sql(f"""SELECT {sql_extra} AS {field}
-FROM {fin} WHERE day_coverage >= 0.9
-  AND day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())""")],
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9 AND work_coverage >= 0.9""")],
             "options": {"reduceOptions": {"calcs": ["lastNotNull"],
                                           "fields": f"/^{field}$/", "values": False},
                         "textMode": "auto", "colorMode": "value", "graphMode": "none"},
@@ -1123,7 +1124,7 @@ FROM {fin} WHERE day_coverage >= 0.9
   mfu_pct                     AS `MFU`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9
+  AND day_coverage >= 0.9 AND work_coverage >= 0.9
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"unit": "percent",
                                      "custom": {"lineWidth": 2, "fillOpacity": 0}},
@@ -1142,7 +1143,7 @@ ORDER BY day""")],
   flops_chip_hours     AS `FLOPs 等效`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9
+  AND day_coverage >= 0.9 AND work_coverage >= 0.9
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"custom": {"lineWidth": 2, "fillOpacity": 10}},
                         "overrides": []},
@@ -1160,9 +1161,16 @@ ORDER BY day""")],
                        "`SELECT * FROM mlobs_core.fin_export WHERE day >= '2026-09-01'`\n\n"
                        "`day_coverage` 低于 0.9 的日子是残日（采集中断或当天未过完）："
                        "比率仍可用，绝对芯片小时会偏低。\n\n"
-                       "`unresolved_busy_chip_hours` 是归不到产能类别的负载 —— "
-                       "falcon 的临时节点池在下次快照前就被删了，池没了就再也解析不出来。"
-                       "这部分不计入分子但产能在分母里，所以它让利用率偏低而不是偏高。",
+                       "**两个覆盖率列决定一行能不能读**：`day_coverage` 是预留指标"
+                       "在这一天的时间轴覆盖，`work_coverage` 是这一天有多少 pod 能"
+                       "归到产能类别。任一低于 0.9，卡利用率与 MFU 直接置空 —— "
+                       "分母残缺时比率不是「偏小」而是无意义。\n\n"
+                       "`work_coverage` 的梯度是**采集起点**造成的，不是集群变好了："
+                       "节点池身份来自快照且快照不追溯，09-02 起为 1.0，08-27 及更早"
+                       "只有 0.38。所以旧日期只有预留占用率可读。\n\n"
+                       "`assumed_busy_chip_hours` 是靠 falcon 命名回落算进来的部分"
+                       "（一周 90 个 falcon 池里 87 个是 SPECIFIC_RESERVATION，约 3% 误判）；"
+                       "`unresolved_busy_chip_hours` 是仍归不到类别的，不进分子。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 12},
         "datasource": DS,
         "targets": [sql(f"""SELECT * FROM {fin}
@@ -1199,7 +1207,11 @@ ORDER BY day DESC""")],
         "editable": True,
         "schemaVersion": 39,
         "refresh": "30m",
-        "time": {"from": "now-30d", "to": "now"},
+        # Seven days, not thirty. Node pool identity comes from snapshots and a
+        # snapshot is not retroactive, so days before the collector started have
+        # a work_coverage near zero and their work-based ratios are suppressed.
+        # A 30-day default would open on mostly blank panels.
+        "time": {"from": "now-7d", "to": "now"},
         "templating": {"list": []},
         "panels": panels,
     }
