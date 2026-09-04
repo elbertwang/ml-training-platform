@@ -121,16 +121,28 @@ if [[ "$ENABLE_IAP" == "1" ]]; then
   echo "  ${IAP_SA}"
 fi
 
+# One definition, both services. They differ in exactly one argument -- whether
+# IAP is on -- and everything else is shared by construction.
+#
+# An earlier version deployed $SERVICE from this function and then updated the
+# sibling with `--image` alone. The image stayed in step; nothing else did. Add
+# an env var, change the memory limit or the instance ceiling, and only one of
+# the two would get it, with no error and no obvious symptom -- the pair would
+# simply start behaving differently for the two audiences, and the difference
+# would surface as a bug report from whichever half was stale.
+#
+#   $1  service name
+#   $2  --iap or --no-iap
 deploy_service() {
-  gcloud beta run deploy "$SERVICE" --project "$PROJECT_ID" --region "$REGION" \
+  gcloud beta run deploy "$1" --project "$PROJECT_ID" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --set-env-vars "MLOBS_PROJECT=${PROJECT_ID},GF_AUTH_ANONYMOUS_ENABLED=true,GF_AUTH_ANONYMOUS_ORG_ROLE=Admin,GF_AUTH_DISABLE_LOGIN_FORM=true,GF_AUTH_BASIC_ENABLED=false" \
-    "$IAP_FLAG" --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
+    "$2" --no-allow-unauthenticated --port 8080 --memory 1Gi --cpu 1 \
     --min-instances 0 --max-instances 2 --timeout 300 --quiet >/dev/null
 }
 
 echo "=== Deploy ==="
-deploy_service
+deploy_service "$SERVICE" "$IAP_FLAG"
 
 if [[ "$ENABLE_IAP" == "1" ]]; then
   # Resource-level IAM needs the resource to exist, so the invoker grant lands
@@ -148,7 +160,7 @@ if [[ "$ENABLE_IAP" == "1" ]]; then
       --region "$REGION" --member="serviceAccount:${IAP_SA}" \
       --role=roles/run.invoker --quiet >/dev/null
     echo "  granted run.invoker to the IAP agent; redeploying so IAP picks it up"
-    deploy_service
+    deploy_service "$SERVICE" "$IAP_FLAG"
   fi
 fi
 
@@ -167,12 +179,40 @@ fi
 #   gcloud beta run deploy ${SERVICE}-direct --image <same image> \
 #     --service-account <same SA> --no-iap --no-allow-unauthenticated ...
 DIRECT="${SERVICE}-direct"
+echo "=== Sibling service without IAP ==="
 if gcloud run services describe "$DIRECT" --project "$PROJECT_ID" \
      --region "$REGION" >/dev/null 2>&1; then
-  echo "=== Sibling service without IAP ==="
-  gcloud run services update "$DIRECT" --project "$PROJECT_ID" --region "$REGION" \
-    --image "$IMAGE" --quiet >/dev/null
-  echo "  ${DIRECT} updated to the same image"
+  deploy_service "$DIRECT" --no-iap
+  echo "  ${DIRECT} redeployed from the same definition"
+
+  # Assert rather than assume. The pair is the one piece of this deployment
+  # where being out of step is silent: both services answer, both look healthy,
+  # and only the content differs. Comparing the digest each revision actually
+  # resolved -- not the tag, which is the same string either way and says
+  # nothing -- turns that into a failed deploy.
+  digest_of() {
+    local rev
+    rev=$(gcloud run services describe "$1" --project "$PROJECT_ID" \
+          --region "$REGION" --format="value(status.latestReadyRevisionName)")
+    gcloud run revisions describe "$rev" --project "$PROJECT_ID" \
+      --region "$REGION" --format="value(status.imageDigest)"
+  }
+  D_MAIN=$(digest_of "$SERVICE")
+  D_SIDE=$(digest_of "$DIRECT")
+  if [[ "$D_MAIN" == "$D_SIDE" && -n "$D_MAIN" ]]; then
+    echo "  both serving ${D_MAIN##*:}"
+  else
+    echo "  MISMATCH -- ${SERVICE}=${D_MAIN:-?} ${DIRECT}=${D_SIDE:-?}" >&2
+    exit 1
+  fi
+else
+  echo "  ${DIRECT} does not exist; skipped."
+  echo "  Out-of-org viewers need it -- IAP intercepts every request on"
+  echo "  ${SERVICE}, so a proxy to that service cannot work. Create it once:"
+  echo "    gcloud beta run deploy ${DIRECT} --project ${PROJECT_ID} \\"
+  echo "      --region ${REGION} --image ${IMAGE} --service-account ${SA} \\"
+  echo "      --no-iap --no-allow-unauthenticated --port 8080"
+  echo "  and every later run of this script keeps it in step."
 fi
 
 URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" \
