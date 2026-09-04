@@ -291,8 +291,15 @@ def main():
     total = 0
     for metric_type, resource_type, alignment, aligner in selected:
         print(f"{metric_type} ({aligner} @ {alignment}s)", flush=True)
-        rows = []
+        metric_total = 0
         cursor = start_dt
+        # Loaded per chunk, not accumulated and loaded once at the end. The
+        # window is normally an hour or two, where either is the same thing; a
+        # backfill is not. Ninety days of per-chip samples is millions of rows,
+        # and holding them to write in a single shot means memory grows with the
+        # window and a failure anywhere throws away every chunk already fetched.
+        # clear_window has already run, so appending per chunk is equally
+        # idempotent and partial progress survives.
         while cursor < end_dt:
             chunk_end = min(cursor + dt.timedelta(hours=args.chunk_hours), end_dt)
             series = fetch_series(
@@ -300,11 +307,13 @@ def main():
                 cursor.isoformat().replace("+00:00", "Z"),
                 chunk_end.isoformat().replace("+00:00", "Z"),
                 alignment, aligner)
-            rows.extend(to_rows(series, metric_type, ingested_at))
+            rows = to_rows(series, metric_type, ingested_at)
+            if rows:
+                bq_load(args.project, args.dataset, rows)
+                metric_total += len(rows)
             cursor = chunk_end
-        print(f"  {len(rows)} points", flush=True)
-        bq_load(args.project, args.dataset, rows)
-        total += len(rows)
+        print(f"  {metric_total} points", flush=True)
+        total += metric_total
     print(f"total {total} points", flush=True)
 
 

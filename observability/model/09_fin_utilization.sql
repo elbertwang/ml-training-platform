@@ -93,7 +93,22 @@ WITH s AS (
     JSON_VALUE(resource_labels, '$.location')              AS location,
     metric_type,
     value,
-    point_time
+    point_time,
+    -- Seconds this sample stands for, measured rather than assumed.
+    --
+    -- Cloud Monitoring keeps six weeks at full resolution and downsamples
+    -- beyond that: a 300s-aligned request returns 288 points a day up to about
+    -- day 40 and 144 from day 45. Multiplying every sample by a hard-coded 300s
+    -- would therefore halve every chip-hour older than six weeks -- invisibly,
+    -- because the number stays plausible. Taking the gap to the previous sample
+    -- makes the integral correct at either resolution.
+    COALESCE(
+      TIMESTAMP_DIFF(point_time,
+        LAG(point_time) OVER (PARTITION BY DATE(point_time),
+                                           JSON_VALUE(resource_labels, '$.reservation_id'),
+                                           metric_type
+                              ORDER BY point_time), SECOND),
+      300) AS interval_s
   FROM mlobs_raw.metric_samples
   WHERE metric_type IN ('compute.googleapis.com/reservation/reserved',
                         'compute.googleapis.com/reservation/used')
@@ -102,9 +117,9 @@ SELECT
   day,
   reservation_id,
   ANY_VALUE(location) AS location,
-  -- Each 5-minute sample stands for 300s = 1/12 h of that many chips.
-  ROUND(SUM(IF(metric_type LIKE '%/reserved', value, 0)) / 12, 2) AS paid_chip_hours,
-  ROUND(SUM(IF(metric_type LIKE '%/used',     value, 0)) / 12, 2) AS scheduled_chip_hours,
+  -- value chips held for interval_s seconds.
+  ROUND(SUM(IF(metric_type LIKE '%/reserved', value * interval_s, 0)) / 3600, 2) AS paid_chip_hours,
+  ROUND(SUM(IF(metric_type LIKE '%/used',     value * interval_s, 0)) / 3600, 2) AS scheduled_chip_hours,
   ROUND(AVG(IF(metric_type LIKE '%/reserved', value, NULL)), 1)   AS avg_reserved_chips,
   COUNTIF(metric_type LIKE '%/reserved')                          AS samples,
   -- Coverage is of the *time axis*, not of any one reservation. 288 five-minute
@@ -113,8 +128,9 @@ SELECT
   -- minimum read 0.021 for 2026-09-02, because a third reservation appeared
   -- that day for half an hour -- which is a fact about the fleet, not a gap in
   -- collection.
-  ROUND(COUNT(DISTINCT IF(metric_type LIKE '%/reserved',
-                          TIMESTAMP_TRUNC(point_time, MINUTE), NULL)) / 288.0, 3)
+  -- Coverage as a share of the day actually spanned by samples, which is
+  -- resolution-independent for the same reason as the integral above.
+  ROUND(LEAST(SUM(IF(metric_type LIKE '%/reserved', interval_s, 0)) / 86400.0, 1.0), 3)
                                                                   AS day_coverage
 FROM s
 WHERE reservation_id IS NOT NULL
@@ -164,17 +180,22 @@ busy AS (
   SELECT
     DATE(m.point_time)  AS day,
     c.capacity_class,
-    -- tensorcore_utilization is a percentage over a 5-minute bucket, so
-    -- value/100 * (300/3600) h is the chip-hours that chip actually spent busy.
-    SUM(m.value / 100 * 300 / 3600) AS busy_chip_hours,
-    -- Chip-hours on which a pod existed at all, busy or not: one sample
-    -- per chip per 5-minute bucket. The gap to busy_chip_hours is
-    -- capacity that was handed to a pod and then not computed on.
-    COUNT(*) * 300 / 3600 AS pod_chip_hours,
+    -- Same interval reasoning as fin_capacity_daily: the bucket is 300s inside
+    -- Cloud Monitoring's six-week window and 600s beyond it, so the width is
+    -- taken from the data rather than written into the formula.
+    SUM(m.value / 100 * m.interval_s / 3600) AS busy_chip_hours,
+    -- Chip-hours on which a pod existed at all, busy or not. The gap to
+    -- busy_chip_hours is capacity handed to a pod and then not computed on.
+    SUM(m.interval_s) / 3600 AS pod_chip_hours,
     COUNT(DISTINCT CONCAT(m.pod_name, '/', m.chip_id)) AS chips_seen
-  FROM mlobs_core.fact_metric m
+  FROM (
+    SELECT *, COALESCE(TIMESTAMP_DIFF(point_time,
+                LAG(point_time) OVER (PARTITION BY pod_name, chip_id, metric_type
+                                      ORDER BY point_time), SECOND), 300) AS interval_s
+    FROM mlobs_core.fact_metric
+    WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+  ) m
   JOIN pod_class c USING (pod_name)
-  WHERE m.metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
   GROUP BY day, c.capacity_class
 ),
 pool_coverage AS (
@@ -267,6 +288,42 @@ SELECT
 FROM busy b
 FULL OUTER JOIN flops f ON f.day = b.day AND f.capacity_class = b.capacity_class
 LEFT JOIN pool_coverage pc ON pc.day = COALESCE(b.day, f.day);
+
+
+-- Cluster-wide occupancy, with no attribution at all.
+--
+-- Everything above needs to know which capacity class a pod ran on, and that
+-- knowledge starts when the node pool snapshot did -- so the reserved-only
+-- ratios cannot reach back before it. This one only sums the accelerator
+-- metric, so it goes back as far as Cloud Monitoring keeps the samples, which
+-- is where the long trend has to come from.
+--
+-- It is a different question and the numbers are not interchangeable: this
+-- counts every chip in every cluster, on-demand and flex-start included, while
+-- chip_utilization_pct counts only capacity that was paid for as reserved. Read
+-- together they bracket the fleet; read as one number they are wrong.
+CREATE OR REPLACE TABLE mlobs_core.fin_occupancy_daily
+CLUSTER BY day
+AS
+SELECT
+  DATE(point_time) AS day,
+  ROUND(SUM(value / 100 * interval_s / 3600), 2) AS busy_chip_hours_all,
+  ROUND(SUM(interval_s) / 3600, 2)               AS present_chip_hours_all,
+  ROUND(100 * SAFE_DIVIDE(SUM(value / 100 * interval_s),
+                          SUM(interval_s)), 2)   AS mean_occupancy_pct,
+  COUNT(DISTINCT CONCAT(JSON_VALUE(resource_labels, '$.pod_name'), '/',
+                        JSON_VALUE(metric_labels, '$.accelerator_id'))) AS chips_seen
+FROM (
+  SELECT point_time, value, resource_labels, metric_labels,
+         COALESCE(TIMESTAMP_DIFF(point_time,
+           LAG(point_time) OVER (
+             PARTITION BY JSON_VALUE(resource_labels, '$.pod_name'),
+                          JSON_VALUE(metric_labels, '$.accelerator_id')
+             ORDER BY point_time), SECOND), 300) AS interval_s
+  FROM mlobs_raw.metric_samples
+  WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+)
+GROUP BY day;
 
 
 -- The finance sheet. One row per day; every column has a formula in the header.
