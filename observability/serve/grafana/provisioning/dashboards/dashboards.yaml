@@ -6,5 +6,12 @@ providers:
     # Editable in the UI for experimentation, but the file is the source of
     # truth: every restart re-applies dashboards/ from the image.
     allowUiUpdates: true
+    # A named folder, not the root. Dashboards provisioned without one land at
+    # the top level, and the left nav's Dashboards section expands to show
+    # *folders* -- so four dashboards at the root are reachable from the
+    # Dashboards page but invisible in the sidebar tree, which is where people
+    # look for them.
+    folder: 'ML 训练可观测'
+    folderUid: mlobs
     options:
       path: /etc/grafana/provisioning/dashboards/json

@@ -142,6 +142,23 @@ def stat(overview_sql, title, x, y, w, h, field, unit=None, decimals=None,
     }
 
 
+# Dashboard-level links, rendered as a row of buttons at the top of every page.
+#
+# Belt and braces for discoverability: the sidebar shows folders, a bookmark has
+# to be made before it appears, and a link someone was sent goes to one page
+# with no way onward. Four dashboards that each name the other three are
+# reachable however the reader arrived.
+def nav_links(current):
+    pages = [("mlobs-jobs", "任务索引"), ("mlobs-job", "单任务"),
+             ("mlobs-events", "集群事件"), ("mlobs-finance", "财务口径")]
+    return [{
+        "title": title, "type": "link", "icon": "external link",
+        "url": f"/d/{uid}", "targetBlank": False,
+        "tooltip": "", "asDropdown": False, "includeVars": True,
+        "keepTime": True, "tags": [],
+    } for uid, title in pages if uid != current]
+
+
 OVERVIEW_SQL_TEMPLATE = """SELECT
   goodput_pct, goodput_source, goodput_pct_proxy, disruptions,
   peak_chips, chip_hours, est_usd, est_usd_observed,
@@ -672,6 +689,7 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
 
     return {
         "uid": "mlobs-job",
+        "links": nav_links("mlobs-job"),
         "title": "ML Training — Job 总览",
         "description": "每个 job 一个 URL：在 URL 后面加 ?var-job_key=<job>",
         "tags": ["mlobs"],
@@ -877,6 +895,7 @@ ORDER BY first_seen DESC""")],
 
     return {
         "uid": "mlobs-jobs",
+        "links": nav_links("mlobs-jobs"),
         "title": "ML Training — Job 索引",
         "description": "所有 job 的入口。点 job 名进入单个 job 的面板。",
         "tags": ["mlobs"],
@@ -1012,6 +1031,7 @@ ORDER BY window_start""")],
 
     return {
         "uid": "mlobs-events",
+        "links": nav_links("mlobs-events"),
         "title": "ML Training — 集群事件",
         "description": "基础设施事件与它们打到了谁身上。",
         "tags": ["mlobs"],
@@ -1208,6 +1228,7 @@ ORDER BY day DESC""")],
 
     return {
         "uid": "mlobs-finance",
+        "links": nav_links("mlobs-finance"),
         "title": "ML Training — TPU 财务口径",
         "description": "已付费产能，以及它换来了什么。每个指标都带公式。",
         "tags": ["mlobs", "finance"],

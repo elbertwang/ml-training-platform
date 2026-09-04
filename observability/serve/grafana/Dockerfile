@@ -22,6 +22,10 @@ COPY dashboards /etc/grafana/provisioning/dashboards/json
 
 # Cloud Run sends traffic to $PORT and terminates TLS in front, so Grafana runs
 # plain HTTP and must be told its public root URL for redirects to work.
+# Land on the job index rather than Grafana's stock welcome page. Opening the
+# service and being asked to go find a dashboard is most of the reason people
+# report not being able to see them.
+ENV GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/json/index.json
 ENV GF_SERVER_HTTP_PORT=8080 \
     GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/ \
     GF_ANALYTICS_REPORTING_ENABLED=false \
