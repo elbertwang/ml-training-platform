@@ -1045,6 +1045,60 @@ ORDER BY window_start""")],
     }
 
 
+TPU_FINANCE_DEFINITIONS = """
+## TPU 产能财务口径
+
+统计范围为**预留产能**。按需（on-demand）与 flex-start 在分子分母两侧一并排除 ——
+它们不计入 `reservation/reserved`，其上的负载也通过节点池的 `capacity_class` 排除在分子外。
+跨集群合并统计，当前覆盖本区域全部 GKE 集群。
+
+### 基础量（单位：芯片·小时）
+
+| 量 | 定义 | 来源 |
+|---|---|---|
+| `paid_chip_hours` | ∫ 预留芯片数 dt | `compute.googleapis.com/reservation/reserved` 按 5 分钟积分 |
+| `scheduled_chip_hours` | ∫ 已交付芯片数 dt | `compute.googleapis.com/reservation/used` |
+| `pod_chip_hours` | Σ(5 分钟 × 有 Pod 的芯片) | 容器加速器指标的样本数 |
+| `stepping_chip_hours` | Σ(step 墙钟秒 × 该 step 的芯片数) | 训练日志解析出的每步记录 |
+| `busy_chip_hours` | Σ(张量核占用率 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/tensorcore_utilization` |
+| `flops_chip_hours` | Σ(实测 TFLOP/s ÷ 峰值 TFLOP/s × step 秒 × 芯片) | 训练日志 + 芯片峰值表（bf16） |
+
+### 比率（分母统一为 `paid_chip_hours`）
+
+| 指标 | 公式 | 回答的问题 |
+|---|---|---|
+| 预留占用率 | `scheduled ÷ paid` | 买下的产能交付出去了吗 |
+| 卡利用率 | `busy ÷ paid` | 交付出去的在计算吗 |
+| MFU | `flops ÷ paid` | 计算时跑到峰值的几成 |
+| 闲置成本 | `(paid − busy) × 费率` | 没产生计算的那部分花了多少钱 |
+
+四者同分母，可直接比较与相减；相邻两层之差即该环节的损耗。
+
+### 数据可信度
+
+两个覆盖率列决定一行能否使用，任一低于 0.9 时相关比率与金额置空，而非给出偏低的数：
+
+- **`day_coverage`** — 当天预留指标覆盖的时间比例。分母残缺时比率无意义，而非偏小。
+- **`work_coverage`** — 当天可归属到产能类别的 Pod 比例。节点池身份来自定期快照且不追溯，
+  快照机制启用之前的日期覆盖率低，此类日期只有预留占用率可用。
+
+### 已知口径限制
+
+- **MFU 按 bf16 峰值计算。** 使用 fp8 的任务峰值为两倍，其 MFU 在此约为真实值的一半。
+- **费率为 3 年承诺价，非实际发票。** 本集群预留产能全部由 ACTIVE 的 36 个月承诺覆盖。
+  两个项目均未开启 Cloud Billing 导出，故折扣与抵扣未反映，金额为估算。
+- **`unresolved_busy_chip_hours`** 为无法归属产能类别的负载，不计入分子，
+  因此其存在使利用率偏低而非偏高。
+
+### 数据同步
+
+同一份数据以长表形式提供，每行自带公式与单位，供内部系统直接拉取：
+
+```sql
+SELECT * FROM `mlobs_core.fin_export` WHERE day >= '2026-09-01'
+```
+"""
+
 def build_finance(project):
     """The finance sheet. Four ratios, one denominator.
 
@@ -1057,6 +1111,16 @@ def build_finance(project):
     """
     fin = f"`{project}.mlobs_core.fin_daily`"
     panels, y = [], 0
+
+    # A definitions panel at the top rather than tooltips only. Finance numbers
+    # get copied into other documents, and a figure that travels without its
+    # formula stops being auditable the moment it lands somewhere else.
+    panels.append({
+        "type": "text", "title": "口径说明 Definitions",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 13},
+        "options": {"mode": "markdown", "content": TPU_FINANCE_DEFINITIONS},
+    })
+    y += 13
 
     panels.append({"type": "row", "title": "大盘 Overview", "collapsed": False,
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
@@ -1085,47 +1149,49 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
         num("① 预留占用率", 0, 5, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
-            "**公式** scheduled_chip_hours / paid_chip_hours\n\n"
-            "买下的芯片有多少发给了 VM。分子分母都对预留积分，不是读瞬时值 —— "
-            "预留会扩缩，读一个时刻会把它触及的每一天都改写。",
+            "**公式** scheduled_chip_hours ÷ paid_chip_hours\n\n"
+            "买下的产能有多少交付给了 VM。分子分母都对预留量按时间积分，"
+            "而不是读某一刻的值 —— 预留规模会变，读瞬时值会把它触及的每一天都算错。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 70},
              {"color": STATUS["good"], "value": 90}]),
         num("② 卡利用率", 5, 5, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(busy_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
-            "**公式** busy_chip_hours / paid_chip_hours\n\n"
-            "busy = Σ(tensorcore% / 100 × 300 秒 × 芯片数)，只算预留节点池上的。\n\n"
-            "**与 GCP 看板的差别就在分母**：那边是 `avg(node_accelerator_duty_cycle)`，"
-            "分母是「有序列上报的芯片」。空闲的预留芯片没有 pod、没有容器指标、"
-            "因此没有序列，于是它被排除而不是记 0。同一周实测：那边 18.62%，这里 12.57%，"
-            "高报 48% —— 付费产能里有三分之一从没进过它的算式。",
+            "**公式** busy_chip_hours ÷ paid_chip_hours\n\n"
+            "busy = Σ(tensorcore% ÷ 100 × 300 秒 × 芯片数)，仅统计预留产能。\n\n"
+            "分母是**已付费的全部产能**，不是「有指标上报的芯片」。空闲的预留芯片"
+            "没有 pod、因而没有容器指标，它在这里计为 0 而不是被排除 —— "
+            "财务口径下没跑东西的产能一样要付钱。\n\n"
+            "这个数偏低通常不代表芯片效率差，而是产能没被用起来。"
+            "下面的「产能漏斗」逐层显示流失在哪一环。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
              {"color": STATUS["good"], "value": 60}]),
         num("③ MFU（真实）", 10, 5, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(flops_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
-            "**公式** Σ(tflops_p50 / 1153.5 × step 秒 × 芯片) / paid_chip_hours\n\n"
-            "分子是训练进程自己打的 TFLOP/s，分母是 TPU7x bf16 峰值（每芯片 2307，"
-            "1 芯片 = 2 个 JAX device，故每 device 1153.5）。\n\n"
-            "**GCP 看板那个「MFU」不是 MFU** —— 它是 tensorcore 占用率，即"
-            "「张量核在发射指令的时间占比」。一个 kernel 可以让张量核一直忙着，"
-            "却只跑出峰值的零头。两者量纲不同。\n\n"
-            "⚠️ 按 bf16 峰值算。跑 fp8 的任务峰值是两倍，这里会读出约一半的真值。",
+            "**公式** Σ(tflops_p50 ÷ 峰值 × step 秒 × 芯片) ÷ paid_chip_hours\n\n"
+            "MFU = Model FLOPs Utilization，实际算力 ÷ 峰值算力。"
+            "分子取训练进程自己上报的 TFLOP/s，分母的峰值取自 MaxText 的芯片峰值表"
+            "（与训练侧计算 TFLOP/s 用的是同一张表，保证分子分母同源）。\n\n"
+            "**与「卡利用率」不是一回事**：卡利用率衡量张量核忙不忙，MFU 衡量忙的时候"
+            "跑多快。一个 kernel 可以让张量核一直处于忙碌状态，却只发挥出峰值的一小部分。\n\n"
+            "⚠️ 峰值按 bf16 取。fp8 任务的峰值是两倍，其 MFU 在此约为真实值的一半。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 20},
              {"color": STATUS["good"], "value": 40}]),
         num("已付费芯片小时", 15, 5, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
-            "**公式** ∫ reservation/reserved dt，仅预留\n\n"
-            "按需与 flex-start 两侧都不计入 —— 它们不在 reservation/reserved 里，"
-            "capacity_class 也把它们的负载挡在分子外。不挡的话一波 flex 任务"
-            "能把比率顶到 100% 以上。"),
+            "**公式** ∫ reservation/reserved dt\n\n"
+            "已付费的产能总量，是本页所有比率的**统一分母**。四个比率同分母，"
+            "因而可以互相比较、相减。\n\n"
+            "只统计预留产能：按需与 flex-start 在分子分母两侧都排除。"
+            "它们不在 reservation/reserved 里，节点池的 capacity_class 也把"
+            "它们的负载挡在分子外，否则一波 flex 任务会把比率顶过 100%。"),
         num("闲置成本", 20, 4, "v", "ROUND(SUM(idle_usd),0)", "currencyUSD", 0,
             "**公式** (paid_chip_hours − busy_chip_hours) × 费率\n\n"
-            "费率取 **3 年承诺价**，不是按需价 —— 本集群的预留产能全部由 ACTIVE 的 "
-            "36 个月承诺覆盖（经预留的 linkedCommitments 与承诺自身的芯片数核对），"
-            "用按需价计价会把金额高报整整一个承诺折扣。\n\n"
+            "费率取 **3 年承诺价** —— 本集群的预留产能全部由 ACTIVE 的 36 个月承诺"
+            "覆盖，经预留的 linkedCommitments 与承诺自身的芯片数核对。\n\n"
             "单位是**每芯片**，不是每主机。该区域的 TPU SKU 是一族，其中三个较老"
             "世代与各自公开的每芯片小时价完全吻合；本项目承诺的计量单位也写作 "
             "ACCELERATOR，数量与预留芯片数相等。\n\n"
@@ -1136,14 +1202,52 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
     ]
     y += 5
 
+    panels.append({"type": "row", "title": "产能漏斗 Where the capacity goes",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+    panels.append({
+        "type": "bargauge", "title": "逐层留存（占已付费产能）",
+        "description":
+            "五层依次收窄，每一层之间的落差就是一类损耗。读法是从上往下找最大的那一刀。\n\n"
+            "**已调度** 预留产能交付给 VM。落差 = 买了但没建出节点。\n\n"
+            "**有 Pod** 节点上确实调度了带 TPU 的 Pod。落差 = 节点空转。\n\n"
+            "**在跑训练步** Pod 正在执行训练迭代。落差 = Pod 在但没训练："
+            "启动与编译、加载 checkpoint、卡住、以及非训练用途的 Pod。\n\n"
+            "**张量核忙** 张量核在发射指令。落差 = 训练中的等待："
+            "数据加载、集合通信、迭代间隙。\n\n"
+            "**满速等效** 折算成以峰值算力跑完同样计算量所需的时间。"
+            "落差 = 算得慢（kernel 效率、并行策略、显存带宽受限）。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT
+  ROUND(100 * SAFE_DIVIDE(SUM(scheduled_chip_hours), SUM(paid_chip_hours)), 1) AS `① 已调度给 VM`,
+  ROUND(100 * SAFE_DIVIDE(SUM(pod_chip_hours),       SUM(paid_chip_hours)), 1) AS `② 节点上有 Pod`,
+  ROUND(100 * SAFE_DIVIDE(SUM(stepping_chip_hours),  SUM(paid_chip_hours)), 1) AS `③ 在跑训练步`,
+  ROUND(100 * SAFE_DIVIDE(SUM(busy_chip_hours),      SUM(paid_chip_hours)), 1) AS `④ 张量核忙`,
+  ROUND(100 * SAFE_DIVIDE(SUM(flops_chip_hours),     SUM(paid_chip_hours)), 1) AS `⑤ 满速等效`
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9 AND work_coverage >= 0.9""")],
+        "options": {"displayMode": "gradient", "orientation": "horizontal",
+                    "showUnfilled": True, "minVizWidth": 8,
+                    "reduceOptions": {"calcs": ["lastNotNull"], "values": False,
+                                      "fields": ""}},
+        "fieldConfig": {"defaults": {
+            "unit": "percent", "decimals": 1, "min": 0, "max": 100,
+            "thresholds": {"mode": "absolute",
+                           "steps": [{"color": STATUS["warning"], "value": None}]},
+        }, "overrides": []},
+    })
+    y += 8
+
     panels.append({"type": "row", "title": "趋势 Daily", "collapsed": False,
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
     y += 1
     panels.append({
         "type": "timeseries", "title": "三个比率（同一分母，可直接相减）",
-        "description": "同一分母意味着它们可比、可相减。GCP 看板上每个指标各自对"
-                       "「上报了自己的那批芯片」取平均，于是会出现 MFU 高于 duty cycle "
-                       "这种不可能的组合。",
+        "description": "三个比率共用同一个分母（已付费芯片小时），因而可以互相比较、"
+                       "相减。曲线之间的垂直距离就是各环节的损耗。",
         "gridPos": {"x": 0, "y": y, "w": 16, "h": 9},
         "datasource": DS,
         "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,

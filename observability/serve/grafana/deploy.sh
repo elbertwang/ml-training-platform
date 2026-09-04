@@ -96,9 +96,68 @@ grant_project_roles "$PROJECT_ID" "$SA" \
   roles/bigquery.jobUser roles/logging.viewer roles/monitoring.viewer
 grant_dataset_access "$PROJECT_ID" "$SA" READER mlobs_raw mlobs_core
 
+echo "=== Dashboards ==="
+python3 "${HERE}/build_dashboard.py" --project "$PROJECT_ID" --out-dir "${HERE}/dashboards"
+
+# Dry-run every BigQuery panel before shipping the image.
+#
+# The dashboards and the model are deployed by two different scripts, and the
+# refresh job runs the model from a baked image -- so a column added locally
+# with bq lives only until the next scheduled run rebuilds the view from the
+# image's older copy. That happened three times; the third reached the user as
+# "400 unrecognized name: work_coverage" on every finance panel, because the
+# dashboard had been built against a column the deployed model no longer had.
+#
+# A dry run costs nothing (BigQuery bills zero bytes for one) and turns that
+# whole class into a deploy that refuses rather than a dashboard that errors.
+python3 - "$PROJECT_ID" "${HERE}/dashboards" <<'PYCHECK'
+import json, pathlib, re, subprocess, sys
+project, path = sys.argv[1], pathlib.Path(sys.argv[2])
+bad = 0
+for f in sorted(path.glob("*.json")):
+    doc = json.loads(f.read_text())
+    for panel in doc.get("panels", []):
+        for t in panel.get("targets", []):
+            sql = t.get("rawSql")
+            if not sql:
+                continue
+            # Grafana macros are substituted at query time and BigQuery cannot
+            # parse them; swap in values of the right type so the rest of the
+            # statement is still checked.
+            probe = (sql.replace("$__timeFrom()", "TIMESTAMP('2026-01-01')")
+                        .replace("$__timeTo()", "CURRENT_TIMESTAMP()")
+                        .replace("${job_key}", "probe")
+                        .replace("${__from}", "0").replace("${__to}", "0"))
+            # $__timeFilter(col) expands to a BETWEEN over that column, so it
+            # needs the argument, not a plain string swap. Missing it flagged
+            # six perfectly good panels on the first run of this check -- worth
+            # noting, because a checker that cries wolf gets switched off.
+            probe = re.sub(r"\$__timeFilter\(([^)]*)\)",
+                           r"\1 BETWEEN TIMESTAMP('2026-01-01') AND CURRENT_TIMESTAMP()",
+                           probe)
+            r = subprocess.run(
+                ["bq", f"--project_id={project}", "query", "--use_legacy_sql=false",
+                 "--dry_run", "--format=none", probe],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                bad += 1
+                msg = (r.stderr or r.stdout).strip().splitlines()
+                print(f"  FAIL {f.name} / {panel.get('title','(untitled)')}")
+                for line in msg[:3]:
+                    print(f"       {line}")
+if bad:
+    print("")
+    print("  An unrecognised column usually means the model has not shipped yet.")
+    print("  The refresh job runs the SQL from its own image, so applying a model")
+    print("  change with bq locally lasts only until the next scheduled run puts")
+    print("  the image's older copy back. Deploy the model first:")
+    print("      PROJECT_ID=$PROJECT_ID ../../schedule/deploy.sh")
+    sys.exit(f"  {bad} panel query/queries do not compile; not deploying")
+print("  every panel query compiles")
+PYCHECK
+
 echo "=== Image ==="
 ensure_artifact_repo "$PROJECT_ID" "$REGION" "$REPO"
-python3 "${HERE}/build_dashboard.py" --project "$PROJECT_ID" --out-dir "${HERE}/dashboards"
 gcloud builds submit "$HERE" --project "$PROJECT_ID" --region "$REGION" \
   --tag "$IMAGE" --quiet >/dev/null
 echo "  ${IMAGE}"

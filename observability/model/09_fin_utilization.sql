@@ -167,6 +167,10 @@ busy AS (
     -- tensorcore_utilization is a percentage over a 5-minute bucket, so
     -- value/100 * (300/3600) h is the chip-hours that chip actually spent busy.
     SUM(m.value / 100 * 300 / 3600) AS busy_chip_hours,
+    -- Chip-hours on which a pod existed at all, busy or not: one sample
+    -- per chip per 5-minute bucket. The gap to busy_chip_hours is
+    -- capacity that was handed to a pod and then not computed on.
+    COUNT(*) * 300 / 3600 AS pod_chip_hours,
     COUNT(DISTINCT CONCAT(m.pod_name, '/', m.chip_id)) AS chips_seen
   FROM mlobs_core.fact_metric m
   JOIN pod_class c USING (pod_name)
@@ -256,6 +260,7 @@ SELECT
   COALESCE(b.capacity_class, f.capacity_class) AS capacity_class,
   pc.work_coverage,
   ROUND(b.busy_chip_hours, 2)                  AS busy_chip_hours,
+  ROUND(b.pod_chip_hours, 2)                   AS pod_chip_hours,
   b.chips_seen,
   ROUND(f.flops_chip_hours, 2)                 AS flops_chip_hours,
   ROUND(f.stepping_chip_hours, 2)              AS stepping_chip_hours
@@ -282,6 +287,10 @@ work AS (
                 busy_chip_hours, 0))                              AS busy_chip_hours,
          SUM(IF(capacity_class = 'reserved_assumed', busy_chip_hours, 0))
                                                                   AS assumed_busy_chip_hours,
+         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
+                COALESCE(pod_chip_hours, 0), 0))                  AS pod_chip_hours,
+         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
+                COALESCE(stepping_chip_hours, 0), 0))             AS stepping_chip_hours,
          -- SUM of a filtered IF() yields 0 when nothing matched, and 0 reads as
          -- "MFU was zero" rather than "no job logged TFLOP/s that day". NULLIF
          -- on the row count keeps the distinction; 2026-08-28 and 08-29 had no
@@ -310,6 +319,8 @@ SELECT
   c.day,
   ROUND(c.paid_chip_hours, 1)                                    AS paid_chip_hours,
   ROUND(c.scheduled_chip_hours, 1)                               AS scheduled_chip_hours,
+  ROUND(w.pod_chip_hours, 1)                                     AS pod_chip_hours,
+  ROUND(w.stepping_chip_hours, 1)                                AS stepping_chip_hours,
   ROUND(w.busy_chip_hours, 1)                                    AS busy_chip_hours,
   ROUND(w.flops_chip_hours, 1)                                   AS flops_chip_hours,
   -- Every ratio is NULL below 0.9 day coverage, rather than published small.
