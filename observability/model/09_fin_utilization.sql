@@ -185,6 +185,10 @@ pool_coverage AS (
   -- 30-day chart of chip_utilization built without this column shows
   -- utilisation climbing from 1% to 15% and reads as a dramatic improvement;
   -- every point of that climb is an artefact.
+  -- Grouped by the day a pod first appeared, while busy_chip_hours is grouped
+  -- by the day its samples landed. The two populations differ only for pods
+  -- that span midnight, which is 790 of 40,152 -- 2%. Measured rather than
+  -- waved away, and small enough to leave as an approximation.
   SELECT
     DATE(p.first_seen) AS day,
     ROUND(COUNTIF(np.ig_hash IS NOT NULL OR p.job_family = 'falcon')
@@ -313,16 +317,21 @@ SELECT
   IF(c.day_coverage < 0.9, NULL,
      ROUND(100 * SAFE_DIVIDE(c.scheduled_chip_hours, c.paid_chip_hours), 2))
                                                                  AS reservation_utilization_pct,
-  IF(c.day_coverage < 0.9 OR w.work_coverage < 0.9, NULL,
+  IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
      ROUND(100 * SAFE_DIVIDE(w.busy_chip_hours, c.paid_chip_hours), 2))
                                                                  AS chip_utilization_pct,
   -- bf16 peak
-  IF(c.day_coverage < 0.9 OR w.work_coverage < 0.9, NULL,
+  IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
      ROUND(100 * SAFE_DIVIDE(w.flops_chip_hours, c.paid_chip_hours), 2))
                                                                  AS mfu_pct,
-  -- (paid - busy) x price
-  ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
-        * (SELECT usd_per_chip_hour FROM price), 0)              AS idle_usd,
+  -- (paid - busy) x price, and suppressed on the same condition as the ratios
+  -- it is derived from. Left unsuppressed it was the most damaging number on
+  -- the page: 2026-08-25 has work_coverage 0.38 and reported 100.0% of that
+  -- day's spend as idle, which says the whole day was wasted when the truth is
+  -- that its work could not be attributed to a capacity class.
+  IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
+     ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
+           * (SELECT usd_per_chip_hour FROM price), 0))          AS idle_usd,
   ROUND(c.paid_chip_hours * (SELECT usd_per_chip_hour FROM price), 0) AS paid_usd,
   -- Trust markers, published beside the numbers rather than in a footnote.
   c.day_coverage,
@@ -356,11 +365,16 @@ SELECT
   value,
   unit,
   formula,
-  -- Below ~0.9 the day is partial and the absolute chip-hours understate.
-  -- Ratios stay usable; totals do not.
-  day_coverage
+  -- Two gates, both of which a consumer needs to see. day_coverage is how much
+  -- of the day the reservation metrics cover; work_coverage is how much of that
+  -- day's work could be attributed to a capacity class. Any ratio or currency
+  -- figure below 0.9 on either is already NULL rather than published low, so a
+  -- row with a value in it has passed both -- but the columns travel with the
+  -- data so a downstream system can apply a stricter bar of its own.
+  day_coverage,
+  work_coverage
 FROM (
-  SELECT day, day_coverage,
+  SELECT day, day_coverage, work_coverage,
     [STRUCT('paid_chip_hours' AS metric, paid_chip_hours AS value,
             'chip*hour' AS unit,
             'INTEGRAL(compute.googleapis.com/reservation/reserved) dt, reserved pools only' AS formula),
