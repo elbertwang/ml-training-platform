@@ -1063,6 +1063,26 @@ TPU_FINANCE_DEFINITIONS = """
 | `busy_chip_hours` | Σ(张量核占用率 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/tensorcore_utilization` |
 | `flops_chip_hours` | Σ(实测 TFLOP/s ÷ 峰值 TFLOP/s × step 秒 × 芯片) | 训练日志 + 芯片峰值表（bf16） |
 
+### 产能漏斗
+
+五个层级依次收窄，均以 `paid_chip_hours` 为分母。**相邻两层之差即该环节的损耗**，
+读法是从上往下找最大的那一刀。
+
+| 层级 | 公式 | 落差代表什么 |
+|---|---|---|
+| ① 已调度给 VM | `scheduled ÷ paid` | 预留了但没建出节点 |
+| ② 节点上有 Pod | `pod ÷ paid` | 节点空转，没有带 TPU 的 Pod 被调度上去 |
+| ③ 在跑训练步 | `stepping ÷ paid` | Pod 在但没训练：启动与编译、加载 checkpoint、卡住、非训练用途的 Pod |
+| ④ 张量核忙 | `busy ÷ paid` | 训练过程中的等待：数据加载、集合通信、迭代间隙 |
+| ⑤ 满速等效 | `flops ÷ paid` | 算得慢：kernel 效率、并行策略、显存带宽受限 |
+
+其中 ① ④ ⑤ 分别就是上文的预留占用率、卡利用率、MFU；② ③ 是把它们之间的落差拆开，
+用于定位损耗发生在哪一环。
+
+一个典型读数：若 ① 接近 100% 而 ③ 只有三成左右，说明产能已经买下并交付，
+但大部分时间没有真正在训练 —— 此时优化 kernel 效率（⑤）收益有限，
+应先看排队、启动耗时与任务衔接。
+
 ### 比率（分母统一为 `paid_chip_hours`）
 
 | 指标 | 公式 | 回答的问题 |
@@ -1146,7 +1166,7 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
         }
 
     panels += [
-        num("① 预留占用率", 0, 5, "v",
+        num("① 预留占用率", 0, 6, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
             "**公式** scheduled_chip_hours ÷ paid_chip_hours\n\n"
@@ -1155,7 +1175,7 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 70},
              {"color": STATUS["good"], "value": 90}]),
-        num("② 卡利用率", 5, 5, "v",
+        num("② 卡利用率", 6, 6, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(busy_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
             "**公式** busy_chip_hours ÷ paid_chip_hours\n\n"
@@ -1168,7 +1188,7 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
              {"color": STATUS["good"], "value": 60}]),
-        num("③ MFU（真实）", 10, 5, "v",
+        num("③ MFU", 12, 6, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(flops_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
             "**公式** Σ(tflops_p50 ÷ 峰值 × step 秒 × 芯片) ÷ paid_chip_hours\n\n"
@@ -1181,24 +1201,13 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 20},
              {"color": STATUS["good"], "value": 40}]),
-        num("已付费芯片小时", 15, 5, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
+        num("已付费芯片小时", 18, 6, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
             "**公式** ∫ reservation/reserved dt\n\n"
             "已付费的产能总量，是本页所有比率的**统一分母**。四个比率同分母，"
             "因而可以互相比较、相减。\n\n"
             "只统计预留产能：按需与 flex-start 在分子分母两侧都排除。"
             "它们不在 reservation/reserved 里，节点池的 capacity_class 也把"
             "它们的负载挡在分子外，否则一波 flex 任务会把比率顶过 100%。"),
-        num("闲置成本", 20, 4, "v", "ROUND(SUM(idle_usd),0)", "currencyUSD", 0,
-            "**公式** (paid_chip_hours − busy_chip_hours) × 费率\n\n"
-            "费率取 **3 年承诺价** —— 本集群的预留产能全部由 ACTIVE 的 36 个月承诺"
-            "覆盖，经预留的 linkedCommitments 与承诺自身的芯片数核对。\n\n"
-            "单位是**每芯片**，不是每主机。该区域的 TPU SKU 是一族，其中三个较老"
-            "世代与各自公开的每芯片小时价完全吻合；本项目承诺的计量单位也写作 "
-            "ACCELERATOR，数量与预留芯片数相等。\n\n"
-            "实际费率见 `rate_usd_per_chip_hour` 列。费率本身不在代码仓库里，"
-            "由 `collect/load_tpu_price.sh` 从外部 CSV 载入。\n\n"
-            "仍未与账单核对：两个项目都没有 Cloud Billing 导出，所以这是费率不是"
-            "发票，折扣与抵扣未反映。"),
     ]
     y += 5
 
