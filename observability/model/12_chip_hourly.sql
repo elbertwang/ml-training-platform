@@ -71,13 +71,35 @@ CLUSTER BY chip_id, job_key;
 
 BEGIN TRANSACTION;
 
+-- Both sides of the window land on a midnight, and they have to.
+--
+-- This deleted `hour >= CURRENT_TIMESTAMP() - 4 days` while reading
+-- `slot >= CURRENT_TIMESTAMP() - 4 days`. The threshold was the same instant,
+-- but the two columns are not: hour is slot truncated to the hour. Whenever
+-- that instant fell inside an hour -- which is almost always -- the hour was
+-- below the DELETE threshold and survived, while the slots after the threshold
+-- were still read and aggregated into a second, partial row for the same
+-- (hour, chip_id). Every refresh added another.
+--
+-- Measured 2026-09-14 before the fix: 1,024 duplicated (hour, chip_id) pairs,
+-- 1,536 surplus rows. 2026-09-10 hour 10 carried two rows per chip with
+-- vm_slots 12 and 2; hour 11 carried three, with 12, 10 and 4. chip_hourly
+-- reported 12,971 chip-hours for that day against fact_chip's 12,288, and
+-- chip_hourly is the table the customer reads.
+--
+-- fact_chip escapes the same shape only because the exporter writes points
+-- already aligned to five-minute boundaries, so there slot = point_time and
+-- the two predicates are the same predicate. That is luck, not design.
+--
+-- Anchored to CURRENT_DATE(), `hour >= midnight` and `TRUNC(slot) >= midnight`
+-- select exactly the same set.
 DELETE FROM mlobs_core.chip_hourly
-WHERE hour >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY);
+WHERE hour >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY));
 
 INSERT INTO mlobs_core.chip_hourly
 WITH src AS (
   SELECT * FROM mlobs_core.fact_chip
-  WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE slot >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
 ),
 -- The job holding the chip longest in the hour -- ranked on summed interval_s
 -- rather than row count, because a row is no longer a fixed amount of time.
