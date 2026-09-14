@@ -1123,6 +1123,44 @@ ORDER BY window_start""")],
     })
     y += 10
 
+    # Log storms, with what they cost. mlobs_core.v_job_error_burst existed and
+    # nothing read it -- its only mention outside its own definition was a
+    # copy-paste snippet in the README, so the one signal that puts a dollar
+    # figure on a misbehaving container was reachable only by someone who
+    # already knew it was there.
+    panels.append({
+        "type": "table", "title": "日志风暴与其成本（单个签名 >10,000 行/小时）",
+        "description": "同一条错误在一小时内重复超过一万次的 pod。"
+                       "它既是故障征兆，也是直接的成本事件：Cloud Logging 按整条 "
+                       "LogEntry 计费，本项目实测均值约 1.4 KB/条、$0.50/GiB，"
+                       "`est_logging_usd` 就是按这个折算的该签名当小时账单。\n\n"
+                       "来源是 `fact_event` 的 `app_error`，所以它只覆盖 sink 收进来的"
+                       "日志；被 sink 拒收的部分不在这里，见 "
+                       "`model/00d_kueue_admission.sql`。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 9},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT hour, job_key, container_name,
+  SUBSTR(message_signature, 1, 120) AS message_signature,
+  pods, lines, lines_per_minute, est_logging_usd
+FROM `{project}.mlobs_core.v_job_error_burst`
+WHERE hour BETWEEN TIMESTAMP($__timeFrom()) AND TIMESTAMP($__timeTo())
+ORDER BY est_logging_usd DESC
+LIMIT 50""")],
+        "fieldConfig": {
+            "defaults": {"custom": {"align": "left"}},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": "est_logging_usd"},
+                 "properties": [{"id": "unit", "value": "currencyUSD"},
+                                {"id": "custom.align", "value": "right"}]},
+                {"matcher": {"id": "byName", "options": "lines"},
+                 "properties": [{"id": "custom.align", "value": "right"}]},
+                {"matcher": {"id": "byName", "options": "lines_per_minute"},
+                 "properties": [{"id": "custom.align", "value": "right"}]},
+            ],
+        },
+    })
+    y += 9
+
     return {
         "uid": "mlobs-events",
         "links": nav_links("mlobs-events"),
