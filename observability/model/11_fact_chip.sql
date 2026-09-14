@@ -68,7 +68,20 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_chip
   -- interval_s instead of counting rows. Counting rows was correct while one
   -- resolution existed and would have silently halved every historical
   -- numerator the moment a second one arrived -- no error, just wrong totals.
-  interval_s    INT64
+  interval_s    INT64,
+  -- How many of those seconds a pod held the chip.
+  --
+  -- In the live path a five-minute slot is occupied or it is not, so this is
+  -- interval_s or zero. In the recovered history an hour can be half occupied,
+  -- and 11h_fact_chip_history.sql measures it from the container series rather
+  -- than crediting the whole hour: 10.2% of the chip-hours that had a pod on
+  -- 2026-06-15 had it for less than the node was up.
+  --
+  -- It goes last because ALTER TABLE appends, and the INSERT below names its
+  -- columns for the same reason -- declaring it before interval_s while the
+  -- live table had it after silently transposed the two, writing node seconds
+  -- into the pod column and producing rows with interval_s = 0.
+  pod_interval_s INT64
 )
 PARTITION BY DATE(slot)
 CLUSTER BY chip_id, job_key;
@@ -90,6 +103,10 @@ DELETE FROM mlobs_core.fact_chip
 WHERE slot >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY));
 
 INSERT INTO mlobs_core.fact_chip
+  (slot, chip_id, instance_id, chip_index, node_name, cluster_name, location,
+   node_pool, capacity_class, reservation_name, machine_type, tpu_topology,
+   pod_name, job_key, job_family, duty_pct, tensorcore_pct, membw_pct,
+   interval_s, pod_interval_s)
 WITH
 -- Pivot the three node metrics onto one row per chip per slot. AVG collapses
 -- the case where collection wrote two samples into one slot; after the phase
@@ -195,7 +212,8 @@ SELECT
   ROUND(du.duty_pct, 2),
   ROUND(n.tensorcore_pct, 2),
   ROUND(n.membw_pct, 2),
-  300 AS interval_s
+  300 AS interval_s,
+  IF(o.pod_name IS NULL, 0, 300) AS pod_interval_s
 FROM node n
 LEFT JOIN duty_inst du
   ON du.slot = n.slot AND du.instance_id = SPLIT(n.chip_id, '-')[OFFSET(0)]

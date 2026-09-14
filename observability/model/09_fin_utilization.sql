@@ -260,7 +260,7 @@ busy AS (
   SELECT
     DATE(slot) AS day,
     SUM(interval_s) / 3600.0                               AS vm_chip_hours,
-    SUM(IF(pod_name IS NULL, 0, interval_s)) / 3600.0      AS pod_chip_hours,
+    SUM(pod_interval_s) / 3600.0                           AS pod_chip_hours,
     SUM(duty_pct       * interval_s) / 100 / 3600.0        AS duty_chip_hours,
     SUM(tensorcore_pct * interval_s) / 100 / 3600.0        AS busy_chip_hours,
     SUM(membw_pct      * interval_s) / 100 / 3600.0        AS membw_chip_hours,

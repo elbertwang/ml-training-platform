@@ -141,7 +141,7 @@ SELECT
   -- resolution, so "12 is a full hour" holds for a historical row built from a
   -- single 3600-second sample exactly as it does for twelve 300-second ones.
   CAST(ROUND(SUM(s.interval_s) / 300.0) AS INT64)  AS vm_slots,
-  CAST(ROUND(SUM(IF(s.pod_name IS NULL, 0, s.interval_s)) / 300.0) AS INT64)
+  CAST(ROUND(SUM(s.pod_interval_s) / 300.0) AS INT64)
                                                    AS pod_slots,
   -- Time-weighted, not a plain mean: a 3600-second row must not count the same
   -- as a 300-second one. Each denominator counts only the rows that reported
@@ -153,7 +153,7 @@ SELECT
   ROUND(SAFE_DIVIDE(SUM(s.membw_pct * s.interval_s),
                     SUM(IF(s.membw_pct IS NULL, 0, s.interval_s))), 2) AS membw_pct,
   ROUND(SUM(s.interval_s) / 3600, 4)               AS vm_chip_hours,
-  ROUND(SUM(IF(s.pod_name IS NULL, 0, s.interval_s)) / 3600, 4) AS pod_chip_hours,
+  ROUND(SUM(s.pod_interval_s) / 3600, 4)           AS pod_chip_hours,
   ROUND(SUM(s.duty_pct       * s.interval_s) / 100 / 3600, 4) AS duty_chip_hours,
   ROUND(SUM(s.tensorcore_pct * s.interval_s) / 100 / 3600, 4) AS busy_chip_hours,
   ROUND(SUM(s.membw_pct      * s.interval_s) / 100 / 3600, 4) AS membw_chip_hours

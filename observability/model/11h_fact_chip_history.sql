@@ -49,6 +49,10 @@ DELETE FROM mlobs_core.fact_chip
 WHERE DATE(slot) >= range_from AND DATE(slot) < range_to;
 
 INSERT INTO mlobs_core.fact_chip
+  (slot, chip_id, instance_id, chip_index, node_name, cluster_name, location,
+   node_pool, capacity_class, reservation_name, machine_type, tpu_topology,
+   pod_name, job_key, job_family, duty_pct, tensorcore_pct, membw_pct,
+   interval_s, pod_interval_s)
 WITH
 -- The chip axis, from the two metrics that number accelerators 0-3 within the
 -- host. Same rule as the live path; only the grain differs.
@@ -94,9 +98,9 @@ duty_inst AS (
 -- to one point per pod per hour, so the rank is on how much of the hour each
 -- pod's series covered. Ties break on the name, as there.
 occupied AS (
-  SELECT slot, chip_id, pod_name
+  SELECT slot, chip_id, pod_name, held_s
   FROM (
-    SELECT slot, chip_id, pod_name,
+    SELECT slot, chip_id, pod_name, held_s,
            ROW_NUMBER() OVER (PARTITION BY slot, chip_id
                               ORDER BY held_s DESC, pod_name) AS rn
     FROM (
@@ -133,7 +137,14 @@ SELECT
   ROUND(du.duty_pct, 2),
   ROUND(n.tensorcore_pct, 2),
   ROUND(n.membw_pct, 2),
-  n.interval_s
+  -- Measured, not assumed. The hour is credited to the pod only for as long as
+  -- the container series actually reported the chip, capped at the time the
+  -- node itself was up. Crediting the whole hour made pod_slots binary across
+  -- the entire recovered range -- 0.0% of rows partially occupied from March to
+  -- July against 51.9% in the live segment -- and made pod_chip_hours, and so
+  -- global_allocate_rate and tpu_allocate_rate_in_vm, an upper bound there.
+  n.interval_s,
+  LEAST(IFNULL(o.held_s, 0), n.interval_s) AS pod_interval_s
 FROM node n
 LEFT JOIN duty_inst du
   ON du.slot = n.slot AND du.instance_id = SPLIT(n.chip_id, '-')[OFFSET(0)]
