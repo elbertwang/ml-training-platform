@@ -76,6 +76,9 @@ FROM mlobs_core.fact_step
 UNION ALL SELECT 'job', MAX(last_seen),
        TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(last_seen), SECOND)
 FROM mlobs_core.job_hub
+UNION ALL SELECT 'kueue_admission', MAX(event_time),
+       TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(event_time), SECOND)
+FROM mlobs_raw.kueue_admission
 UNION ALL SELECT 'fin_daily', TIMESTAMP(MAX(day)),
        TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), TIMESTAMP(MAX(day)), SECOND)
 FROM mlobs_core.fin_daily"

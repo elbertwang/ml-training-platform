@@ -143,7 +143,11 @@ IF wm < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR) THEN
       'Workload requires preemption, but there are no candidate workloads allowed for preemption',
       'Waiting for Slices to be initialized',
       'Resetting the head of the ClusterQueue',
-      'Workload assumed in the cache');
+      'Workload assumed in the cache')
+  -- The source can repeat an insert_id. Five pairs arrived that way in the
+  -- first 81,315 rows, both copies written by the same run -- so it is
+  -- _AllLogs redelivering an entry, not this loop reading a window twice.
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY insert_id ORDER BY timestamp) = 1;
 
   -- Advance on the window, not on what the window happened to contain.
   UPDATE mlobs_raw.kueue_admission_wm SET watermark = win_end WHERE TRUE;
