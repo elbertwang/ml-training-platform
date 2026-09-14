@@ -7,7 +7,7 @@
     "quality_profile": "showcase",
     "viewBox": [
       1360,
-      600
+      640
     ],
     "views": [
       {
@@ -52,10 +52,25 @@
       "type": "cloud",
       "label": "Log Router sink",
       "sublabel": "mlobs-selective",
-      "tag": "590 万行/天 · 全量的 0.83%",
+      "tag": "590 万行/天；准入决策它收不了",
       "pos": [
         40,
-        98
+        40
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "loganalytics",
+      "type": "cloud",
+      "label": "Log Analytics",
+      "sublabel": "defaultLink · 全保真 30 天",
+      "tag": "json_payload 是原生 JSON",
+      "pos": [
+        40,
+        180
       ],
       "size": [
         190,
@@ -70,7 +85,7 @@
       "tag": "11 指标 · 300 秒对齐",
       "pos": [
         40,
-        266
+        320
       ],
       "size": [
         190,
@@ -85,7 +100,7 @@
       "tag": "每 5 分钟",
       "pos": [
         40,
-        434
+        470
       ],
       "size": [
         190,
@@ -99,7 +114,22 @@
       "sublabel": "运行时发现并 union 24 张 sink 表",
       "pos": [
         300,
-        98
+        40
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "kueue_adm",
+      "type": "database",
+      "label": "kueue_admission",
+      "sublabel": "准入决策 · 8.1 万行",
+      "tag": "sink 结构上收不了",
+      "pos": [
+        300,
+        180
       ],
       "size": [
         190,
@@ -109,12 +139,12 @@
     {
       "id": "metric_samples",
       "type": "database",
-      "label": "metric_samples",
-      "sublabel": "8.6 GiB",
-      "tag": "node 级 / 容器级 / 预留",
+      "label": "metric_samples + metric_hourly",
+      "sublabel": "300 秒实时 / 3600 秒回补",
+      "tag": "12.0 GiB",
       "pos": [
         300,
-        266
+        320
       ],
       "size": [
         190,
@@ -125,10 +155,10 @@
       "id": "fact_ev_step",
       "type": "database",
       "label": "fact_event · fact_step",
-      "sublabel": "3088 万 / 100 万",
+      "sublabel": "3260 万 / 103 万",
       "pos": [
         560,
-        98
+        110
       ],
       "size": [
         190,
@@ -139,11 +169,11 @@
       "id": "fact_chip",
       "type": "database",
       "label": "fact_chip",
-      "sublabel": "每芯片每 5 分钟 · 460 万行",
-      "tag": "唯一测量点",
+      "sublabel": "每芯片每段 · 811 万行 / 188 天",
+      "tag": "interval_s 是列不是常数",
       "pos": [
         560,
-        266
+        320
       ],
       "size": [
         190,
@@ -157,7 +187,7 @@
       "sublabel": "13.9 万 / 762",
       "pos": [
         560,
-        434
+        470
       ],
       "size": [
         190,
@@ -168,10 +198,10 @@
       "id": "chip_hourly",
       "type": "database",
       "label": "chip_hourly",
-      "sublabel": "每芯片每小时 · 1.2 万行/天",
+      "sublabel": "每芯片每小时 · 386 万行",
       "pos": [
         820,
-        203
+        230
       ],
       "size": [
         190,
@@ -185,7 +215,7 @@
       "sublabel": "四个资源效能比率",
       "pos": [
         820,
-        329
+        360
       ],
       "size": [
         190,
@@ -199,7 +229,7 @@
       "sublabel": "每预留每天 · 分母",
       "pos": [
         820,
-        455
+        490
       ],
       "size": [
         190,
@@ -214,7 +244,7 @@
       "tag": "同一镜像摘要",
       "pos": [
         1090,
-        98
+        40
       ],
       "size": [
         190,
@@ -229,7 +259,7 @@
       "tag": "对外交付",
       "pos": [
         1090,
-        266
+        300
       ],
       "size": [
         190,
@@ -243,21 +273,23 @@
       "label": "采集 Collection",
       "wraps": [
         "sink",
+        "loganalytics",
         "exporter",
         "snapshot"
       ]
     },
     {
       "kind": "region",
-      "label": "暂存 mlobs_raw · 32 表 91.9 GiB",
+      "label": "暂存 mlobs_raw · 36 表 85.9 GiB",
       "wraps": [
         "v_sink_logs",
+        "kueue_adm",
         "metric_samples"
       ]
     },
     {
       "kind": "region",
-      "label": "模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新",
+      "label": "模型 mlobs_core · 27 表 13.5 GiB",
       "wraps": [
         "fact_ev_step",
         "fact_chip",
@@ -287,7 +319,8 @@
       "id": "raw-events",
       "from": "v_sink_logs",
       "to": "fact_ev_step",
-      "label": "解析归因"
+      "label": "解析归因",
+      "labelDy": 26
     },
     {
       "id": "events-grafana",
@@ -343,15 +376,15 @@
       "via": [
         [
           395,
-          392
+          440
         ],
         [
           785,
-          392
+          440
         ],
         [
           785,
-          491
+          526
         ]
       ]
     },
@@ -371,7 +404,7 @@
       "via": [
         [
           1185,
-          365
+          396
         ]
       ],
       "labelSegment": 0
@@ -386,19 +419,27 @@
       "via": [
         [
           915,
-          420
+          460
+        ],
+        [
+          1050,
+          460
+        ],
+        [
+          1050,
+          600
         ],
         [
           1320,
-          420
+          600
         ],
         [
           1320,
-          67
+          16
         ],
         [
           1185,
-          67
+          16
         ]
       ]
     },
@@ -407,15 +448,27 @@
       "from": "snapshot",
       "to": "dim_pool",
       "label": "节点池与预留"
+    },
+    {
+      "id": "la-kueue",
+      "from": "loganalytics",
+      "to": "kueue_adm",
+      "label": "每天定向抽取"
+    },
+    {
+      "id": "kueue-events",
+      "from": "kueue_adm",
+      "to": "fact_ev_step",
+      "label": "绕过 sink"
     }
   ],
   "cards": [
     {
       "dot": "cyan",
-      "title": "一个测量点",
+      "title": "一个测量点，两种分辨率",
       "items": [
         "fact_chip 是唯一从原始指标推导的表，其余都是它的聚合",
-        "node 级读数把空闲芯片计为 0% 而非从平均中消失，序列数即已开出的芯片数"
+        "interval_s 是列不是常数：实时段 300 秒、回补段 3600 秒，下游一律加权而非数行"
       ]
     },
     {
@@ -428,10 +481,10 @@
     },
     {
       "dot": "amber",
-      "title": "已知缺口",
+      "title": "sink 收不下的那条",
       "items": [
-        "sink 每天丢 5k–28k 条 kueue 日志，schema 类型冲突，累计 20.9 万",
-        "mldiag_poller 采集 13 GiB，02_dim_mlrun 从未进刷新序列"
+        "Kueue 把同一字段同时以标量和对象发出，任何推断 schema 都会拒绝其中一种",
+        "准入决策曾 100% 丢失而 fact_event 看起来健康；现从 Log Analytics 定向抽取"
       ]
     }
   ]

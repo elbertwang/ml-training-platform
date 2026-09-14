@@ -5130,7 +5130,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read"
          data-preset-badge-editorial-plate="ARCHIFY / 图版 04">
-      <svg viewBox="0 0 1360 600" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
+      <svg viewBox="0 0 1360 640" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
         <title id="archify-diagram-title">TPU 训练可观测与财务分析平台</title>
         <desc id="archify-diagram-description">由 Archify 生成的架构图。</desc>
         <!-- Definitions -->
@@ -5156,268 +5156,321 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <rect width="100%" height="100%" fill="url(#grid)" />
 
         <!-- Boundaries (behind everything) -->
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" data-composition-frame-label="采集 Collection" x="10" y="68" width="250" height="458" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" data-composition-frame-label="采集 Collection" x="10" y="10" width="250" height="552" rx="12" class="c-region" stroke-width="1"/>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="1" data-composition-frame-label="暂存 mlobs_raw · 32 表 91.9 GiB" x="270" y="68" width="250" height="290" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="1" data-composition-frame-label="暂存 mlobs_raw · 36 表 85.9 GiB" x="270" y="10" width="250" height="402" rx="12" class="c-region" stroke-width="1"/>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="2" data-composition-frame-label="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" x="530" y="68" width="510" height="479" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="2" data-composition-frame-label="模型 mlobs_core · 27 表 13.5 GiB" x="530" y="80" width="510" height="502" rx="12" class="c-region" stroke-width="1"/>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="3" data-composition-frame-label="服务与对外" x="1060" y="68" width="250" height="290" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="3" data-composition-frame-label="服务与对外" x="1060" y="10" width="250" height="382" rx="12" class="c-region" stroke-width="1"/>
 
         <!-- Connection paths (before components for correct z-order) -->
-        <path data-edge-from="sink" data-edge-to="v_sink_logs" data-edge-label="精选日志" data-edge-key="0" data-edge-id="sink-raw" data-composition-points="230,134;300,134" d="M 230 134 L 300 134" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="v_sink_logs" data-edge-to="fact_ev_step" data-edge-label="解析归因" data-edge-key="1" data-edge-id="raw-events" data-composition-points="490,134;560,134" d="M 490 134 L 560 134" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="fact_ev_step" data-edge-to="grafana" data-edge-label="事件面板" data-edge-key="2" data-edge-id="events-grafana" data-composition-points="750,134;1090,134" d="M 750 134 L 1090 134" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="exporter" data-edge-to="metric_samples" data-edge-label="node 级加速器指标" data-edge-key="3" data-edge-id="exp-raw" data-composition-points="230,302;300,302" d="M 230 302 L 300 302" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="metric_samples" data-edge-to="fact_chip" data-edge-label="按芯片按时隙" data-edge-key="4" data-edge-id="raw-chip" data-composition-points="490,302;560,302" d="M 490 302 L 560 302" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="fact_chip" data-edge-to="chip_hourly" data-edge-label="聚合到小时" data-edge-key="5" data-edge-id="chip-hourly" data-composition-points="750,295;785,295;785,239;820,239" d="M 750 295 L 777 295 Q 785 295 785 287 L 785 247 Q 785 239 793 239 L 820 239" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="chip_hourly" data-edge-to="share" data-edge-label="v_chip_hourly" data-edge-key="6" data-edge-id="hourly-share" data-composition-points="1010,239;1050,239;1050,302;1090,302" d="M 1010 239 L 1042 239 Q 1050 239 1050 247 L 1050 294 Q 1050 302 1058 302 L 1090 302" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="fact_chip" data-edge-to="fin_daily" data-edge-label="聚合到天" data-edge-key="7" data-edge-id="chip-fin" data-composition-points="750,309;785,309;785,365;820,365" d="M 750 309 L 777 309 Q 785 309 785 317 L 785 357 Q 785 365 793 365 L 820 365" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="metric_samples" data-edge-to="fin_capacity" data-edge-label="预留指标 · 不经 fact_chip" data-edge-key="8" data-edge-id="raw-capacity" data-composition-points="395,338;395,392;785,392;785,491;820,491" d="M 395 338 L 395 384 Q 395 392 403 392 L 777 392 Q 785 392 785 400 L 785 483 Q 785 491 793 491 L 820 491" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="fin_capacity" data-edge-to="fin_daily" data-edge-label="分母" data-edge-key="9" data-edge-id="capacity-fin" data-composition-points="915,455;915,401" d="M 915 455 L 915 401" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="fin_daily" data-edge-to="share" data-edge-label="v_utilization_daily" data-edge-key="10" data-edge-id="fin-share" data-composition-points="1010,365;1185,365;1185,338" d="M 1010 365 L 1177 365 Q 1185 365 1185 357 L 1185 338" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="fin_daily" data-edge-to="grafana" data-edge-label="财务面板" data-edge-key="11" data-edge-id="fin-grafana" data-composition-points="915,401;915,420;1320,420;1320,67;1185,67;1185,98" d="M 915 401 L 915 412 Q 915 420 923 420 L 1312 420 Q 1320 420 1320 412 L 1320 75 Q 1320 67 1312 67 L 1193 67 Q 1185 67 1185 75 L 1185 98" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="snapshot" data-edge-to="dim_pool" data-edge-label="节点池与预留" data-edge-key="12" data-edge-id="snap-dim" data-composition-points="230,470;560,470" d="M 230 470 L 560 470" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="sink" data-edge-to="v_sink_logs" data-edge-label="精选日志" data-edge-key="0" data-edge-id="sink-raw" data-composition-points="230,76;300,76" d="M 230 76 L 300 76" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="v_sink_logs" data-edge-to="fact_ev_step" data-edge-label="解析归因" data-edge-key="1" data-edge-id="raw-events" data-composition-points="490,76;525,76;525,139;560,139" d="M 490 76 L 517 76 Q 525 76 525 84 L 525 131 Q 525 139 533 139 L 560 139" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="fact_ev_step" data-edge-to="grafana" data-edge-label="事件面板" data-edge-key="2" data-edge-id="events-grafana" data-composition-points="750,146;920,146;920,76;1090,76" d="M 750 146 L 912 146 Q 920 146 920 138 L 920 84 Q 920 76 928 76 L 1090 76" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="exporter" data-edge-to="metric_samples" data-edge-label="node 级加速器指标" data-edge-key="3" data-edge-id="exp-raw" data-composition-points="230,356;300,356" d="M 230 356 L 300 356" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="metric_samples" data-edge-to="fact_chip" data-edge-label="按芯片按时隙" data-edge-key="4" data-edge-id="raw-chip" data-composition-points="490,356;560,356" d="M 490 356 L 560 356" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="fact_chip" data-edge-to="chip_hourly" data-edge-label="聚合到小时" data-edge-key="5" data-edge-id="chip-hourly" data-composition-points="750,349;785,349;785,266;820,266" d="M 750 349 L 777 349 Q 785 349 785 341 L 785 274 Q 785 266 793 266 L 820 266" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="chip_hourly" data-edge-to="share" data-edge-label="v_chip_hourly" data-edge-key="6" data-edge-id="hourly-share" data-composition-points="1010,266;1050,266;1050,336;1090,336" d="M 1010 266 L 1042 266 Q 1050 266 1050 274 L 1050 328 Q 1050 336 1058 336 L 1090 336" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="fact_chip" data-edge-to="fin_daily" data-edge-label="聚合到天" data-edge-key="7" data-edge-id="chip-fin" data-composition-points="750,363;785,363;785,396;820,396" d="M 750 363 L 777 363 Q 785 363 785 371 L 785 388 Q 785 396 793 396 L 820 396" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="metric_samples" data-edge-to="fin_capacity" data-edge-label="预留指标 · 不经 fact_chip" data-edge-key="8" data-edge-id="raw-capacity" data-composition-points="395,392;395,440;785,440;785,526;820,526" d="M 395 392 L 395 432 Q 395 440 403 440 L 777 440 Q 785 440 785 448 L 785 518 Q 785 526 793 526 L 820 526" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="fin_capacity" data-edge-to="fin_daily" data-edge-label="分母" data-edge-key="9" data-edge-id="capacity-fin" data-composition-points="915,490;915,432" d="M 915 490 L 915 432" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="fin_daily" data-edge-to="share" data-edge-label="v_utilization_daily" data-edge-key="10" data-edge-id="fin-share" data-composition-points="1010,396;1185,396;1185,372" d="M 1010 396 L 1177 396 Q 1185 396 1185 388 L 1185 372" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="fin_daily" data-edge-to="grafana" data-edge-label="财务面板" data-edge-key="11" data-edge-id="fin-grafana" data-composition-points="915,432;915,460;1050,460;1050,600;1320,600;1320,16;1185,16;1185,40" d="M 915 432 L 915 452 Q 915 460 923 460 L 1042 460 Q 1050 460 1050 468 L 1050 592 Q 1050 600 1058 600 L 1312 600 Q 1320 600 1320 592 L 1320 24 Q 1320 16 1312 16 L 1193 16 Q 1185 16 1185 24 L 1185 40" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="snapshot" data-edge-to="dim_pool" data-edge-label="节点池与预留" data-edge-key="12" data-edge-id="snap-dim" data-composition-points="230,506;560,506" d="M 230 506 L 560 506" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="loganalytics" data-edge-to="kueue_adm" data-edge-label="每天定向抽取" data-edge-key="13" data-edge-id="la-kueue" data-composition-points="230,216;300,216" d="M 230 216 L 300 216" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="kueue_adm" data-edge-to="fact_ev_step" data-edge-label="绕过 sink" data-edge-key="14" data-edge-id="kueue-events" data-composition-points="490,216;525,216;525,153;560,153" d="M 490 216 L 517 216 Q 525 216 525 208 L 525 161 Q 525 153 533 153 L 560 153" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
 
         <!-- Components -->
-        <g id="node-sink" data-node-id="sink" data-node-label="Log Router sink" tabindex="0" role="button" aria-label="聚焦Log Router sink，mlobs-selective, 采集 Collection" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="mlobs-selective" data-node-tag="590 万行/天 · 全量的 0.83%" data-node-context="采集 Collection">
-          <title>Log Router sink · mlobs-selective · 采集 Collection · 590 万行/天 · 全量的 0.83%</title>
-          <rect x="40" y="98" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="40" y="98" width="190" height="72" rx="6" class="c-cloud" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(46 104) scale(0.6875)">
+        <g id="node-sink" data-node-id="sink" data-node-label="Log Router sink" tabindex="0" role="button" aria-label="聚焦Log Router sink，mlobs-selective, 采集 Collection" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="mlobs-selective" data-node-tag="590 万行/天；准入决策它收不了" data-node-context="采集 Collection">
+          <title>Log Router sink · mlobs-selective · 采集 Collection · 590 万行/天；准入决策它收不了</title>
+          <rect x="40" y="40" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="40" y="40" width="190" height="72" rx="6" class="c-cloud" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(46 46) scale(0.6875)">
             <path d="M4.3 12.5h7.3a2.4 2.4 0 0 0 .2-4.8 4 4 0 0 0-7.5-1.3A3.1 3.1 0 0 0 4.3 12.5Z"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="135" y="132" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Log Router sink</text>
-        <text data-detail="context" x="135" y="148" class="t-muted" font-size="9" text-anchor="middle">mlobs-selective</text>
-        <text data-detail="fine" x="135" y="162" class="t-cloud" font-size="7" text-anchor="middle">590 万行/天 · 全量的 0.83%</text>
+          <text data-node-label="" data-detail-anchor="" x="135" y="74" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Log Router sink</text>
+        <text data-detail="context" x="135" y="90" class="t-muted" font-size="9" text-anchor="middle">mlobs-selective</text>
+        <text data-detail="fine" x="135" y="104" class="t-cloud" font-size="7" text-anchor="middle">590 万行/天；准入决策它收不了</text>
+        </g>
+
+        <g id="node-loganalytics" data-node-id="loganalytics" data-node-label="Log Analytics" tabindex="0" role="button" aria-label="聚焦Log Analytics，defaultLink · 全保真 30 天, 采集 Collection" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="defaultLink · 全保真 30 天" data-node-tag="json_payload 是原生 JSON" data-node-context="采集 Collection">
+          <title>Log Analytics · defaultLink · 全保真 30 天 · 采集 Collection · json_payload 是原生 JSON</title>
+          <rect x="40" y="180" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="40" y="180" width="190" height="72" rx="6" class="c-cloud" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(46 186) scale(0.6875)">
+            <path d="M4.3 12.5h7.3a2.4 2.4 0 0 0 .2-4.8 4 4 0 0 0-7.5-1.3A3.1 3.1 0 0 0 4.3 12.5Z"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="135" y="214" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Log Analytics</text>
+        <text data-detail="context" x="135" y="230" class="t-muted" font-size="9" text-anchor="middle">defaultLink · 全保真 30 天</text>
+        <text data-detail="fine" x="135" y="244" class="t-cloud" font-size="7" text-anchor="middle">json_payload 是原生 JSON</text>
         </g>
 
         <g id="node-exporter" data-node-id="exporter" data-node-label="metrics_exporter.py" tabindex="0" role="button" aria-label="聚焦metrics_exporter.py，Cloud Monitoring → BigQuery, 采集 Collection" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Cloud Monitoring → BigQuery" data-node-tag="11 指标 · 300 秒对齐" data-node-context="采集 Collection">
           <title>metrics_exporter.py · Cloud Monitoring → BigQuery · 采集 Collection · 11 指标 · 300 秒对齐</title>
-          <rect x="40" y="266" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="40" y="266" width="190" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(46 272) scale(0.6875)">
+          <rect x="40" y="320" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="40" y="320" width="190" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(46 326) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="135" y="300" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">metrics_exporter.py</text>
-        <text data-detail="context" x="135" y="316" class="t-muted" font-size="9" text-anchor="middle">Cloud Monitoring → BigQuery</text>
-        <text data-detail="fine" x="135" y="330" class="t-backend" font-size="7" text-anchor="middle">11 指标 · 300 秒对齐</text>
+          <text data-node-label="" data-detail-anchor="" x="135" y="354" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">metrics_exporter.py</text>
+        <text data-detail="context" x="135" y="370" class="t-muted" font-size="9" text-anchor="middle">Cloud Monitoring → BigQuery</text>
+        <text data-detail="fine" x="135" y="384" class="t-backend" font-size="7" text-anchor="middle">11 指标 · 300 秒对齐</text>
         </g>
 
         <g id="node-snapshot" data-node-id="snapshot" data-node-label="node_pool_snapshot.py" tabindex="0" role="button" aria-label="聚焦node_pool_snapshot.py，GKE + Reservations API, 采集 Collection" aria-pressed="false" data-node-kind="backend" data-node-sublabel="GKE + Reservations API" data-node-tag="每 5 分钟" data-node-context="采集 Collection">
           <title>node_pool_snapshot.py · GKE + Reservations API · 采集 Collection · 每 5 分钟</title>
-          <rect x="40" y="434" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="40" y="434" width="190" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(46 440) scale(0.6875)">
+          <rect x="40" y="470" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="40" y="470" width="190" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(46 476) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="135" y="468" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">node_pool_snapshot.py</text>
-        <text data-detail="context" x="135" y="484" class="t-muted" font-size="9" text-anchor="middle">GKE + Reservations API</text>
-        <text data-detail="fine" x="135" y="498" class="t-backend" font-size="7" text-anchor="middle">每 5 分钟</text>
+          <text data-node-label="" data-detail-anchor="" x="135" y="504" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">node_pool_snapshot.py</text>
+        <text data-detail="context" x="135" y="520" class="t-muted" font-size="9" text-anchor="middle">GKE + Reservations API</text>
+        <text data-detail="fine" x="135" y="534" class="t-backend" font-size="7" text-anchor="middle">每 5 分钟</text>
         </g>
 
-        <g id="node-v_sink_logs" data-node-id="v_sink_logs" data-node-label="v_sink_logs" tabindex="0" role="button" aria-label="聚焦v_sink_logs，运行时发现并 union 24 张 sink 表, 暂存 mlobs_raw · 32 表 91.9 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="运行时发现并 union 24 张 sink 表" data-node-context="暂存 mlobs_raw · 32 表 91.9 GiB">
-          <title>v_sink_logs · 运行时发现并 union 24 张 sink 表 · 暂存 mlobs_raw · 32 表 91.9 GiB</title>
-          <rect x="300" y="98" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="300" y="98" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(306 104) scale(0.6875)">
+        <g id="node-v_sink_logs" data-node-id="v_sink_logs" data-node-label="v_sink_logs" tabindex="0" role="button" aria-label="聚焦v_sink_logs，运行时发现并 union 24 张 sink 表, 暂存 mlobs_raw · 36 表 85.9 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="运行时发现并 union 24 张 sink 表" data-node-context="暂存 mlobs_raw · 36 表 85.9 GiB">
+          <title>v_sink_logs · 运行时发现并 union 24 张 sink 表 · 暂存 mlobs_raw · 36 表 85.9 GiB</title>
+          <rect x="300" y="40" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="300" y="40" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(306 46) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="395" y="132" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">v_sink_logs</text>
-        <text data-detail="context" x="395" y="148" class="t-muted" font-size="9" text-anchor="middle">运行时发现并 union 24 张 sink 表</text>
+          <text data-node-label="" data-detail-anchor="" x="395" y="74" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">v_sink_logs</text>
+        <text data-detail="context" x="395" y="90" class="t-muted" font-size="9" text-anchor="middle">运行时发现并 union 24 张 sink 表</text>
         </g>
 
-        <g id="node-metric_samples" data-node-id="metric_samples" data-node-label="metric_samples" tabindex="0" role="button" aria-label="聚焦metric_samples，8.6 GiB, 暂存 mlobs_raw · 32 表 91.9 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="8.6 GiB" data-node-tag="node 级 / 容器级 / 预留" data-node-context="暂存 mlobs_raw · 32 表 91.9 GiB">
-          <title>metric_samples · 8.6 GiB · 暂存 mlobs_raw · 32 表 91.9 GiB · node 级 / 容器级 / 预留</title>
-          <rect x="300" y="266" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="300" y="266" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(306 272) scale(0.6875)">
+        <g id="node-kueue_adm" data-node-id="kueue_adm" data-node-label="kueue_admission" tabindex="0" role="button" aria-label="聚焦kueue_admission，准入决策 · 8.1 万行, 暂存 mlobs_raw · 36 表 85.9 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="准入决策 · 8.1 万行" data-node-tag="sink 结构上收不了" data-node-context="暂存 mlobs_raw · 36 表 85.9 GiB">
+          <title>kueue_admission · 准入决策 · 8.1 万行 · 暂存 mlobs_raw · 36 表 85.9 GiB · sink 结构上收不了</title>
+          <rect x="300" y="180" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="300" y="180" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(306 186) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="395" y="300" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">metric_samples</text>
-        <text data-detail="context" x="395" y="316" class="t-muted" font-size="9" text-anchor="middle">8.6 GiB</text>
-        <text data-detail="fine" x="395" y="330" class="t-database" font-size="7" text-anchor="middle">node 级 / 容器级 / 预留</text>
+          <text data-node-label="" data-detail-anchor="" x="395" y="214" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">kueue_admission</text>
+        <text data-detail="context" x="395" y="230" class="t-muted" font-size="9" text-anchor="middle">准入决策 · 8.1 万行</text>
+        <text data-detail="fine" x="395" y="244" class="t-database" font-size="7" text-anchor="middle">sink 结构上收不了</text>
         </g>
 
-        <g id="node-fact_ev_step" data-node-id="fact_ev_step" data-node-label="fact_event · fact_step" tabindex="0" role="button" aria-label="聚焦fact_event · fact_step，3088 万 / 100 万, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="3088 万 / 100 万" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>fact_event · fact_step · 3088 万 / 100 万 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</title>
-          <rect x="560" y="98" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="560" y="98" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 104) scale(0.6875)">
+        <g id="node-metric_samples" data-node-id="metric_samples" data-node-label="metric_samples + metric_hourly" tabindex="0" role="button" aria-label="聚焦metric_samples + metric_hourly，300 秒实时 / 3600 秒回补, 暂存 mlobs_raw · 36 表 85.9 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="300 秒实时 / 3600 秒回补" data-node-tag="12.0 GiB" data-node-context="暂存 mlobs_raw · 36 表 85.9 GiB">
+          <title>metric_samples + metric_hourly · 300 秒实时 / 3600 秒回补 · 暂存 mlobs_raw · 36 表 85.9 GiB · 12.0 GiB</title>
+          <rect x="300" y="320" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="300" y="320" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(306 326) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="655" y="132" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fact_event · fact_step</text>
-        <text data-detail="context" x="655" y="148" class="t-muted" font-size="9" text-anchor="middle">3088 万 / 100 万</text>
+          <text data-node-label="" data-detail-anchor="" x="395" y="354" class="t-primary" font-size="10.1" font-weight="600" text-anchor="middle">metric_samples + metric_hourly</text>
+        <text data-detail="context" x="395" y="370" class="t-muted" font-size="9" text-anchor="middle">300 秒实时 / 3600 秒回补</text>
+        <text data-detail="fine" x="395" y="384" class="t-database" font-size="7" text-anchor="middle">12.0 GiB</text>
         </g>
 
-        <g id="node-fact_chip" data-node-id="fact_chip" data-node-label="fact_chip" tabindex="0" role="button" aria-label="聚焦fact_chip，每芯片每 5 分钟 · 460 万行, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="每芯片每 5 分钟 · 460 万行" data-node-tag="唯一测量点" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>fact_chip · 每芯片每 5 分钟 · 460 万行 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新 · 唯一测量点</title>
-          <rect x="560" y="266" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="560" y="266" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 272) scale(0.6875)">
+        <g id="node-fact_ev_step" data-node-id="fact_ev_step" data-node-label="fact_event · fact_step" tabindex="0" role="button" aria-label="聚焦fact_event · fact_step，3260 万 / 103 万, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="3260 万 / 103 万" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>fact_event · fact_step · 3260 万 / 103 万 · 模型 mlobs_core · 27 表 13.5 GiB</title>
+          <rect x="560" y="110" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="560" y="110" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 116) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="655" y="300" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fact_chip</text>
-        <text data-detail="context" x="655" y="316" class="t-muted" font-size="9" text-anchor="middle">每芯片每 5 分钟 · 460 万行</text>
-        <text data-detail="fine" x="655" y="330" class="t-database" font-size="7" text-anchor="middle">唯一测量点</text>
+          <text data-node-label="" data-detail-anchor="" x="655" y="144" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fact_event · fact_step</text>
+        <text data-detail="context" x="655" y="160" class="t-muted" font-size="9" text-anchor="middle">3260 万 / 103 万</text>
         </g>
 
-        <g id="node-dim_pool" data-node-id="dim_pool" data-node-label="dim_pod · dim_node_pool" tabindex="0" role="button" aria-label="聚焦dim_pod · dim_node_pool，13.9 万 / 762, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="13.9 万 / 762" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>dim_pod · dim_node_pool · 13.9 万 / 762 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</title>
-          <rect x="560" y="434" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="560" y="434" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 440) scale(0.6875)">
+        <g id="node-fact_chip" data-node-id="fact_chip" data-node-label="fact_chip" tabindex="0" role="button" aria-label="聚焦fact_chip，每芯片每段 · 811 万行 / 188 天, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="每芯片每段 · 811 万行 / 188 天" data-node-tag="interval_s 是列不是常数" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>fact_chip · 每芯片每段 · 811 万行 / 188 天 · 模型 mlobs_core · 27 表 13.5 GiB · interval_s 是列不是常数</title>
+          <rect x="560" y="320" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="560" y="320" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 326) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="655" y="468" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">dim_pod · dim_node_pool</text>
-        <text data-detail="context" x="655" y="484" class="t-muted" font-size="9" text-anchor="middle">13.9 万 / 762</text>
+          <text data-node-label="" data-detail-anchor="" x="655" y="354" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fact_chip</text>
+        <text data-detail="context" x="655" y="370" class="t-muted" font-size="9" text-anchor="middle">每芯片每段 · 811 万行 / 188 天</text>
+        <text data-detail="fine" x="655" y="384" class="t-database" font-size="7" text-anchor="middle">interval_s 是列不是常数</text>
         </g>
 
-        <g id="node-chip_hourly" data-node-id="chip_hourly" data-node-label="chip_hourly" tabindex="0" role="button" aria-label="聚焦chip_hourly，每芯片每小时 · 1.2 万行/天, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="每芯片每小时 · 1.2 万行/天" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>chip_hourly · 每芯片每小时 · 1.2 万行/天 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</title>
-          <rect x="820" y="203" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="820" y="203" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 209) scale(0.6875)">
+        <g id="node-dim_pool" data-node-id="dim_pool" data-node-label="dim_pod · dim_node_pool" tabindex="0" role="button" aria-label="聚焦dim_pod · dim_node_pool，13.9 万 / 762, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="13.9 万 / 762" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>dim_pod · dim_node_pool · 13.9 万 / 762 · 模型 mlobs_core · 27 表 13.5 GiB</title>
+          <rect x="560" y="470" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="560" y="470" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(566 476) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="915" y="237" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">chip_hourly</text>
-        <text data-detail="context" x="915" y="253" class="t-muted" font-size="9" text-anchor="middle">每芯片每小时 · 1.2 万行/天</text>
+          <text data-node-label="" data-detail-anchor="" x="655" y="504" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">dim_pod · dim_node_pool</text>
+        <text data-detail="context" x="655" y="520" class="t-muted" font-size="9" text-anchor="middle">13.9 万 / 762</text>
         </g>
 
-        <g id="node-fin_daily" data-node-id="fin_daily" data-node-label="fin_daily" tabindex="0" role="button" aria-label="聚焦fin_daily，四个资源效能比率, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="四个资源效能比率" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>fin_daily · 四个资源效能比率 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</title>
-          <rect x="820" y="329" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="820" y="329" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 335) scale(0.6875)">
+        <g id="node-chip_hourly" data-node-id="chip_hourly" data-node-label="chip_hourly" tabindex="0" role="button" aria-label="聚焦chip_hourly，每芯片每小时 · 386 万行, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="每芯片每小时 · 386 万行" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>chip_hourly · 每芯片每小时 · 386 万行 · 模型 mlobs_core · 27 表 13.5 GiB</title>
+          <rect x="820" y="230" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="820" y="230" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 236) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="915" y="363" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fin_daily</text>
-        <text data-detail="context" x="915" y="379" class="t-muted" font-size="9" text-anchor="middle">四个资源效能比率</text>
+          <text data-node-label="" data-detail-anchor="" x="915" y="264" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">chip_hourly</text>
+        <text data-detail="context" x="915" y="280" class="t-muted" font-size="9" text-anchor="middle">每芯片每小时 · 386 万行</text>
         </g>
 
-        <g id="node-fin_capacity" data-node-id="fin_capacity" data-node-label="fin_capacity_daily" tabindex="0" role="button" aria-label="聚焦fin_capacity_daily，每预留每天 · 分母, 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新" aria-pressed="false" data-node-kind="database" data-node-sublabel="每预留每天 · 分母" data-node-context="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <title>fin_capacity_daily · 每预留每天 · 分母 · 模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</title>
-          <rect x="820" y="455" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="820" y="455" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 461) scale(0.6875)">
+        <g id="node-fin_daily" data-node-id="fin_daily" data-node-label="fin_daily" tabindex="0" role="button" aria-label="聚焦fin_daily，四个资源效能比率, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="四个资源效能比率" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>fin_daily · 四个资源效能比率 · 模型 mlobs_core · 27 表 13.5 GiB</title>
+          <rect x="820" y="360" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="820" y="360" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 366) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="915" y="489" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fin_capacity_daily</text>
-        <text data-detail="context" x="915" y="505" class="t-muted" font-size="9" text-anchor="middle">每预留每天 · 分母</text>
+          <text data-node-label="" data-detail-anchor="" x="915" y="394" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fin_daily</text>
+        <text data-detail="context" x="915" y="410" class="t-muted" font-size="9" text-anchor="middle">四个资源效能比率</text>
+        </g>
+
+        <g id="node-fin_capacity" data-node-id="fin_capacity" data-node-label="fin_capacity_daily" tabindex="0" role="button" aria-label="聚焦fin_capacity_daily，每预留每天 · 分母, 模型 mlobs_core · 27 表 13.5 GiB" aria-pressed="false" data-node-kind="database" data-node-sublabel="每预留每天 · 分母" data-node-context="模型 mlobs_core · 27 表 13.5 GiB">
+          <title>fin_capacity_daily · 每预留每天 · 分母 · 模型 mlobs_core · 27 表 13.5 GiB</title>
+          <rect x="820" y="490" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="820" y="490" width="190" height="72" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(826 496) scale(0.6875)">
+            <ellipse cx="8" cy="4" rx="5" ry="2"/>
+            <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="915" y="524" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">fin_capacity_daily</text>
+        <text data-detail="context" x="915" y="540" class="t-muted" font-size="9" text-anchor="middle">每预留每天 · 分母</text>
         </g>
 
         <g id="node-grafana" data-node-id="grafana" data-node-label="Grafana on Cloud Run" tabindex="0" role="button" aria-label="聚焦Grafana on Cloud Run，IAP 与 run.invoker 双服务, 服务与对外" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="IAP 与 run.invoker 双服务" data-node-tag="同一镜像摘要" data-node-context="服务与对外">
           <title>Grafana on Cloud Run · IAP 与 run.invoker 双服务 · 服务与对外 · 同一镜像摘要</title>
-          <rect x="1090" y="98" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="1090" y="98" width="190" height="72" rx="6" class="c-frontend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(1096 104) scale(0.6875)">
+          <rect x="1090" y="40" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="1090" y="40" width="190" height="72" rx="6" class="c-frontend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(1096 46) scale(0.6875)">
             <rect x="2" y="3" width="12" height="10" rx="2"/>
             <path d="M2 6.5h12"/>
             <circle cx="4.1" cy="4.8" r=".7" class="sigil-fill"/>
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="1185" y="132" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Grafana on Cloud Run</text>
-        <text data-detail="context" x="1185" y="148" class="t-muted" font-size="9" text-anchor="middle">IAP 与 run.invoker 双服务</text>
-        <text data-detail="fine" x="1185" y="162" class="t-frontend" font-size="7" text-anchor="middle">同一镜像摘要</text>
+          <text data-node-label="" data-detail-anchor="" x="1185" y="74" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Grafana on Cloud Run</text>
+        <text data-detail="context" x="1185" y="90" class="t-muted" font-size="9" text-anchor="middle">IAP 与 run.invoker 双服务</text>
+        <text data-detail="fine" x="1185" y="104" class="t-frontend" font-size="7" text-anchor="middle">同一镜像摘要</text>
         </g>
 
         <g id="node-share" data-node-id="share" data-node-label="mlobs_share" tabindex="0" role="button" aria-label="聚焦mlobs_share，9 视图 · 只读服务账号, 服务与对外" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="9 视图 · 只读服务账号" data-node-tag="对外交付" data-node-context="服务与对外">
           <title>mlobs_share · 9 视图 · 只读服务账号 · 服务与对外 · 对外交付</title>
-          <rect x="1090" y="266" width="190" height="72" rx="6" class="c-mask"/>
-          <rect x="1090" y="266" width="190" height="72" rx="6" class="c-cloud" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(1096 272) scale(0.6875)">
+          <rect x="1090" y="300" width="190" height="72" rx="6" class="c-mask"/>
+          <rect x="1090" y="300" width="190" height="72" rx="6" class="c-cloud" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(1096 306) scale(0.6875)">
             <path d="M4.3 12.5h7.3a2.4 2.4 0 0 0 .2-4.8 4 4 0 0 0-7.5-1.3A3.1 3.1 0 0 0 4.3 12.5Z"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="1185" y="300" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">mlobs_share</text>
-        <text data-detail="context" x="1185" y="316" class="t-muted" font-size="9" text-anchor="middle">9 视图 · 只读服务账号</text>
-        <text data-detail="fine" x="1185" y="330" class="t-cloud" font-size="7" text-anchor="middle">对外交付</text>
+          <text data-node-label="" data-detail-anchor="" x="1185" y="334" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">mlobs_share</text>
+        <text data-detail="context" x="1185" y="350" class="t-muted" font-size="9" text-anchor="middle">9 视图 · 只读服务账号</text>
+        <text data-detail="fine" x="1185" y="364" class="t-cloud" font-size="7" text-anchor="middle">对外交付</text>
         </g>
 
         <!-- Connection labels -->
         <g data-detail="context" data-edge-from="sink" data-edge-to="v_sink_logs" data-edge-label="精选日志" data-edge-key="0" data-edge-id="sink-raw">
-          <rect x="240.8" y="114" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="265" y="124" class="t-muted" font-size="8" text-anchor="middle">精选日志</text>
+          <rect x="240.8" y="56" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="265" y="66" class="t-muted" font-size="8" text-anchor="middle">精选日志</text>
         </g>
         <g data-detail="context" data-edge-from="v_sink_logs" data-edge-to="fact_ev_step" data-edge-label="解析归因" data-edge-key="1" data-edge-id="raw-events">
-          <rect x="500.8" y="114" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="525" y="124" class="t-muted" font-size="8" text-anchor="middle">解析归因</text>
+          <rect x="500.8" y="113.5" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="525" y="123.5" class="t-muted" font-size="8" text-anchor="middle">解析归因</text>
         </g>
         <g data-detail="context" data-edge-from="fact_ev_step" data-edge-to="grafana" data-edge-label="事件面板" data-edge-key="2" data-edge-id="events-grafana">
-          <rect x="895.8" y="114" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="920" y="124" class="t-muted" font-size="8" text-anchor="middle">事件面板</text>
+          <rect x="895.8" y="91" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="920" y="101" class="t-muted" font-size="8" text-anchor="middle">事件面板</text>
         </g>
         <g data-detail="context" data-edge-from="exporter" data-edge-to="metric_samples" data-edge-label="node 级加速器指标" data-edge-key="3" data-edge-id="exp-raw">
-          <rect x="219.2" y="230" width="91.6" height="14" rx="3" class="c-mask"/>
-          <text x="265" y="240" class="t-backend" font-size="8" text-anchor="middle">node 级加速器指标</text>
+          <rect x="219.2" y="284" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="265" y="294" class="t-backend" font-size="8" text-anchor="middle">node 级加速器指标</text>
         </g>
         <g data-detail="context" data-edge-from="metric_samples" data-edge-to="fact_chip" data-edge-label="按芯片按时隙" data-edge-key="4" data-edge-id="raw-chip">
-          <rect x="491.2" y="282" width="67.6" height="14" rx="3" class="c-mask"/>
-          <text x="525" y="292" class="t-backend" font-size="8" text-anchor="middle">按芯片按时隙</text>
+          <rect x="491.2" y="336" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="525" y="346" class="t-backend" font-size="8" text-anchor="middle">按芯片按时隙</text>
         </g>
         <g data-detail="context" data-edge-from="fact_chip" data-edge-to="chip_hourly" data-edge-label="聚合到小时" data-edge-key="5" data-edge-id="chip-hourly">
-          <rect x="756" y="247" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="785" y="257" class="t-backend" font-size="8" text-anchor="middle">聚合到小时</text>
+          <rect x="756" y="287.5" width="58" height="14" rx="3" class="c-mask"/>
+          <text x="785" y="297.5" class="t-backend" font-size="8" text-anchor="middle">聚合到小时</text>
         </g>
         <g data-detail="context" data-edge-from="chip_hourly" data-edge-to="share" data-edge-label="v_chip_hourly" data-edge-key="6" data-edge-id="hourly-share">
-          <rect x="1013.8" y="250.5" width="72.4" height="14" rx="3" class="c-mask"/>
-          <text x="1050" y="260.5" class="t-backend" font-size="8" text-anchor="middle">v_chip_hourly</text>
+          <rect x="1013.8" y="281" width="72.4" height="14" rx="3" class="c-mask"/>
+          <text x="1050" y="291" class="t-backend" font-size="8" text-anchor="middle">v_chip_hourly</text>
         </g>
         <g data-detail="context" data-edge-from="fact_chip" data-edge-to="fin_daily" data-edge-label="聚合到天" data-edge-key="7" data-edge-id="chip-fin">
-          <rect x="760.8" y="317" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="785" y="327" class="t-muted" font-size="8" text-anchor="middle">聚合到天</text>
+          <rect x="760.8" y="359.5" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="785" y="369.5" class="t-muted" font-size="8" text-anchor="middle">聚合到天</text>
         </g>
         <g data-detail="context" data-edge-from="metric_samples" data-edge-to="fin_capacity" data-edge-label="预留指标 · 不经 fact_chip" data-edge-key="8" data-edge-id="raw-capacity">
-          <rect x="525" y="372" width="130" height="14" rx="3" class="c-mask"/>
-          <text x="590" y="382" class="t-messagebus" font-size="8" text-anchor="middle">预留指标 · 不经 fact_chip</text>
+          <rect x="525" y="420" width="130" height="14" rx="3" class="c-mask"/>
+          <text x="590" y="430" class="t-messagebus" font-size="8" text-anchor="middle">预留指标 · 不经 fact_chip</text>
         </g>
         <g data-detail="context" data-edge-from="fin_capacity" data-edge-to="fin_daily" data-edge-label="分母" data-edge-key="9" data-edge-id="capacity-fin">
-          <rect x="900" y="435" width="30" height="14" rx="3" class="c-mask"/>
-          <text x="915" y="445" class="t-muted" font-size="8" text-anchor="middle">分母</text>
+          <rect x="900" y="470" width="30" height="14" rx="3" class="c-mask"/>
+          <text x="915" y="480" class="t-muted" font-size="8" text-anchor="middle">分母</text>
         </g>
         <g data-detail="context" data-edge-from="fin_daily" data-edge-to="share" data-edge-label="v_utilization_daily" data-edge-key="10" data-edge-id="fin-share">
-          <rect x="1046.9" y="345" width="101.2" height="14" rx="3" class="c-mask"/>
-          <text x="1097.5" y="355" class="t-muted" font-size="8" text-anchor="middle">v_utilization_daily</text>
+          <rect x="1046.9" y="376" width="101.2" height="14" rx="3" class="c-mask"/>
+          <text x="1097.5" y="386" class="t-muted" font-size="8" text-anchor="middle">v_utilization_daily</text>
         </g>
         <g data-detail="context" data-edge-from="fin_daily" data-edge-to="grafana" data-edge-label="财务面板" data-edge-key="11" data-edge-id="fin-grafana">
-          <rect x="1093.3" y="400" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="1117.5" y="410" class="t-muted" font-size="8" text-anchor="middle">财务面板</text>
+          <rect x="958.3" y="440" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="982.5" y="450" class="t-muted" font-size="8" text-anchor="middle">财务面板</text>
         </g>
         <g data-detail="context" data-edge-from="snapshot" data-edge-to="dim_pool" data-edge-label="节点池与预留" data-edge-key="12" data-edge-id="snap-dim">
-          <rect x="361.2" y="450" width="67.6" height="14" rx="3" class="c-mask"/>
-          <text x="395" y="460" class="t-muted" font-size="8" text-anchor="middle">节点池与预留</text>
+          <rect x="361.2" y="486" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="395" y="496" class="t-muted" font-size="8" text-anchor="middle">节点池与预留</text>
+        </g>
+        <g data-detail="context" data-edge-from="loganalytics" data-edge-to="kueue_adm" data-edge-label="每天定向抽取" data-edge-key="13" data-edge-id="la-kueue">
+          <rect x="231.2" y="196" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="265" y="206" class="t-muted" font-size="8" text-anchor="middle">每天定向抽取</text>
+        </g>
+        <g data-detail="context" data-edge-from="kueue_adm" data-edge-to="fact_ev_step" data-edge-label="绕过 sink" data-edge-key="14" data-edge-id="kueue-events">
+          <rect x="498.4" y="164.5" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
+          <text x="525" y="174.5" class="t-muted" font-size="8" text-anchor="middle">绕过 sink</text>
         </g>
 
         <!-- Boundary labels (foreground masks keep routes out of titles) -->
         <g data-graph-role="structural-frame-label" data-composition-frame-id="0" data-composition-frame-kind="region" data-composition-frame-label="采集 Collection">
-          <rect data-graph-role="structural-frame-label-mask" x="14" y="78" width="91" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="18" y="91" class="t-cloud" font-size="9" font-weight="600">采集 Collection</text>
+          <rect data-graph-role="structural-frame-label-mask" x="14" y="20" width="91" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="18" y="33" class="t-cloud" font-size="9" font-weight="600">采集 Collection</text>
         </g>
 
-        <g data-graph-role="structural-frame-label" data-composition-frame-id="1" data-composition-frame-kind="region" data-composition-frame-label="暂存 mlobs_raw · 32 表 91.9 GiB">
-          <rect data-graph-role="structural-frame-label-mask" x="274" y="78" width="177.4" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="278" y="91" class="t-cloud" font-size="9" font-weight="600">暂存 mlobs_raw · 32 表 91.9 GiB</text>
+        <g data-graph-role="structural-frame-label" data-composition-frame-id="1" data-composition-frame-kind="region" data-composition-frame-label="暂存 mlobs_raw · 36 表 85.9 GiB">
+          <rect data-graph-role="structural-frame-label-mask" x="274" y="20" width="177.4" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="278" y="33" class="t-cloud" font-size="9" font-weight="600">暂存 mlobs_raw · 36 表 85.9 GiB</text>
         </g>
 
-        <g data-graph-role="structural-frame-label" data-composition-frame-id="2" data-composition-frame-kind="region" data-composition-frame-label="模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新">
-          <rect data-graph-role="structural-frame-label-mask" x="534" y="78" width="274.59999999999997" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="538" y="91" class="t-cloud" font-size="9" font-weight="600">模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新</text>
+        <g data-graph-role="structural-frame-label" data-composition-frame-id="2" data-composition-frame-kind="region" data-composition-frame-label="模型 mlobs_core · 27 表 13.5 GiB">
+          <rect data-graph-role="structural-frame-label-mask" x="534" y="90" width="182.79999999999998" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="538" y="103" class="t-cloud" font-size="9" font-weight="600">模型 mlobs_core · 27 表 13.5 GiB</text>
         </g>
 
         <g data-graph-role="structural-frame-label" data-composition-frame-id="3" data-composition-frame-kind="region" data-composition-frame-label="服务与对外">
-          <rect data-graph-role="structural-frame-label-mask" x="1064" y="78" width="64" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="1068" y="91" class="t-cloud" font-size="9" font-weight="600">服务与对外</text>
+          <rect data-graph-role="structural-frame-label-mask" x="1064" y="20" width="64" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="1068" y="33" class="t-cloud" font-size="9" font-weight="600">服务与对外</text>
         </g>
 
         <!-- Legend -->
-
+        <g data-legend="" data-legend-bridge="">
+          <text x="40" y="604" class="t-primary" font-size="12" font-weight="650">图例</text>
+          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="前端" data-legend-x="40" data-legend-baseline="624" data-legend-width="63">
+            <rect x="40" y="615" width="16" height="10" rx="2.5" class="c-frontend" stroke-width="1"/>
+            <text x="62" y="624" class="t-muted" font-size="10" font-weight="500">前端</text>
+          </g>
+          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="后端" data-legend-x="125" data-legend-baseline="624" data-legend-width="63">
+            <rect x="125" y="615" width="16" height="10" rx="2.5" class="c-backend" stroke-width="1"/>
+            <text x="147" y="624" class="t-muted" font-size="10" font-weight="500">后端</text>
+          </g>
+          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="数据库" data-legend-x="210" data-legend-baseline="624" data-legend-width="73">
+            <rect x="210" y="615" width="16" height="10" rx="2.5" class="c-database" stroke-width="1"/>
+            <text x="232" y="624" class="t-muted" font-size="10" font-weight="500">数据库</text>
+          </g>
+          <g data-legend-semantic-kind="cloud" data-legend-kind="cloud" data-legend-label="云服务" data-legend-x="305" data-legend-baseline="624" data-legend-width="73">
+            <rect x="305" y="615" width="16" height="10" rx="2.5" class="c-cloud" stroke-width="1"/>
+            <text x="327" y="624" class="t-muted" font-size="10" font-weight="500">云服务</text>
+          </g>
+        </g>
       </svg>
       <p class="intent-trace-status no-print" id="intent-trace-status" role="status" aria-live="polite" aria-atomic="true"></p>
       <div class="share-chapter-cue no-print" id="share-chapter-cue" hidden role="status" aria-live="polite">
@@ -5607,11 +5660,11 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>一个测量点</h3>
+          <h3>一个测量点，两种分辨率</h3>
         </div>
         <ul>
           <li>&bull; fact_chip 是唯一从原始指标推导的表，其余都是它的聚合</li>
-          <li>&bull; node 级读数把空闲芯片计为 0% 而非从平均中消失，序列数即已开出的芯片数</li>
+          <li>&bull; interval_s 是列不是常数：实时段 300 秒、回补段 3600 秒，下游一律加权而非数行</li>
         </ul>
       </div>
 
@@ -5629,11 +5682,11 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       <div class="card">
         <div class="card-header">
           <div class="card-dot amber"></div>
-          <h3>已知缺口</h3>
+          <h3>sink 收不下的那条</h3>
         </div>
         <ul>
-          <li>&bull; sink 每天丢 5k–28k 条 kueue 日志，schema 类型冲突，累计 20.9 万</li>
-          <li>&bull; mldiag_poller 采集 13 GiB，02_dim_mlrun 从未进刷新序列</li>
+          <li>&bull; Kueue 把同一字段同时以标量和对象发出，任何推断 schema 都会拒绝其中一种</li>
+          <li>&bull; 准入决策曾 100% 丢失而 fact_event 看起来健康；现从 Log Analytics 定向抽取</li>
         </ul>
       </div>
     </div>
