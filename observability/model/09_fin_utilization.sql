@@ -192,8 +192,22 @@ CLUSTER BY day;
 
 BEGIN TRANSACTION;
 
+-- The window is whole days on both sides, and it has to be.
+--
+-- This used to delete `day >= DATE(CURRENT_TIMESTAMP() - 4 days)` -- a whole
+-- day -- while every CTE below read `>= CURRENT_TIMESTAMP() - 4 days`, a
+-- timestamp. The oldest day in the window was therefore deleted entirely and
+-- rebuilt from the hours after the current clock time, losing a little more on
+-- each refresh, and frozen at that remnant the moment it slid out of the
+-- window. Found on 2026-09-14: fact_chip held 24 hours and 147,460 rows for
+-- 2026-09-10, fin_work_daily held 13 hours of them, and global_tpu_utils was
+-- NULL for the day because the coverage gate correctly refused a partial one.
+-- The gate caught it; nothing else would have.
+--
+-- Everything below is now anchored to CURRENT_DATE(), matching what
+-- fin_occupancy_daily further down already did.
 DELETE FROM mlobs_core.fin_work_daily
-WHERE day >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY));
+WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY);
 
 INSERT INTO mlobs_core.fin_work_daily
 WITH pod_class AS (
@@ -253,7 +267,7 @@ busy AS (
     COUNT(DISTINCT chip_id)                                AS chips_seen,
     COUNT(DISTINCT node_name)                              AS nodes_seen
   FROM mlobs_core.fact_chip
-  WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE slot >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
   GROUP BY day
 ),
 pool_coverage AS (
@@ -294,7 +308,7 @@ pool_coverage AS (
   LEFT JOIN mlobs_core.dim_node_pool np
     ON np.ig_hash = mlobs_core.node_ig_hash(p.node_name)
   WHERE p.node_name IS NOT NULL
-    AND p.first_seen >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+    AND p.first_seen >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
   GROUP BY day
 ),
 job_class AS (
@@ -319,7 +333,7 @@ job_shape AS (
          SAFE_DIVIDE(ANY_VALUE(h.peak_chips), MAX(s.ranks_reporting)) AS chips_per_rank
   FROM mlobs_core.fact_step s
   JOIN mlobs_core.job_hub h USING (job_key)
-  WHERE s.step_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE s.step_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
     AND s.ranks_reporting > 0 AND h.peak_chips > 0
   GROUP BY s.job_key
 ),
@@ -347,7 +361,7 @@ flops AS (
   LEFT JOIN job_shape sh USING (job_key)
   CROSS JOIN (SELECT peak_tflops_per_device FROM mlobs_core.dim_chip_peak
               WHERE tpu_model = 'tpu7x' AND dtype = 'bf16') pk
-  WHERE s.step_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE s.step_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
     AND s.tflops_p50 IS NOT NULL AND s.ranks_reporting > 0
   GROUP BY day, c.capacity_class
 ),
@@ -387,7 +401,7 @@ metric_coverage AS (
     DATE(slot) AS day,
     ROUND(COUNT(DISTINCT TIMESTAMP_TRUNC(slot, HOUR)) / 24, 3) AS metric_coverage
   FROM mlobs_core.fact_chip
-  WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE slot >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
   GROUP BY day
 )
 -- One row per day. capacity_class is no longer a dimension here: the work

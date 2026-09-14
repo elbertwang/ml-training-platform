@@ -32,7 +32,8 @@ cannot say whether it averaged six underlying samples or one. A chip whose node
 came up ten minutes before the hour ended would otherwise be billed a full
 chip-hour. So each metric is fetched twice and the two are zipped on
 (series, timestamp): value from the mean, interval_s from the count times the
-underlying 600s period. Presence stays exact and the row count does not change.
+underlying sampling period, which is itself read off the busiest bucket of the
+day rather than assumed. Presence stays exact and the row count does not change.
 
 Rows go to mlobs_raw.metric_hourly, not metric_samples. The two never overlap --
 this one starts where the live collector's history ends -- and keeping them
@@ -121,14 +122,23 @@ def fetch_day(token, project, metric_type, day, ingested_at):
     counts = fetch_series(token, project, metric_type, None,
                           start, end, ALIGNMENT_S, "ALIGN_COUNT")
 
-    n_by_key = {}
+    n_by_key, max_n = {}, 0
     for s in counts:
         bucket = n_by_key.setdefault(series_key(s), {})
         for p in s.get("points", []):
             v = p["value"]
             n = v.get("int64Value", v.get("doubleValue"))
             if n is not None:
-                bucket[p["interval"]["endTime"]] = int(float(n))
+                n = int(float(n))
+                bucket[p["interval"]["endTime"]] = n
+                max_n = max(max_n, n)
+
+    # The underlying sampling period, measured rather than assumed. A full hour
+    # holds the most samples the resolution allows, so the busiest bucket of the
+    # day gives it away: 6 means 600s, 12 means 300s. Hard-coding 600 is right
+    # only past the six-week downsampling boundary -- inside it a half-empty
+    # hour of 300s samples would be credited with twice the seconds it had.
+    period_s = (ALIGNMENT_S // max_n) if max_n else DOWNSAMPLED_PERIOD_S
 
     rows, unmatched = [], 0
     for s in means:
@@ -156,10 +166,9 @@ def fetch_day(token, project, metric_type, day, ingested_at):
                 "resource_type": resource.get("type"),
                 "resource_labels": resource.get("labels", {}),
                 "metric_labels": s.get("metric", {}).get("labels", {}),
-                # Capped at the alignment period: a count of 7 on a 600s series
-                # inside a 3600s bucket would otherwise claim 4,200 seconds of a
-                # 3,600-second hour.
-                "interval_s": min(n * DOWNSAMPLED_PERIOD_S, ALIGNMENT_S),
+                # Capped at the alignment period: a stray extra sample in a
+                # bucket would otherwise claim more than the hour it sits in.
+                "interval_s": min(n * period_s, ALIGNMENT_S),
                 "ingested_at": ingested_at,
             })
     return rows, unmatched
