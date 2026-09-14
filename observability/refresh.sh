@@ -80,7 +80,7 @@ collect optional mldiag_poller \
                                      --locations "$MLDIAG_LOCATIONS" --since-hours 6
 
 echo "=== Model ==="
-for f in 00b_dim_config 00c_compact_mldiag 02_dim_mlrun 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
+for f in 00b_dim_config 00c_compact_mldiag 00d_kueue_admission 02_dim_mlrun 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
   printf "  %-18s " "$f"
   if out=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
              < "${HERE}/model/${f}.sql" 2>&1); then
@@ -102,7 +102,10 @@ done
 
 echo "=== Freshness ==="
 bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
-SELECT 'fact_event'  AS t, TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(event_time), MINUTE) AS lag_min, COUNT(*) AS rows_
+SELECT 'kueue_admission' AS t, TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(event_time), MINUTE) AS lag_min, COUNT(*) AS rows_
+FROM \`${PROJECT_ID}.mlobs_raw.kueue_admission\`
+UNION ALL
+SELECT 'fact_event', TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(event_time), MINUTE), COUNT(*)
 FROM \`${PROJECT_ID}.mlobs_core.fact_event\`
 UNION ALL
 SELECT 'fact_metric', TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(point_time), MINUTE), COUNT(*)

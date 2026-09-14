@@ -81,6 +81,53 @@ WHERE e.start_time >= window_start AND e.start_time < window_end
 
 UNION ALL
 
+-- 1b. Kueue admission decisions, from mlobs_raw.kueue_admission.
+--
+--     Read straight from that table rather than through v_sink_logs, because
+--     the sink cannot carry these rows at all: kueue emits clusterQueue,
+--     rootCohort, queue and workload as both scalars and objects, and an
+--     inferred BigQuery schema rejects one shape or the other. Every admission
+--     decision was being dropped -- 100% of them, while the reconciliation
+--     chatter around them arrived intact, which is why fact_event looked
+--     healthy with 16,127 kueue rows a day and could not say why anything
+--     waited. See model/00d_kueue_admission.sql.
+--
+--     job_key is derived from the workload name and then checked against
+--     dim_pod, never guessed. Kueue names a workload `[namespace/]jobset-<job>-
+--     <hash>`, so stripping both ends yields the job_key directly -- an equality
+--     join, not a prefix match, which also means no fan-out across the jobset's
+--     pods. Measured over two days: 84.4% of 28,308 rows resolve, 8% do not
+--     parse, and the rest parse to a job dim_pod has never seen. A derived name
+--     with no match is published as NULL rather than as a job_key that does not
+--     exist.
+--
+--     attempt_uid stays NULL. An admission decision is about the workload, and
+--     which attempt it turned into is not knowable from this row.
+SELECT
+  k.event_time,
+  j.job_key,
+  CAST(NULL AS STRING) AS attempt_uid,
+  k.cluster_name,
+  'kueue-system' AS namespace_name,
+  'kueue_admission' AS source,
+  'INFO' AS severity,
+  k.msg AS event_type,
+  SUBSTR(CONCAT(k.msg,
+                IFNULL(CONCAT(' | workload=', k.workload), ''),
+                IFNULL(CONCAT(' | queue=', k.cluster_queue), '')), 1, 500) AS summary,
+  CAST(NULL AS STRING) AS pod_name,
+  CAST(NULL AS STRING) AS node_name,
+  1 AS occurrences,
+  TO_JSON_STRING(STRUCT(k.cluster_queue, k.root_cohort, k.parent_cohort,
+                        k.workload, k.workload_ns, k.queue,
+                        k.scheduling_cycle)) AS detail
+FROM mlobs_raw.kueue_admission k
+LEFT JOIN (SELECT DISTINCT job_key FROM mlobs_core.dim_pod WHERE job_key IS NOT NULL) j
+  ON j.job_key = REGEXP_EXTRACT(k.workload, r'(?:^|/)jobset-(.+)-[0-9a-f]{4,6}$')
+WHERE k.event_time >= window_start AND k.event_time < window_end
+
+UNION ALL
+
 -- 2. Kubernetes events. involvedObject names the pod or node concerned; the
 --    job comes from dim_pod when the object is a pod we know about.
 SELECT

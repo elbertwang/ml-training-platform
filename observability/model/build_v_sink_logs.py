@@ -57,7 +57,12 @@ COLUMNS = {
 }
 
 # Tables that live in mlobs_raw but are not sink output.
-DENY = {"pod_labels_backfill", "metric_samples", "mldiag_runs", "mldiag_events"}
+DENY = {"pod_labels_backfill", "metric_samples", "mldiag_runs", "mldiag_events",
+        # 04_fact_event reads this one directly; unioning it here as well
+        # would count every admission decision twice. It has no `resource`
+        # column so the test below would skip it anyway -- this is the
+        # guard that survives someone adding one.
+        "kueue_admission", "kueue_admission_wm"}
 
 
 def bq_json(project, sql):
