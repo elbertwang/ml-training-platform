@@ -487,11 +487,11 @@ instance id（与 `compute instances describe` 核对一致），所以芯片↔
 ### 4.5 四个资源效能口径
 
 ```
-                     分母 = 买下的产能              分母 = 已开出的 VM
+                     分母 = 买下的产能              分母 = 已交付的 VM
 有 Pod 调度          global_allocate_rate          tpu_allocate_rate_in_vm
-                     pod ÷ paid                    pod ÷ vm
+                     pod ÷ paid                    pod ÷ scheduled
 加速器在跑           global_tpu_utils              tpu_utils_in_vm
-                     duty ÷ paid                   duty ÷ vm
+                     duty ÷ paid                   duty ÷ scheduled
 ```
 
 `global_X = X_in_vm × 预留占用率`，因为 `vm` 约掉。四个比率在 `fin_daily` 里

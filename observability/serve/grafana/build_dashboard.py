@@ -1150,12 +1150,12 @@ TPU_FINANCE_DEFINITIONS = """
 
 | 量 | 定义 | 来源 |
 |---|---|---|
-| `paid_chip_hours` | ∫ 预留芯片数 dt | `compute.googleapis.com/reservation/reserved` 按 5 分钟积分 |
+| `paid_chip_hours` | ∫ 预留芯片数 dt | `compute.googleapis.com/reservation/reserved`，按实测采样间隔积分 |
 | `scheduled_chip_hours` | ∫ 已交付芯片数 dt | `compute.googleapis.com/reservation/used` |
-| `pod_chip_hours` | Σ(5 分钟 × 有 Pod 的芯片) | 容器加速器指标的样本数 |
+| `pod_chip_hours` | Σ(interval_s × 有 Pod 的芯片) ÷ 3600 | 容器加速器指标定位 Pod，时长按 `fact_chip.interval_s` |
 | `stepping_chip_hours` | Σ(step 墙钟秒 × 该 step 的芯片数) | 训练日志解析出的每步记录 |
-| `duty_chip_hours` | Σ(加速器处理时间占比 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/duty_cycle` |
-| `busy_chip_hours` | Σ(张量核占用率 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/tensorcore_utilization` |
+| `duty_chip_hours` | Σ(加速器处理时间占比 ÷ 100 × interval_s × 芯片) ÷ 3600 | `node/accelerator/duty_cycle` |
+| `busy_chip_hours` | Σ(张量核占用率 ÷ 100 × interval_s × 芯片) ÷ 3600 | `node/accelerator/tensorcore_utilization` |
 | `flops_chip_hours` | Σ(实测 TFLOP/s ÷ 峰值 TFLOP/s × step 秒 × 芯片) | 训练日志 + 芯片峰值表（bf16） |
 
 ### 产能漏斗
@@ -1399,15 +1399,16 @@ LIMIT 1""")],
             "percent", 2,
             "**定义** 有 Pod 调度的芯片占预留产能的比例。\n\n"
             "**公式** `global_allocate_rate = pod_chip_hours ÷ paid_chip_hours`\n\n"
-            "分子按芯片逐个判定：某块芯片在某个 5 分钟窗口里被容器加速器指标点名，"
-            "就算它当时承载了 Pod。分母是预留买下的全部产能。\n\n"
+            "分子按芯片逐个判定：某块芯片在某个采样窗口里被容器加速器指标点名，"
+            "就算它当时承载了 Pod；窗口长度是 `fact_chip.interval_s`，实时段 300 秒、"
+            "回补的历史段最长一小时。分母是预留买下的全部产能。\n\n"
             "它与 ① 的落差是「节点建起来了却没派上活」。\n\n"
             "同分子换分母即 `tpu_allocate_rate_in_vm`（除以已开出 VM 的产能），"
             "两者之比就是 ①。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 50},
              {"color": STATUS["good"], "value": 80}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+            gate="day_coverage >= 0.9 AND metric_coverage >= 0.9"),
         num("③ 全局利用率 global_tpu_utils", 14, 5, "v",
             "ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
@@ -1424,7 +1425,7 @@ LIMIT 1""")],
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
              {"color": STATUS["good"], "value": 60}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+            gate="day_coverage >= 0.9 AND metric_coverage >= 0.9"),
     ]
     y += 5
 
@@ -1444,7 +1445,7 @@ LIMIT 1""")],
     y += 1
     panels += [
         num("使用率 tpu_allocate_rate_in_vm", 9, 5, "v",
-            "ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),SUM(vm_chip_hours)),2)",
+            "ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),SUM(scheduled_chip_hours)),2)",
             "percent", 2,
             "**定义** 开了 VM 的集合中，有多少调度了 Pod。\n\n"
             "**公式** `tpu_allocate_rate_in_vm = pod_chip_hours ÷ vm_chip_hours`\n\n"
@@ -1456,9 +1457,9 @@ LIMIT 1""")],
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 60},
              {"color": STATUS["good"], "value": 85}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+            gate="day_coverage >= 0.9 AND metric_coverage >= 0.9"),
         num("利用率 tpu_utils_in_vm", 14, 5, "v",
-            "ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours),SUM(vm_chip_hours)),2)",
+            "ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours),SUM(scheduled_chip_hours)),2)",
             "percent", 2,
             "**定义** 开了 VM 的利用率均值。\n\n"
             "**公式** `tpu_utils_in_vm = duty_chip_hours ÷ vm_chip_hours`\n\n"
@@ -1473,7 +1474,7 @@ LIMIT 1""")],
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
              {"color": STATUS["good"], "value": 60}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+            gate="day_coverage >= 0.9 AND metric_coverage >= 0.9"),
     ]
     y += 5
 
@@ -1505,7 +1506,7 @@ LIMIT 1""")],
   ROUND(100 * SAFE_DIVIDE(SUM(busy_chip_hours),      SUM(paid_chip_hours)), 1) AS `D 张量核忙`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9 AND work_coverage >= 0.9
+  AND day_coverage >= 0.9 AND metric_coverage >= 0.9
   AND metric_coverage >= 0.9
   -- Six systems, one bar chart. Nothing forces a stage to sit below the one
   -- above it, so a day whose stages cross is excluded rather than averaged in.
@@ -1551,6 +1552,7 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
   chip_utilization_pct        AS `D 张量核忙`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND funnel_monotonic
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"unit": "percent",
                                      "custom": {"lineWidth": 2, "fillOpacity": 0}},

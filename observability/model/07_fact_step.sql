@@ -77,12 +77,29 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_step
 PARTITION BY DATE(step_time)
 CLUSTER BY job_key, step;
 
-BEGIN TRANSACTION;
-
-DELETE FROM mlobs_core.fact_step
-WHERE step_time >= step_window_start AND step_time < step_window_end;
-
-INSERT INTO mlobs_core.fact_step
+-- Built before the transaction, because the DELETE has to know the keys the
+-- INSERT is about to write.
+--
+-- The window is read on `l.timestamp` but the table is keyed on
+-- `step_time = MIN(timestamp)` over the group. MIN() is never above any of the
+-- rows it summarises, so a step whose rank lines straddle step_window_start
+-- keeps a row whose step_time sits *below* the DELETE threshold and survives
+-- it, while the source read still sees the lines above the threshold and emits
+-- a second, single-rank fragment for the same (job_key, attempt_uid, step).
+--
+-- Measured 2026-09-14: 14 duplicated keys in 1,014,352 rows, every later copy a
+-- 1-rank fragment landing one scheduler tick after the full one --
+-- falcon-job-hu07r2ht8r step 4 as 16 ranks at 15:01:57 and again as 1 rank at
+-- 15:07:18. Small in aggregate and total per step: ranks_reporting reads 1
+-- instead of 16, tflops_p50 and straggler_ratio are computed over one rank, and
+-- job_steps() draws both points on the Grafana job page.
+--
+-- Unlike the same-shaped bugs in chip_hourly and fin_work_daily, this one never
+-- repairs itself: the stale copy is below every future threshold. Anchoring to
+-- CURRENT_DATE() does not help either, because MIN() can fall below any
+-- boundary, not just a truncated one. The DELETE has to be keyed on what the
+-- INSERT produces.
+CREATE TEMP TABLE new_steps AS
 WITH raw AS (
   SELECT
     l.timestamp,
@@ -176,5 +193,20 @@ SELECT
 FROM parsed
 WHERE step IS NOT NULL
 GROUP BY job_key, attempt_uid, step;
+
+BEGIN TRANSACTION;
+
+-- Two clauses. The first keeps the original behaviour -- everything in the
+-- window goes, so a step that vanished from the source does not linger. The
+-- second reaches one day further back for exactly the keys about to be
+-- rewritten, which is the straddle case above. The extra day is bounded and
+-- still prunes partitions.
+DELETE FROM mlobs_core.fact_step t
+WHERE (t.step_time >= step_window_start AND t.step_time < step_window_end)
+   OR (t.step_time >= TIMESTAMP_SUB(step_window_start, INTERVAL 1 DAY)
+       AND STRUCT(t.job_key, t.attempt_uid, t.step) IN (
+             SELECT AS STRUCT job_key, attempt_uid, step FROM new_steps));
+
+INSERT INTO mlobs_core.fact_step SELECT * FROM new_steps;
 
 COMMIT TRANSACTION;

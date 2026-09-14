@@ -62,6 +62,11 @@ TABLE = "metric_hourly"
 # and 150 days back it came back 600s apart.
 DOWNSAMPLED_PERIOD_S = 600
 
+# Samples per hour at each cadence Cloud Monitoring has actually been observed
+# to serve for these metrics: 60 raw (inside the six-week window), 6 downsampled
+# (outside it). 12 is kept because a 300s-aligned source would report it.
+KNOWN_CADENCES = {6, 12, 60}
+
 # Aligned to 3600s: one point per chip per hour, which is the grain chip_hourly
 # publishes and more than a daily figure needs.
 ALIGNMENT_S = 3600
@@ -138,7 +143,18 @@ def fetch_day(token, project, metric_type, day, ingested_at):
     # day gives it away: 6 means 600s, 12 means 300s. Hard-coding 600 is right
     # only past the six-week downsampling boundary -- inside it a half-empty
     # hour of 300s samples would be credited with twice the seconds it had.
-    period_s = (ALIGNMENT_S // max_n) if max_n else DOWNSAMPLED_PERIOD_S
+    if max_n in KNOWN_CADENCES:
+        period_s = ALIGNMENT_S // max_n
+    else:
+        # Only the measured cadences divide the hour exactly. A stray count --
+        # 7, say -- would yield 514s and push a wrong interval_s straight into
+        # fact_chip's chip-hours with nothing to flag it, so snap to the nearest
+        # real cadence and say so rather than trusting the arithmetic.
+        nearest = min(KNOWN_CADENCES, key=lambda k: abs(k - max_n)) if max_n else 6
+        period_s = ALIGNMENT_S // nearest
+        print(f"    {metric_type.split('/')[-1]} {day}: busiest bucket held "
+              f"{max_n} samples, not one of {sorted(KNOWN_CADENCES)}; "
+              f"treating the cadence as {period_s}s", flush=True)
 
     rows, unmatched = [], 0
     for s in means:
@@ -248,30 +264,39 @@ def main():
         sys.exit("--from must be before --to")
 
     total, total_unmatched, started = 0, 0, dt.datetime.now(dt.timezone.utc)
+    all_skipped = []
     print(f"  {args.start} .. {args.end} ({(last - day).days} days), "
           f"{len(wanted)} metrics -> {args.dataset}.{args.target}", flush=True)
 
     while day < last:
         ingested_at = dt.datetime.now(dt.timezone.utc).isoformat()
         token = access_token()          # refreshes itself past 40 minutes
-        rows, unmatched = [], 0
+        rows, unmatched, fetched, skipped = [], 0, [], []
         for metric in wanted:
             try:
                 r, u = fetch_day(token, args.project, metric, day, ingested_at)
             except RuntimeError as e:
-                # One unreadable metric-day must not discard the rest of the run.
+                # One unreadable metric-day must not discard the rest of the run
+                # -- and must not discard its own existing rows either. It is
+                # left out of `fetched`, so clear_day below does not touch it.
+                # Clearing all of `wanted` and reloading only what succeeded
+                # turned a transient 5xx into permanent deletion of that
+                # metric's day, while still printing a row count and "done."
                 print(f"  {day} {metric.split('/')[-1]}: {e}", flush=True)
+                skipped.append(metric)
                 continue
+            fetched.append(metric)
             rows += r
             unmatched += u
+        all_skipped.extend((day, m) for m in skipped)
         if args.target == "metric_samples":
             # fin_capacity_daily derives the sample width with LAG over whatever
             # spacing it finds, so the reservation series need no interval_s and
             # that table has no column for one. Carrying it would fail the load.
             rows = [{k: v for k, v in r.items() if k != "interval_s"}
                     for r in rows]
-        if not args.dry:
-            clear_day(args.project, args.dataset, args.target, day, wanted)
+        if not args.dry and fetched:
+            clear_day(args.project, args.dataset, args.target, day, fetched)
             bq_load(args.project, args.dataset, args.target, rows,
                     SCHEMA.replace("interval_s:INT64,", "")
                     if args.target == "metric_samples" else SCHEMA)
@@ -285,6 +310,14 @@ def main():
 
     print(f"  done. {total:,} rows, {total_unmatched:,} points dropped for "
           f"having no count alongside the mean.")
+    if all_skipped:
+        # Non-zero, because a backfill that half-ran and reported success is
+        # how a repair becomes a second outage.
+        print(f"  {len(all_skipped)} metric-days could not be fetched and were "
+              f"left untouched; re-run those days:", file=sys.stderr)
+        for d, m in all_skipped[:20]:
+            print(f"    {d} {m}", file=sys.stderr)
+        sys.exit(1)
     if not args.dry:
         print(f"  next: model/11h_fact_chip_history.sql over the same range.")
 

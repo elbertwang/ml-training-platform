@@ -745,7 +745,7 @@ FROM (
      STRUCT('scheduled_chip_hours', scheduled_chip_hours, 'chip*hour',
             'INTEGRAL(compute.googleapis.com/reservation/used) dt'),
      STRUCT('busy_chip_hours', busy_chip_hours, 'chip*hour',
-            'SUM(tensorcore_utilization/100 * 300s * chips) over reserved pools'),
+            'SUM(tensorcore_utilization/100 * interval_s * chips)/3600 over reserved pools'),
      STRUCT('flops_chip_hours', flops_chip_hours, 'chip*hour',
             'SUM(tflops_p50 / 1153.5 * step_seconds * chips), bf16 peak per JAX device'),
      STRUCT('reservation_utilization_pct', reservation_utilization_pct, 'percent',

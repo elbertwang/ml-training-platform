@@ -183,8 +183,15 @@ Analytics Hub 的机制反而用不上。若后续你们希望在自己项目里
 
 ### 4.1 历史数据的两段分辨率
 
-数据从 **2026-03-11** 起可查，那天是集群 `tpu-training-antgroup` 的创建时间，
-不是保留上限——再往前不存在。中间有一条分界线：
+**这一节只适用于四张按芯片/按天的视图**：`v_chip_hourly`、`v_utilization_daily`、
+`v_capacity_daily`、`v_metric_export`。它们从 **2026-03-11** 起可查，那天是集群
+`tpu-training-antgroup` 的创建时间，不是保留上限——再往前不存在。
+
+事件流三张视图的历史短得多，因为它们来自日志而不是指标：
+`v_event` 从 2026-08-22（24 天）、`v_step` 与 `v_job` 从 2026-08-05（约 40 天）。
+规划回溯分析时请按这三个数字，不要按 2026-03-11。
+
+指标那四张视图中间有一条分辨率分界线：
 
 | 区间 | 底层分辨率 | 来源 |
 |---|---|---|
@@ -192,8 +199,17 @@ Analytics Hub 的机制反而用不上。若后续你们希望在自己项目里
 | 2026-03-11 – 2026-08-10 | 1 小时 | 从 Cloud Monitoring 回补 |
 
 Cloud Monitoring 只保留六周的完整分辨率，更早的数据一律降采样到 10 分钟，
-所以历史段按小时对齐取回。**这不影响你们的任何计算**：`v_chip_hourly` 本来就是
-小时粒度，两段在这张表里列完全相同、口径完全相同，不需要区分处理。
+所以历史段按小时对齐取回。`v_chip_hourly` 本来就是小时粒度，两段列完全相同，
+`vm_chip_hours` / `duty_chip_hours` / `busy_chip_hours` 在两段都是按实测时长
+加权的，可以直接跨段相加。
+
+**但 `pod_chip_hours` 在历史段是上界，不能跨段直接比。** 历史段的占用是
+按小时判定的：只要有容器指标在那个小时点名过这块芯片，整小时都算被占用，
+结构上无法表达「半小时」。实测 `0 < pod_slots < vm_slots` 的行占比——
+3 月到 7 月**恒为 0.0%**，8 月（交接月）17.1%，9 月（实时段）51.9%。
+也就是说历史段的 `pod_slots` 只有 0 和满格两种取值。受影响的是
+`global_allocate_rate` 与 `tpu_allocate_rate_in_vm`，它们在那 150 天偏高；
+另外三个量不受影响。
 
 唯一能看出差别的是 `vm_slots` / `pod_slots`——它们的单位是「5 分钟等价数，满格 12」。
 历史段的一行由一个整小时的样本构成，若该芯片整小时在线则记 12，只在线 30 分钟则记 6。
@@ -240,29 +256,33 @@ Cloud Logging 的 `_Default` 只留 30 天，无法补回。`pod_name` 在整个
 ### 5.2 四个资源效能指标
 
 ```
-                     分母 = 买下的产能              分母 = 已开出的 VM
+                     分母 = 买下的产能              分母 = 已交付的 VM
                      ────────────────              ──────────────────
 有 Pod 调度          global_allocate_rate          tpu_allocate_rate_in_vm
-                     pod ÷ paid                    pod ÷ vm
+                     pod ÷ paid                    pod ÷ scheduled
 
 加速器在跑           global_tpu_utils              tpu_utils_in_vm
-                     duty ÷ paid                   duty ÷ vm
+                     duty ÷ paid                   duty ÷ scheduled
 ```
 
 | 指标 | 中文 | 定义 | 公式 |
 |---|---|---|---|
 | `global_allocate_rate` | 全局使用率 | 有 Pod 调度的比例，分母是 reservation | `pod_chip_hours ÷ paid_chip_hours` |
 | `global_tpu_utils` | 全局利用率 | VM 利用率均值 × reservation 使用率 | `duty_chip_hours ÷ paid_chip_hours` |
-| `tpu_allocate_rate_in_vm` | 使用率 | 开了 VM 的集合中，有多少调度了 Pod | `pod_chip_hours ÷ vm_chip_hours` |
-| `tpu_utils_in_vm` | 利用率 | 开了 VM 的利用率均值 | `duty_chip_hours ÷ vm_chip_hours` |
+| `tpu_allocate_rate_in_vm` | 使用率 | 交付给 VM 的集合中，有多少调度了 Pod | `pod_chip_hours ÷ scheduled_chip_hours` |
+| `tpu_utils_in_vm` | 利用率 | 交付给 VM 的利用率均值 | `duty_chip_hours ÷ scheduled_chip_hours` |
 
-「全局利用率」的定义是两项相乘，公式写成单一比值，两者等价——`vm` 约掉了：
+「全局利用率」的定义是两项相乘，公式写成单一比值，两者等价——`scheduled` 约掉了：
 
 ```
-global_tpu_utils = tpu_utils_in_vm × 预留占用率
-                 = (duty ÷ vm)     × (vm ÷ paid)
+global_tpu_utils = tpu_utils_in_vm    × 预留占用率
+                 = (duty ÷ scheduled) × (scheduled ÷ paid)
                  = duty ÷ paid
 ```
+
+**分母是 `scheduled_chip_hours` 而不是 `vm_chip_hours`。** 两者在 5 月以后差 1–2%，
+但在回补的历史段差得很远（3 月 `vm ÷ scheduled` 达 158%），只有用 `scheduled`
+上面的约分才成立，也才和 `v_utilization_daily` 里已发布的列一致。
 
 > **⚠️ 两组分母不同，不可混用。** `global_*` 之间可以相减，`*_in_vm` 之间可以相减，
 > **跨组相减没有意义**。
@@ -289,7 +309,7 @@ global_tpu_utils = tpu_utils_in_vm × 预留占用率
   它回答「卡有没有在跑」。
 - `tensorcore_utilization` 是**吞吐口径**——实际执行的算子数 ÷ 可支持的算子数，
   连续值且从不触顶。它回答「用掉了多少算力」。
-  视图里是 `tensorcore_utilization` 字段。
+  视图里是 `tensorcore_pct` 字段。
 
 近 30 天 `global_tpu_utils` 32.93%，而 tensorcore 口径只有 14.7%——
 **卡在跑，但只用掉不到一半的算力**，差额是访存受限、集合通信、数据加载。
@@ -378,13 +398,20 @@ ORDER BY hour, chip_id;
 
 ```sql
 SELECT
-  ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),  SUM(vm_chip_hours)),2) AS tpu_allocate_rate_in_vm,
-  ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours), SUM(vm_chip_hours)),2) AS tpu_utils_in_vm
-FROM `tpu-for-training.mlobs_share.v_chip_hourly`
-WHERE hour >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
+  ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),  SUM(scheduled_chip_hours)),2) AS tpu_allocate_rate_in_vm,
+  ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours), SUM(scheduled_chip_hours)),2) AS tpu_utils_in_vm
+FROM `tpu-for-training.mlobs_share.v_utilization_daily`
+WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY);
 ```
 
-**两个全局指标需要关联容量表**，因为分母是「买了的」而不是「开出来的」：
+**两个全局指标需要关联容量表**，因为分母是「买了的」而不是「开出来的」。
+
+> ⚠️ **下面这段只适用于 2026-07-01 以后。** 它按 `reservation_name` 做 INNER JOIN，
+> 而该列在历史段大面积为空（宽表侧 3–6 月 100% 为空、7 月 88.9%、8 月 20.6%），
+> NULL 不匹配任何值，行会**无声消失**、不报错。实测把窗口从 7 天放大到 90 天，
+> `global_allocate_rate` 从 66.07% 掉到 40.15%，差值全是被 JOIN 丢掉的行。
+> **要更长的历史，直接读 `v_utilization_daily.global_allocate_rate` /
+> `global_tpu_utils`** ——那两列已经算好、已过闸门，不需要自己关联。
 
 ```sql
 WITH w AS (
@@ -447,11 +474,13 @@ ORDER BY event_time;
 如果你们的数与我方面板对不上，按顺序检查：
 
 1. **时区。** 所有时间戳是 UTC。日表的 `day` 也按 UTC 切分。
-2. **分母。** 是 `paid_chips` 还是 `scheduled_chips`，见 §5.2 的警告。
+2. **分母。** 是 `paid_chip_hours` 还是 `scheduled_chip_hours`，见 §5.2。
 3. **NULL 当 0。** 见 §5.6 与 §6.3。
 4. **闸门。** 我方面板默认应用了三个覆盖率闸门，日表原始数据没有过滤。
-5. **5 分钟桶汇总回日。** `SUM(chips)/12` 应与日表的 `*_chip_hours` 接近；
-   若差异超过 5%，多半是漏了空桶，见 §6.3。
+5. **宽表汇总回日。** 对同一天，`v_chip_hourly` 的 `SUM(vm_chip_hours)` 应与
+   `v_utilization_daily.vm_chip_hours` 相等（实测逐日吻合到 0.00%）。
+   等价写法 `SUM(vm_slots)/12` 也成立。**不要用 `COUNT(*)/12`** ——
+   一行不再固定代表 5 分钟，历史段一行是一小时，那样会差 12 倍。
 
 对不上请把 SQL 和时间范围发给我们，我们对着同一段数据核。
 

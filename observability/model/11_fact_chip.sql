@@ -73,10 +73,21 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_chip
 PARTITION BY DATE(slot)
 CLUSTER BY chip_id, job_key;
 
+-- The window is a midnight on both sides, not an instant.
+--
+-- The DELETE filters `slot` while the three source CTEs filter `point_time`,
+-- and slot is point_time floored to five minutes. That is the same shape that
+-- duplicated chip_hourly's boundary hour, and it is harmless here only because
+-- the exporter writes points already on five-minute boundaries, so slot equals
+-- point_time and the two predicates are one predicate -- measured over the
+-- window, 0 of 1,432,752 node-accelerator samples are misaligned. That is a
+-- property of the collector, not of this file, and a backfill writing an
+-- unaligned point would turn it into the chip_hourly bug on a 4.6M-row table.
+-- Anchoring both sides to midnight removes the dependency entirely.
 BEGIN TRANSACTION;
 
 DELETE FROM mlobs_core.fact_chip
-WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY);
+WHERE slot >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY));
 
 INSERT INTO mlobs_core.fact_chip
 WITH
@@ -99,7 +110,7 @@ node AS (
     AVG(IF(metric_type LIKE '%/tensorcore_utilization', value, NULL))       AS tensorcore_pct,
     AVG(IF(metric_type LIKE '%/memory_bandwidth_utilization', value, NULL)) AS membw_pct
   FROM mlobs_raw.metric_samples
-  WHERE point_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE point_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
     AND metric_type IN (
       'kubernetes.io/node/accelerator/tensorcore_utilization',
       'kubernetes.io/node/accelerator/memory_bandwidth_utilization')
@@ -136,7 +147,7 @@ duty_inst AS (
     SPLIT(JSON_VALUE(metric_labels, '$.accelerator_id'), '-')[OFFSET(0)] AS instance_id,
     AVG(value) AS duty_pct
   FROM mlobs_raw.metric_samples
-  WHERE point_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  WHERE point_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
     AND metric_type = 'kubernetes.io/node/accelerator/duty_cycle'
   GROUP BY slot, instance_id
 ),
@@ -157,7 +168,7 @@ occupied AS (
             MAKE_INTERVAL(minute => MOD(EXTRACT(MINUTE FROM point_time), 5)) AS slot,
           chip_id, pod_name
         FROM mlobs_core.fact_metric
-        WHERE point_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+        WHERE point_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 4 DAY))
           AND metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
       )
       GROUP BY slot, chip_id, pod_name
