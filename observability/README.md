@@ -420,17 +420,27 @@ flowchart LR
 财务与效能这一整条链路，只有一个测量点，其余都是它的聚合。
 
 ```
-                     采集                        原子事实                 聚合
-  node/accelerator/{tensorcore,duty_cycle,        fact_chip           chip_hourly      ← 客户宽表
-    memory_bandwidth}  每芯片每5分钟一条序列  →  每芯片×5分钟       →  每芯片×小时
-                                                 460万行/35天           1.2万行/天
-                                                        │
-  container/accelerator/tensorcore                      │            fin_work_daily   → fin_daily
-    （只用来判定"这块卡上有谁的作业"）                     └──────────→  每天一行            财务口径
-                                                                       41 行
-  compute/reservation/{reserved,used}  ────────────→  fin_capacity_daily
-    （分母，按预留而非按芯片）                            每预留每天
+        采集（两个分支，同一张原子表）              原子事实                聚合
+  ┌─ metrics_exporter.py ── metric_samples ─┐
+  │    300 秒，实时，2026-08-11 起            │
+  │                                          ├→   fact_chip      →  chip_hourly    ← 客户宽表
+  │  backfill_metrics_hourly.py ─────────────┤    每芯片×一段        每芯片×小时
+  └─   metric_hourly  3600 秒，回补            │    811 万行/188 天     386 万行
+       2026-03-11 .. 2026-08-11               │    interval_s 说明     2.1 万行/天
+                                              │    每行代表多少秒            │
+  container/accelerator/tensorcore ───────────┘                             │
+    判定「这块卡上有谁的作业」，并给出 pod_interval_s       fin_work_daily  ←┘
+                                                            每天一行 188 行
+                                                                  │
+  compute/reservation/{reserved,used} → fin_capacity_daily ───────┴→ fin_daily
+    分母，按预留而非按芯片，252 行                                      财务口径 184 天
 ```
+
+**分辨率是数据的属性，不是代码的假设。** Cloud Monitoring 六周内给 300 秒、
+更早只给 600 秒，所以 `fact_chip` 带 `interval_s`：实时分支写 300，回补分支写
+3600。所有下游一律按 `pct/100 × interval_s/3600` 加权。**数行数在只有一种分辨率
+时是对的，第二种到达的那一刻会把历史的每个分子砍掉 12 分之 11，而且不报错。**
+`pod_interval_s` 同理——回补段一小时里 Pod 只占了一半就记一半，不把整小时算上。
 
 **为什么加速器指标取 node 级而非容器级。** node 级每块物理芯片一条序列，
 无论上面有没有 Pod 都上报。三个后果：
@@ -539,6 +549,13 @@ JobSet **65 → 201**。
 | `metrics_exporter.py` | tensorcore、log_entry_count、goodput/badput/elapsed/disruptions、reservation reserved+used | 这些是指标不是日志。`log_entry_count` 零成本检测日志风暴；reservation 两个是财务口径唯一的分母来源 |
 | `mldiag_poller.py` | ML run、monitored event、analyzer 判定 | 只有 REST，`gcloud` 无 `mldiagnostics` 命令组。支持多 region |
 | **Cloud Asset Inventory** | node pool 的**配置历史**（35 天） | 唯一能回溯已删除资源配置的通道。日志记录的是「发生了什么」，它记录的是「当时长什么样」——两者不能互相替代，详见 4.6.1 |
+| **Log Analytics 定向抽取** | Kueue 准入决策（`00d_kueue_admission.sql`） | sink **结构上无法**承载这批日志：Kueue 把 `clusterQueue` 等字段同时以标量和对象两种形态发出，推断出的 BigQuery schema 必然拒绝其中一种。那边 `json_payload` 是原生 JSON 列，类型差异变成读时的一个 `COALESCE`。每天扫 22.5 GiB，约 $4/月 |
+
+**第六条是被迫开的，不是设计出来的。** 在它之前，`fact_event` 每天有一万六千行
+kueue 记录，而「作业为什么在排队」这个问题一条都答不了——对账类的流水全部到齐，
+准入决策 **100% 丢失**。表看起来很健康，这正是它一直没被发现的原因。教训是：
+**一条链路的行数正常，不等于它承载的语义完整。**
+
 
 #### 4.8.1 资源配置不在日志里：一次找错层级的教训
 
