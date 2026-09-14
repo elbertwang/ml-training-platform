@@ -90,7 +90,10 @@ WITH raw AS (
     COALESCE(l.text_payload, JSON_VALUE(l.json_payload, '$.message')) AS msg
   FROM mlobs_core.v_sink_logs l
   WHERE l.timestamp >= step_window_start AND l.timestamp < step_window_end
-    AND l.log_id IN ('stdout', 'stderr')
+    -- step_lines_backfill carries the same lines lifted out of the linked
+    -- dataset for the period before the sink existed; see
+    -- collect/backfill_step_lines.sh. Empty until that has been run.
+    AND l.log_id IN ('stdout', 'stderr', 'step_lines_backfill')
     AND COALESCE(l.text_payload, JSON_VALUE(l.json_payload, '$.message'))
         LIKE '%completed step%'
 ),

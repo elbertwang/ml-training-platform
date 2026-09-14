@@ -64,8 +64,60 @@ DEFAULT_DATASET = os.environ.get("MLOBS_RAW_DATASET", "mlobs_raw")
 # memory_used and duty_cycle were exported for a while and read by nothing; they
 # are now displayed straight from Cloud Monitoring and no longer copied.
 METRICS = [
+    # ---- node-scoped accelerator metrics: the chip-level source of truth ----
+    #
+    # One series per physical chip, keyed on node_name and accelerator_id, and
+    # emitted whether or not a pod is scheduled. That single property is what
+    # the container-scoped equivalents cannot provide:
+    #
+    #   * they cover every chip the fleet has running, so the count of series IS
+    #     the scheduled chip count -- 512 series across 128 nodes, exactly four
+    #     per node at every point sampled over four months;
+    #   * a chip nobody is using still reports, at 0%, instead of vanishing from
+    #     the average. 36 chips on 9 nodes read exactly 0.00% while running no
+    #     workload at all;
+    #   * one chip yields one reading. The container metric attributes a chip to
+    #     whichever container claims it, so a pod handover briefly produces two
+    #     series for one piece of silicon.
+    #
+    # Where a chip carries a single container series the two scopes agree to the
+    # decimal -- 180 chips compared, median difference 0.0000pp. They diverge
+    # only across handovers, and there the node figure is the physical one.
+    #
+    # accelerator_id is <gce-instance-id>-<0..3> here, the same spelling the
+    # container metrics use, so job attribution joins directly.
+    #
+    # These do NOT flow into fact_metric: that table exists to join metrics to
+    # dim_pod by pod_name, and these carry a node instead. They are read from
+    # mlobs_raw.metric_samples and joined to dim_node_pool by node name.
+    ("kubernetes.io/node/accelerator/tensorcore_utilization",
+     "k8s_node", 300, "ALIGN_MEAN"),
+    ("kubernetes.io/node/accelerator/duty_cycle",
+     "k8s_node", 300, "ALIGN_MEAN"),
+    # Memory bandwidth is the missing third dimension. duty_cycle says the chip
+    # was busy and tensorcore says how much arithmetic it issued; when the first
+    # is high and the second low the work is stalled on something, and this is
+    # what distinguishes memory-bound from communication-bound.
+    ("kubernetes.io/node/accelerator/memory_bandwidth_utilization",
+     "k8s_node", 300, "ALIGN_MEAN"),
+
     # goodput input; joins to dim_pod
     ("kubernetes.io/container/accelerator/tensorcore_utilization",
+     "k8s_container", 300, "ALIGN_MEAN"),
+    # The layer between "a pod is on the chip" and "the TensorCore is issuing
+    # ops". duty_cycle is time-based -- percent of the sample period the
+    # accelerator was actively processing -- while tensorcore_utilization is
+    # throughput-based, ops performed over ops supported. A chip can therefore
+    # be busy every second and still use a quarter of its arithmetic, and that
+    # gap is a different kind of waste from an idle chip: measured live on
+    # 2026-09-05, duty_cycle ran a median of 100.0 against tensorcore's 24.8.
+    #
+    # It was collected once before and dropped from this list; the orphaned rows
+    # it left in metric_samples span 2026-08-23 20:12 to 08-24 06:52 and are
+    # wrong -- they average 3.77% where tensorcore averages 49% over the same
+    # chips, which is not physically possible. Do not reason from them; they
+    # predate this entry and should be deleted rather than trusted.
+    ("kubernetes.io/container/accelerator/duty_cycle",
      "k8s_container", 300, "ALIGN_MEAN"),
     # log-storm events on the fact_event timeline; joins to dim_pod
     ("logging.googleapis.com/log_entry_count",
@@ -128,18 +180,44 @@ METRICS = [
 # come from Kubernetes events instead, which fact_event already collects.
 
 
-def access_token() -> str:
-    """ADC token. CLOUDSDK_AUTH_ACCESS_TOKEN wins when set -- inside the Cloud
-    Run refresh job the entrypoint exports one metadata-server token for the
-    whole run, which avoids a ~1.3s gcloud call and matches what bq already
-    reads."""
-    env = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN")
-    if env:
-        return env
-    return subprocess.run(
+_TOKEN: tuple[str, float] | None = None
+# Access tokens last an hour. Refresh well inside that, because the failure is
+# not graceful: a 90-day backfill ran 55 minutes, hit HTTP 401 on the next
+# fetch, and took every chunk it had gathered down with it. A normal run is
+# minutes long and never reaches this.
+_TOKEN_MAX_AGE_S = 40 * 60
+
+
+def access_token(force: bool = False) -> str:
+    """ADC token, refreshed when it is old enough to be a risk.
+
+    CLOUDSDK_AUTH_ACCESS_TOKEN wins when set -- inside the Cloud Run refresh job
+    the entrypoint exports one metadata-server token for the whole run, which
+    avoids a ~1.3s gcloud call and matches what bq already reads. That job's
+    task timeout is under an hour, so its token cannot expire mid-run; a
+    long-running backfill from a workstation can, and does.
+    """
+    global _TOKEN
+    if not force and _TOKEN and time.time() - _TOKEN[1] < _TOKEN_MAX_AGE_S:
+        return _TOKEN[0]
+    # Only on the very first call. After that the variable holds whatever this
+    # function last wrote into it, so reading it back returns the token that
+    # just expired and the refresh below can never run -- which is exactly how
+    # the first attempt at this fix still died of HTTP 401 after 40 minutes.
+    if _TOKEN is None and not force:
+        env = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+        if env:
+            _TOKEN = (env, time.time())
+            return env
+    fresh = subprocess.run(
         ["gcloud", "auth", "application-default", "print-access-token"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
+    # bq reads the same variable, so refreshing it keeps the loader alive too --
+    # otherwise the fetch would recover and the write would start failing.
+    os.environ["CLOUDSDK_AUTH_ACCESS_TOKEN"] = fresh
+    _TOKEN = (fresh, time.time())
+    return fresh
 
 
 def fetch_series(token, project, metric_type, resource_type,
@@ -277,7 +355,23 @@ def main():
                  + ", ".join(m[0] for m in METRICS))
 
     token = access_token()
-    end_dt = dt.datetime.now(dt.timezone.utc)
+    # Snap the window to a 300s boundary so every run produces points at the
+    # same wall-clock instants.
+    #
+    # Cloud Monitoring aligns output to the interval start, so a window opening
+    # at an arbitrary second puts that run's points on an arbitrary phase.
+    # Observed 2026-09-10: one run emitted every sample at :49 past (phase 169),
+    # the previous run at phase 186. Within a run the spacing is exactly 300s
+    # and all metrics share a timestamp, so nothing was wrong -- until you
+    # bucket by wall clock, where a shifting phase gives a five-minute bucket
+    # zero points at one boundary and two at the next.
+    #
+    # Snapping also makes re-collection idempotent by construction: a backfill
+    # and the live collector covering the same period now produce identical
+    # timestamps, so clear-then-load replaces rows instead of laying a second
+    # phase alongside the first.
+    end_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    end_dt -= dt.timedelta(seconds=end_dt.timestamp() % 300)
     start_dt = end_dt - dt.timedelta(hours=args.hours)
     ingested_at = end_dt.isoformat()
     iso = lambda d: d.isoformat().replace("+00:00", "Z")
@@ -302,9 +396,18 @@ def main():
         # idempotent and partial progress survives.
         while cursor < end_dt:
             chunk_end = min(cursor + dt.timedelta(hours=args.chunk_hours), end_dt)
+            token = access_token()          # refreshes itself when stale
             series = fetch_series(
                 token, args.project, metric_type, resource_type,
-                cursor.isoformat().replace("+00:00", "Z"),
+                # One second before the cursor. Cloud Monitoring treats a
+                # TimeInterval as (startTime, endTime] -- the start is
+                # exclusive -- so a request for [T, T+1h] never returns the
+                # sample at exactly T. clear_window deletes the closed range
+                # including T, so every run destroyed the boundary sample and
+                # could not reload it. With a 30-minute cadence and a one-hour
+                # window the boundaries land on :00 and :30, and those were
+                # exactly the buckets missing: 48 of 288 a day, 17%.
+                (cursor - dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                 chunk_end.isoformat().replace("+00:00", "Z"),
                 alignment, aligner)
             rows = to_rows(series, metric_type, ingested_at)

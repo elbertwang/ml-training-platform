@@ -64,10 +64,25 @@ SINK_NAME="${SINK_NAME:-mlobs-selective}"
 #   cloudaudit system_event  Google-initiated VM actions:
 #                        compute.instances.repair.recreateInstance is node
 #                        auto-repair, migrateOnHostMaintenance is live migration
+#   Config param tensorboard_dir
+#                        Where the run writes TensorBoard, logged once per pod
+#                        at startup. MaxText composes it as
+#                        <base_output_directory>/<run_name>/tensorboard/ and
+#                        neither part is derivable from anything else held here:
+#                        jobset falcon-job-vhweixfuz5 runs run_name
+#                        fused-moe-r196-pass-16l-fsdp128-state-capture, and the
+#                        bucket differs by pipeline. Taking the composed value
+#                        also survives MaxText changing how it composes.
+#                        One line per pod per run, noise against ~1.8M rows/day.
+#
+#                        NOTE the filter language has no comments -- every line
+#                        inside FILTER is an expression. A '#' in there fails
+#                        with 'Unparseable filter', which is how this was found.
 FILTER='
 (
   jsonPayload.message:"completed step"
   OR textPayload:"completed step"
+  OR textPayload:"Config param tensorboard_dir"
   OR severity>=ERROR
   OR log_id("events")
   OR log_id("container.googleapis.com/cluster-autoscaler-visibility")

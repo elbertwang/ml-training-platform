@@ -52,14 +52,31 @@ if [[ -n "${CLOUD_RUN_EXECUTION:-}" && -n "${CLOUD_RUN_JOB:-}" ]]; then
 import json, os, sys
 me = os.environ["CLOUD_RUN_EXECUTION"]
 execs = json.load(sys.stdin).get("executions", [])
-# A missing completionTime is the only signal that an execution is still
-# going. Do NOT also require `reconciling` to be false: reconciling is True
-# precisely while a run is in flight, so filtering on it excludes the very
-# executions this check exists to find. That inversion is why an earlier
-# version of this guard never fired.
-print(" ".join(e["name"].rsplit("/", 1)[-1] for e in execs
-                if e["name"].rsplit("/", 1)[-1] != me
-                and not e.get("completionTime")))')
+by_name = {e["name"].rsplit("/", 1)[-1]: e for e in execs}
+
+# Yield only to executions that started BEFORE me.
+#
+# Deferring to any other running execution is not mutual exclusion, it is mutual
+# deference: on 2026-09-08 a manual run and the scheduled run started together,
+# each saw the other, each skipped, and the refresh did not happen at all. The
+# log read "skip: another execution is already running" twice and exit(0) twice,
+# which is indistinguishable from healthy. createTime breaks the tie so exactly
+# one proceeds, and the name breaks an exact createTime tie.
+#
+# A missing completionTime is the only signal that an execution is still going.
+# Do NOT also require `reconciling` to be false: reconciling is True precisely
+# while a run is in flight, so filtering on it excludes the very executions this
+# check exists to find. That inversion is why an earlier version never fired.
+#
+# If I cannot find myself in the page, I proceed. Two writers is the lesser
+# failure -- every window swap is transactional, so the loser fails on
+# serialisation and retries next tick -- whereas nobody running is silent.
+mine = by_name.get(me)
+my_key = ((mine or {}).get("createTime", ""), me)
+print(" ".join(sorted(
+    n for n, e in by_name.items()
+    if n != me and not e.get("completionTime")
+    and (e.get("createTime", ""), n) < my_key)))')
     echo "overlap check: me=${CLOUD_RUN_EXECUTION} others_running=[${RUNNING}]"
     if [[ -n "${RUNNING// /}" ]]; then
       # Exit 0, not 1 -- a skipped run is normal operation, not a failure, and

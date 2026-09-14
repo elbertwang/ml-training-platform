@@ -774,6 +774,70 @@ FROM `{project}.mlobs_core.job_attempts`('${{job_key}}')""")],
 RUNNING_WINDOW_MIN = 45
 
 
+def _logs_url_expr(project):
+    """SQL for a Cloud Logging deep link scoped to one job.
+
+    **Indexed fields only.** Cloud Logging indexes resource.type,
+    resource.labels.*, logName, severity and timestamp; anything under
+    jsonPayload or protoPayload is not, and an OR reaching into those degrades
+    to a scan of the project's ~709M lines a day. Measured 2026-09-09 on one
+    job: pod_name alone answered in 1.4s, the same query OR-ed with
+    jsonPayload.involvedObject.name and protoPayload.resourceName had not
+    finished at 240s.
+
+    That constraint is also the reason the platform channels -- events,
+    autoscaler, TPU runtime, audit, maintenance -- are answered from
+    fact_event in Grafana rather than linked to here. They cannot be filtered
+    by job in Cloud Logging at any usable speed, and at ~153k lines a day the
+    sink holds effectively all of them. The container logs are the mirror
+    image: 709M lines a day, of which the sink keeps 0.8%, but pod_name is
+    indexed so a link costs nothing.
+
+    The window is the run plus five minutes either side. The lines worth
+    reading -- the crash, the OOM, the preemption notice -- cluster at the
+    edges, and a link opening exactly on first_seen cuts them off.
+    """
+    return ("CONCAT(\n"
+            "    'https://console.cloud.google.com/logs/query;query=',\n"
+            "    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(\n"
+            "      CONCAT('resource.labels.pod_name:\"', job_key, '\"',\n"
+            "             CHR(10),\n"
+            "             'resource.labels.cluster_name=\"', cluster_name, '\"'),\n"
+            "      '%', '%25'), ':', '%3A'), '=', '%3D'), '\"', '%22'), CHR(10), '%0A'),\n"
+            "    ';timeRange=',\n"
+            "    FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', TIMESTAMP_SUB(first_seen, INTERVAL 5 MINUTE)),\n"
+            "    '%2F',\n"
+            "    FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', TIMESTAMP_ADD(last_seen, INTERVAL 5 MINUTE)),\n"
+            f"    '?project={project}')")
+
+
+def _tensorboard_override():
+    """Turn run_name into a link to the run TensorBoard directory, and keep the
+    two URL columns out of the table.
+
+    Data links rather than visible URL columns: the console URLs run past 120
+    characters and would push every other column off screen. run_name is worth
+    showing on its own -- it is what the training process calls itself, and it
+    is NOT the job name (jobset falcon-job-vhweixfuz5 runs
+    fused-moe-r196-pass-16l-fsdp128-state-capture).
+    """
+    return [
+        {"matcher": {"id": "byName", "options": "run_name"},
+         "properties": [{
+             "id": "links",
+             "value": [{
+                 "title": "打开 TensorBoard 目录（GCS）",
+                 "url": "${__data.fields.tensorboard_url}",
+                 "targetBlank": True,
+             }],
+         }]},
+        {"matcher": {"id": "byName", "options": "tensorboard_url"},
+         "properties": [{"id": "custom.hidden", "value": True}]},
+        {"matcher": {"id": "byName", "options": "logs_url"},
+         "properties": [{"id": "custom.hidden", "value": True}]},
+    ]
+
+
 def _job_link_override(field="job_key"):
     """Make the job name a link into the per-job dashboard.
 
@@ -789,6 +853,13 @@ def _job_link_override(field="job_key"):
                 "title": "打开该 job 的面板",
                 "url": "/d/mlobs-job?var-job_key=${__data.fields." + field + "}"
                        "&from=${__from}&to=${__to}",
+            }, {
+                # The escape hatch. Grafana holds 0.8% of this project's log
+                # lines by design; the INFO and WARNING context around a
+                # failure only ever exists in Cloud Logging.
+                "title": "在 Cloud Logging 看原始日志（含 INFO/WARNING）",
+                "url": "${__data.fields.logs_url}",
+                "targetBlank": True,
             }],
         }],
     }
@@ -798,6 +869,10 @@ def build_index(project):
     """The job index: what is running now, and everything that ran before."""
     panels = []
     y = 0
+
+    # Built once; both job tables embed it. It reads job_key, cluster_name,
+    # first_seen and last_seen straight out of job_hub.
+    logs_url = _logs_url_expr(project)
 
     common_overrides = [
         _job_link_override(),
@@ -811,7 +886,7 @@ def build_index(project):
                  {"color": STATUS["good"], "value": 60}]}}]},
         {"matcher": {"id": "byName", "options": "peak_chips"},
          "properties": [{"id": "custom.align", "value": "right"}]},
-    ]
+    ] + _tensorboard_override()
 
     panels.append({"type": "row", "title": "运行中 Current", "collapsed": False,
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
@@ -821,7 +896,7 @@ def build_index(project):
         "type": "table", "title": "运行中的 job",
         "description": f"最近 {RUNNING_WINDOW_MIN} 分钟内仍有日志的 job。"
                        "点 job 名进入该 job 的面板。按占用芯片数排序 —— "
-                       "出问题时先看大的。",
+                       "出问题时先看大的。\n\n`run_name` 是训练进程自称的名字，**不等于 job 名**（jobset `falcon-job-vhweixfuz5` 跑的是 `fused-moe-r196-…`）；点它打开该 run 的 TensorBoard 目录。\n\n该路径取自训练启动时打印的 `Config param tensorboard_dir`，是这次运行**声明**要写的位置，不代表一定写出了数据 —— 早期失败的 run 会留下一个空路径。实测 16 个 run 里 5 个有内容。\n\n看的时候直接 `tensorboard --logdir <该路径>`：MaxText 的标量写在它下面再嵌一层 `<run_name>/`，profiler 写在 `plugins/` 下，指到这一层两者都能读到。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
         "datasource": DS,
         "targets": [sql(f"""SELECT
@@ -833,9 +908,18 @@ def build_index(project):
   TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), first_seen, MINUTE) AS running_min,
   goodput_pct,
   attempts,
+  a.run_name,
+  a.tensorboard_url,
+  {logs_url} AS logs_url,
   owner,
   job_family
 FROM `{project}.mlobs_core.job_hub`
+-- Only the two columns the table shows. Joining the whole dimension
+-- brings its own first_seen/last_seen into scope and every bare
+-- reference to them in this SELECT becomes ambiguous -- which is a
+-- query error, not a silent wrong answer, but only at run time.
+LEFT JOIN (SELECT job_key, run_name, tensorboard_url
+           FROM `{project}.mlobs_core.dim_job_artifact`) a USING (job_key)
 WHERE last_seen > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {RUNNING_WINDOW_MIN} MINUTE)
 ORDER BY peak_chips DESC, first_seen DESC""")],
         "options": {"showHeader": True, "cellHeight": "sm"},
@@ -857,7 +941,8 @@ ORDER BY peak_chips DESC, first_seen DESC""")],
     panels.append({
         "type": "table", "title": "历史 job（按开始时间倒序）",
         "description": "已结束的 job，最新的在最上面。`ended` 是最后一条日志的时间，"
-                       "不是退出码 —— 平台读的是日志与事件，没有作业的返回状态。",
+                       "不是退出码 —— 平台读的是日志与事件，没有作业的返回状态。"
+                       "\n\n`run_name` 是训练进程自称的名字，**不等于 job 名**（jobset `falcon-job-vhweixfuz5` 跑的是 `fused-moe-r196-…`）；点它打开该 run 的 TensorBoard 目录。\n\n该路径取自训练启动时打印的 `Config param tensorboard_dir`，是这次运行**声明**要写的位置，不代表一定写出了数据 —— 早期失败的 run 会留下一个空路径。实测 16 个 run 里 5 个有内容。\n\n看的时候直接 `tensorboard --logdir <该路径>`：MaxText 的标量写在它下面再嵌一层 `<run_name>/`，profiler 写在 `plugins/` 下，指到这一层两者都能读到。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 16},
         "datasource": DS,
         "targets": [sql(f"""SELECT
@@ -872,9 +957,18 @@ ORDER BY peak_chips DESC, first_seen DESC""")],
   goodput_pct,
   attempts,
   ROUND(est_usd, 0) AS est_usd,
+  a.run_name,
+  a.tensorboard_url,
+  {logs_url} AS logs_url,
   owner,
   job_family
 FROM `{project}.mlobs_core.job_hub`
+-- Only the two columns the table shows. Joining the whole dimension
+-- brings its own first_seen/last_seen into scope and every bare
+-- reference to them in this SELECT becomes ambiguous -- which is a
+-- query error, not a silent wrong answer, but only at run time.
+LEFT JOIN (SELECT job_key, run_name, tensorboard_url
+           FROM `{project}.mlobs_core.dim_job_artifact`) a USING (job_key)
 WHERE last_seen <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {RUNNING_WINDOW_MIN} MINUTE)
 ORDER BY first_seen DESC""")],
         "options": {"showHeader": True, "cellHeight": "sm",
@@ -1060,27 +1154,99 @@ TPU_FINANCE_DEFINITIONS = """
 | `scheduled_chip_hours` | ∫ 已交付芯片数 dt | `compute.googleapis.com/reservation/used` |
 | `pod_chip_hours` | Σ(5 分钟 × 有 Pod 的芯片) | 容器加速器指标的样本数 |
 | `stepping_chip_hours` | Σ(step 墙钟秒 × 该 step 的芯片数) | 训练日志解析出的每步记录 |
+| `duty_chip_hours` | Σ(加速器处理时间占比 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/duty_cycle` |
 | `busy_chip_hours` | Σ(张量核占用率 ÷ 100 × 5 分钟 × 芯片) | `container/accelerator/tensorcore_utilization` |
 | `flops_chip_hours` | Σ(实测 TFLOP/s ÷ 峰值 TFLOP/s × step 秒 × 芯片) | 训练日志 + 芯片峰值表（bf16） |
 
 ### 产能漏斗
 
-五个层级依次收窄，均以 `paid_chip_hours` 为分母。**相邻两层之差即该环节的损耗**，
-读法是从上往下找最大的那一刀。
+四个层级依次收窄，均以 `paid_chip_hours` 为分母。**相邻两层之差即该环节的损耗**，
+读法是找最大的那一刀。落差幅度取自近 30 天。
 
-| 层级 | 公式 | 落差代表什么 |
+| 层级 | 公式 | 落差代表什么 | 平均落差 |
+|---|---|---|---|
+| A 已调度给 VM | `scheduled ÷ paid` | 预留了但没建出节点 | 5.7pp |
+| B 节点上有 Pod | `pod ÷ paid` | 节点空转，没有带 TPU 的 Pod 被调度上去 | 23.0pp |
+| C 卡被占用在跑 | `duty ÷ paid` | **Pod 挂着但卡是空的**：等数据、等同伴、卡死 | **40.4pp** |
+| D 张量核忙 | `busy ÷ paid` | 在跑但没做密集算术：数据加载、集合通信、访存受限算子 | 17.4pp |
+
+**漏斗用 A–E，大盘用 ①–④，两套记号刻意不同**——它们不是同一组东西，
+混用同一种编号会让「②」在两个面板上指向两件事。对应关系是
+① = A、② = B、③ = D、④ = E；漏斗的 C「卡被占用在跑」不在大盘上，
+而它恰好是最大的一道落差所在：B→C 这一刀，四成的已付费产能 Pod 已经调度上去了
+但卡没在执行。
+
+#### 为什么 `stepping_chip_hours` 不是一层
+
+它曾经是，被撤掉了。`stepping` 由训练日志里 step 的墙钟时间算出，`duty` 由加速器
+agent 的占用信号算出，两条链路毫不相干——而近 30 天它们分别是 30.9% 和 30.8%，
+**落差 0.1pp、标准差 1.7pp**，是唯一一个落差小于自身波动的层级。其余五道落差都在
+5.7–40.4pp 之间。
+
+一个稳定为零的落差不构成损耗类别，只会稀释「每一层落差都是一类损耗」这个读法。
+它的真正含义是个**结论**而不是一层：卡只要在执行，执行的基本就是训练迭代，
+「忙但不在训练」（启动、编译、加载 checkpoint）这一类浪费小到测不出来。
+
+`stepping_chip_hours` 仍然保留在 `fin_daily` 与 `fin_export` 中，用作 C 的独立互校；
+选 `duty` 而非 `stepping` 做柱子，是因为 `duty` 覆盖所有上报加速器指标的 pod，
+而 `stepping` 依赖 MaxText 的日志格式，会漏掉非 MaxText 的负载。
+
+### TPU 资源效能：四个口径
+
+同一批芯片小时，换分母就是不同的问题。**全局**口径的分母是 reservation（买下的
+全部产能），**细粒度**口径的分母是已开出 VM 的那部分。
+
+| 指标 | 定义 | 公式 |
 |---|---|---|
-| ① 已调度给 VM | `scheduled ÷ paid` | 预留了但没建出节点 |
-| ② 节点上有 Pod | `pod ÷ paid` | 节点空转，没有带 TPU 的 Pod 被调度上去 |
-| ③ 在跑训练步 | `stepping ÷ paid` | Pod 在但没训练：启动与编译、加载 checkpoint、卡住、非训练用途的 Pod |
-| ④ 张量核忙 | `busy ÷ paid` | 训练过程中的等待：数据加载、集合通信、迭代间隙 |
-| ⑤ 满速等效 | `flops ÷ paid` | 算得慢：kernel 效率、并行策略、显存带宽受限 |
+| `global_allocate_rate` 全局使用率 | 有 Pod 调度的比例，分母是 reservation | `pod_chip_hours ÷ paid_chip_hours` |
+| `global_tpu_utils` 全局利用率 | VM 利用率均值 × reservation 使用率 | `duty_chip_hours ÷ paid_chip_hours` |
+| `tpu_allocate_rate_in_vm` 使用率 | 开了 VM 的集合中，有多少调度了 Pod | `pod_chip_hours ÷ vm_chip_hours` |
+| `tpu_utils_in_vm` 利用率 | 开了 VM 的利用率均值 | `duty_chip_hours ÷ vm_chip_hours` |
 
-其中 ① ④ ⑤ 分别就是上文的预留占用率、卡利用率、MFU；② ③ 是把它们之间的落差拆开，
-用于定位损耗发生在哪一环。
+全局口径的定义是两项相乘，公式写成单一比值，两者等价——`scheduled` 约掉了：
 
-一个典型读数：若 ① 接近 100% 而 ③ 只有三成左右，说明产能已经买下并交付，
-但大部分时间没有真正在训练 —— 此时优化 kernel 效率（⑤）收益有限，
+```
+global_tpu_utils = tpu_utils_in_vm × 预留占用率
+                 = (duty ÷ vm)     × (vm ÷ paid)
+                 = duty ÷ paid
+```
+
+两个全局口径同分母，可以互相相减，也可以和 ① 预留占用率相减；
+两个细粒度口径分母是 `vm_chip_hours`，**与全局口径不可混比**。
+
+大盘上的 ② ③ 是两个全局口径。细粒度两个等于全局口径除以 ①，从页面现有数字即可
+推出，因此不单独占磁贴。
+
+### 数据来源
+
+| 量 | 含义 | 采集 |
+|---|---|---|
+| `paid_chip_hours` | 预留买下的芯片 | `compute.googleapis.com/reservation/reserved` 按时间积分 |
+| `vm_chip_hours` | 开出了节点的芯片 | `kubernetes.io/node/accelerator/*` 的序列数按时间积分 |
+| `pod_chip_hours` | 承载了 Pod 的芯片 | 容器加速器指标点名了该芯片的时段 |
+| `duty_chip_hours` | 在执行指令的芯片 | `node/accelerator/duty_cycle` |
+| `busy_chip_hours` | 张量核在发指令的芯片 | `node/accelerator/tensorcore_utilization` |
+| `membw_chip_hours` | HBM 带宽占用 | `node/accelerator/memory_bandwidth_utilization` |
+
+**加速器指标取 node 级而非容器级**：node 级每块物理芯片一条序列，无论上面有没有
+Pod 都上报。这带来三件事——空闲的芯片计为 0% 而不是从平均里消失；序列数本身就是
+已开出的芯片数，可作分母；一块芯片始终只有一个读数。`vm_chip_hours` 与
+`reservation/used` 由两套互不相干的系统测得，逐小时吻合。
+
+`membw_chip_hours` 是区分停顿类型的依据：`duty` 高而 `busy` 低说明卡在等，
+带宽占用则说明它等的是 HBM 还是网络。
+
+#### `funnel_monotonic`
+
+四个层级由三套互不相干的测量系统产生（预留指标、加速器 agent、训练日志），
+没有任何机制保证第 N 层一定低于第 N−1 层。出现交叉的日子是**测量故障**而非发现，
+该列标记这种日子，漏斗把它们剔除而不是平均进去。2026-08-22 就是一例：
+那天 71.4% 的 `duty_cycle` 采样为 0 而 `tensorcore` 只有 56.1%，
+两者却都覆盖了全部 24 小时，所以不是采集缺口。该列同时出现在 `fin_export` 中，
+下游可以看到哪些天被剔除以及为什么。
+
+一个典型读数：若 A 接近 100% 而 C 只有三成左右，说明产能已经买下并交付，
+但大部分时间卡上没在执行 —— 此时优化 kernel 效率收益有限，
 应先看排队、启动耗时与任务衔接。
 
 ### 比率（分母统一为 `paid_chip_hours`）
@@ -1171,52 +1337,146 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
         }
 
     panels += [
-        num("① 预留占用率", 0, 6, "v",
-            "ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2)",
-            "percent", 2,
+        # A gauge, not a stat. This one has a natural full scale -- you cannot
+        # schedule more than you reserved -- so a needle against a fixed 0-100
+        # says "how close to fully deployed" at a glance, which a bare number
+        # does not. The ratios below have no such ceiling in practice and stay
+        # as numbers.
+        {"type": "gauge", "title": "① 预留占用率", "datasource": DS,
+         "gridPos": {"x": 0, "y": y, "w": 5, "h": 5},
+         "description":
             "**公式** scheduled_chip_hours ÷ paid_chip_hours\n\n"
             "买下的产能有多少交付给了 VM。分子分母都对预留量按时间积分，"
-            "而不是读某一刻的值 —— 预留规模会变，读瞬时值会把它触及的每一天都算错。",
-            [{"color": STATUS["critical"], "value": None},
-             {"color": STATUS["warning"], "value": 70},
-             {"color": STATUS["good"], "value": 90}]),
-        num("② 卡利用率", 6, 6, "v",
-            "ROUND(100*SAFE_DIVIDE(SUM(busy_chip_hours),SUM(paid_chip_hours)),2)",
+            "而不是读某一刻的值 —— 预留规模会变，读瞬时值会把它触及的每一天都算错。\n\n"
+            "大盘用 ①–④，下方漏斗用 A–E，是两套记号：本指标对应漏斗的 A。",
+         "targets": [sql(f"""SELECT
+  ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2) AS v
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9""")],
+         "options": {"reduceOptions": {"calcs": ["lastNotNull"],
+                                       "fields": "/^v$/", "values": False},
+                     "showThresholdMarkers": True, "showThresholdLabels": False},
+         "fieldConfig": {"defaults": {
+             "unit": "percent", "decimals": 2, "min": 0, "max": 100,
+             "thresholds": {"mode": "absolute", "steps": [
+                 {"color": STATUS["critical"], "value": None},
+                 {"color": STATUS["warning"], "value": 70},
+                 {"color": STATUS["good"], "value": 90}]},
+         }, "overrides": []}},
+        # The two chip counts the gauge is a ratio of. A percentage alone does
+        # not say whether 94% is 94% of 512 chips or of 64, and the reservation
+        # is resized often enough that the reader cannot carry the denominator
+        # in their head.
+        {"type": "stat", "title": "已调度 / 已预留（芯片，最新一天）", "datasource": DS,
+         "gridPos": {"x": 5, "y": y, "w": 4, "h": 5},
+         "description":
+            "**取区间内最后一个完整日，不是区间平均。**\n\n"
+            "预留规模是阶跃变化的，跨越一次调整去取平均会得到一个从未成立过的数字。"
+            "实测：`3615901865426835680` 在 08-31 由 512 缩到 384，"
+            "`2877059003882016695` 的 128 张卡在 09-02 才创建 —— 两者相加"
+            "09-04 起重新是 512，而这 30 天的平均是 503，那一天都不曾是真的。\n\n"
+            "芯片数由芯片小时还原：`chip_hours ÷ (24 × day_coverage)`。"
+            "除数带 `day_coverage` 而不是直接按整天摊，否则采集有中断的日子会被压低。\n\n"
+            "左侧表盘是**区间**的占用率，本磁贴是**最新一天**的绝对值，"
+            "两者在预留刚调整过的区间里对不上是正常的。",
+         "targets": [sql(f"""SELECT CONCAT(
+    CAST(ROUND(SAFE_DIVIDE(scheduled_chip_hours, 24*day_coverage)) AS INT64),
+    ' / ',
+    CAST(ROUND(SAFE_DIVIDE(paid_chip_hours,      24*day_coverage)) AS INT64)
+  ) AS v
+FROM {fin}
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND day_coverage >= 0.9
+ORDER BY day DESC
+LIMIT 1""")],
+         "options": {"reduceOptions": {"calcs": ["lastNotNull"],
+                                       "fields": "/^v$/", "values": False},
+                     "textMode": "auto", "colorMode": "none", "graphMode": "none"},
+         "fieldConfig": {"defaults": {}, "overrides": []}},
+        num("② 全局使用率 global_allocate_rate", 9, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),SUM(paid_chip_hours)),2)",
             "percent", 2,
-            "**公式** busy_chip_hours ÷ paid_chip_hours\n\n"
-            "busy = Σ(tensorcore% ÷ 100 × 300 秒 × 芯片数)，仅统计预留产能。\n\n"
-            "分母是**已付费的全部产能**，不是「有指标上报的芯片」。空闲的预留芯片"
-            "没有 pod、因而没有容器指标，它在这里计为 0 而不是被排除 —— "
-            "财务口径下没跑东西的产能一样要付钱。\n\n"
-            "这个数偏低通常不代表芯片效率差，而是产能没被用起来。"
-            "下面的「产能漏斗」逐层显示流失在哪一环。",
+            "**定义** 有 Pod 调度的芯片占预留产能的比例。\n\n"
+            "**公式** `global_allocate_rate = pod_chip_hours ÷ paid_chip_hours`\n\n"
+            "分子按芯片逐个判定：某块芯片在某个 5 分钟窗口里被容器加速器指标点名，"
+            "就算它当时承载了 Pod。分母是预留买下的全部产能。\n\n"
+            "它与 ① 的落差是「节点建起来了却没派上活」。\n\n"
+            "同分子换分母即 `tpu_allocate_rate_in_vm`（除以已开出 VM 的产能），"
+            "两者之比就是 ①。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 50},
+             {"color": STATUS["good"], "value": 80}],
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+        num("③ 全局利用率 global_tpu_utils", 14, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours),SUM(paid_chip_hours)),2)",
+            "percent", 2,
+            "**定义** VM 利用率均值 × reservation 使用率。\n\n"
+            "**公式** `global_tpu_utils = duty_chip_hours ÷ paid_chip_hours`\n\n"
+            "与定义等价：`(duty ÷ scheduled) × (scheduled ÷ paid)` 中 `scheduled` "
+            "约掉，左项即 `tpu_utils_in_vm`，右项即 ①。写成单一比值是为了与 ①②"
+            "共用分母，可直接相减。\n\n"
+            "**「利用率」指 `duty_cycle`**：加速器有多少比例的时间在执行指令，"
+            "按芯片逐个采集，与既有口径一致。张量核吞吐是另一个量，"
+            "见漏斗 D 层。\n\n"
+            "分母是**已付费的全部产能**。空闲的预留芯片同样计入分母，"
+            "因为没跑东西的产能一样要付钱。",
             [{"color": STATUS["critical"], "value": None},
              {"color": STATUS["warning"], "value": 30},
              {"color": STATUS["good"], "value": 60}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9"),
-        num("③ MFU", 12, 6, "v",
-            "ROUND(100*SAFE_DIVIDE(SUM(flops_chip_hours),SUM(paid_chip_hours)),2)",
-            "percent", 2,
-            "**公式** Σ(tflops_p50 ÷ 峰值 × step 秒 × 芯片) ÷ paid_chip_hours\n\n"
-            "MFU = Model FLOPs Utilization，实际算力 ÷ 峰值算力。"
-            "分子取训练进程自己上报的 TFLOP/s，分母的峰值取自 MaxText 的芯片峰值表"
-            "（与训练侧计算 TFLOP/s 用的是同一张表，保证分子分母同源）。\n\n"
-            "**与「卡利用率」不是一回事**：卡利用率衡量张量核忙不忙，MFU 衡量忙的时候"
-            "跑多快。一个 kernel 可以让张量核一直处于忙碌状态，却只发挥出峰值的一小部分。\n\n"
-            "⚠️ 峰值按 bf16 取。fp8 任务的峰值是两倍，其 MFU 在此约为真实值的一半。",
-            [{"color": STATUS["critical"], "value": None},
-             {"color": STATUS["warning"], "value": 20},
-             {"color": STATUS["good"], "value": 40}],
-            gate="day_coverage >= 0.9 AND work_coverage >= 0.9"),
-        num("已付费芯片小时", 18, 6, "v", "ROUND(SUM(paid_chip_hours),0)", None, 0,
-            "**公式** ∫ reservation/reserved dt\n\n"
-            "已付费的产能总量，是本页所有比率的**统一分母**。四个比率同分母，"
-            "因而可以互相比较、相减。\n\n"
-            "只统计预留产能：按需与 flex-start 在分子分母两侧都排除。"
-            "它们不在 reservation/reserved 里，节点池的 capacity_class 也把"
-            "它们的负载挡在分子外，否则一波 flex 任务会把比率顶过 100%。"),
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
     ]
     y += 5
+
+    # The two in-VM ratios, placed directly under the global ones they derive
+    # from: same numerator, denominator changed from what was paid for to what
+    # was actually handed to a VM. Column-aligned on purpose -- x=9 sits under
+    # global_allocate_rate and x=14 under global_tpu_utils -- so the pairing is
+    # visible without reading a word.
+    #
+    # No circled number. The numbering belongs to the global metrics, which are
+    # the ones that line up with the funnel; giving these numbers too would
+    # imply they are further stages of it, and they are not -- they are the same
+    # stages measured against a smaller base.
+    panels.append({"type": "row", "title": "细粒度 In-VM（分母为已开出的 VM）",
+                   "collapsed": False,
+                   "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
+    y += 1
+    panels += [
+        num("使用率 tpu_allocate_rate_in_vm", 9, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(pod_chip_hours),SUM(vm_chip_hours)),2)",
+            "percent", 2,
+            "**定义** 开了 VM 的集合中，有多少调度了 Pod。\n\n"
+            "**公式** `tpu_allocate_rate_in_vm = pod_chip_hours ÷ vm_chip_hours`\n\n"
+            "与 ② 同分子、不同分母：② 除以买下的全部产能，这里只除以真的开出了 VM 的"
+            "那部分，把「产能没交付」那一层剥掉。所以它回答的是调度器的问题"
+            "（节点都在，Pod 排上去了吗），而 ② 回答的是产能全链路的问题。\n\n"
+            "`② = 本指标 × ① 预留占用率`，三个数任取两个可推出第三个。\n\n"
+            "⚠️ 分母不同，**不能**和 ①②③ 放在一起相减。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 60},
+             {"color": STATUS["good"], "value": 85}],
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+        num("利用率 tpu_utils_in_vm", 14, 5, "v",
+            "ROUND(100*SAFE_DIVIDE(SUM(duty_chip_hours),SUM(vm_chip_hours)),2)",
+            "percent", 2,
+            "**定义** 开了 VM 的利用率均值。\n\n"
+            "**公式** `tpu_utils_in_vm = duty_chip_hours ÷ vm_chip_hours`\n\n"
+            "与 ③ 同分子、不同分母。这正是原 GCP 面板「芯片利用率 % "
+            "(utilized/scheduled, by type)」的口径 —— 分母是 scheduled，"
+            "分子是 duty_cycle。\n\n"
+            "`③ = 本指标 × ① 预留占用率`。\n\n"
+            "它比 ③ 高，是因为把没开出 VM 的产能排除在外了；换句话说，"
+            "**这个数好看不代表钱花得值** —— 买了却没开出来的产能它看不见，"
+            "那部分只有 ③ 和漏斗的 A 层能反映。\n\n"
+            "⚠️ 分母不同，**不能**和 ①②③ 放在一起相减。",
+            [{"color": STATUS["critical"], "value": None},
+             {"color": STATUS["warning"], "value": 30},
+             {"color": STATUS["good"], "value": 60}],
+            gate="day_coverage >= 0.9 AND work_coverage >= 0.9 AND metric_coverage >= 0.9"),
+    ]
+    y += 5
+
 
     panels.append({"type": "row", "title": "产能漏斗 Where the capacity goes",
                    "collapsed": False,
@@ -1225,26 +1485,31 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
     panels.append({
         "type": "bargauge", "title": "逐层留存（占已付费产能）",
         "description":
-            "五层依次收窄，每一层之间的落差就是一类损耗。读法是从上往下找最大的那一刀。\n\n"
-            "**已调度** 预留产能交付给 VM。落差 = 买了但没建出节点。\n\n"
-            "**有 Pod** 节点上确实调度了带 TPU 的 Pod。落差 = 节点空转。\n\n"
-            "**在跑训练步** Pod 正在执行训练迭代。落差 = Pod 在但没训练："
-            "启动与编译、加载 checkpoint、卡住、以及非训练用途的 Pod。\n\n"
-            "**张量核忙** 张量核在发射指令。落差 = 训练中的等待："
-            "数据加载、集合通信、迭代间隙。\n\n"
-            "**满速等效** 折算成以峰值算力跑完同样计算量所需的时间。"
-            "落差 = 算得慢（kernel 效率、并行策略、显存带宽受限）。",
+            "预留买下的产能逐层收窄到真正产出算力的部分，**相邻两层之差就是"
+            "一类损耗**。全部以已付费芯片小时为分母，因此可以直接相减。\n\n"
+            "**A 已调度给 VM** 预留产能开出了节点。落差 = 买了但没建出机器。\n\n"
+            "**B 节点上有 Pod** 节点上调度了带 TPU 的 Pod。落差 = 机器开着没派活。\n\n"
+            "**C 卡被占用在跑** 加速器在执行指令（`duty_cycle`）。"
+            "落差 = Pod 挂着但卡是空的：等数据、等同伴、卡死。\n\n"
+            "**D 张量核忙** 张量核在发射矩阵指令（`tensorcore_utilization`）。"
+            "落差 = 卡在跑但没做密集算术：访存受限、集合通信、数据加载。\n\n"
+            "C 与 D 量的是同一块卡的两件事：前者问「有没有在跑」，"
+            "后者问「用掉了多少算力」。C 高而 D 低说明负载受限于访存或通信，"
+            "不是卡闲着。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
         "datasource": DS,
         "targets": [sql(f"""SELECT
-  ROUND(100 * SAFE_DIVIDE(SUM(scheduled_chip_hours), SUM(paid_chip_hours)), 1) AS `① 已调度给 VM`,
-  ROUND(100 * SAFE_DIVIDE(SUM(pod_chip_hours),       SUM(paid_chip_hours)), 1) AS `② 节点上有 Pod`,
-  ROUND(100 * SAFE_DIVIDE(SUM(stepping_chip_hours),  SUM(paid_chip_hours)), 1) AS `③ 在跑训练步`,
-  ROUND(100 * SAFE_DIVIDE(SUM(busy_chip_hours),      SUM(paid_chip_hours)), 1) AS `④ 张量核忙`,
-  ROUND(100 * SAFE_DIVIDE(SUM(flops_chip_hours),     SUM(paid_chip_hours)), 1) AS `⑤ 满速等效`
+  ROUND(100 * SAFE_DIVIDE(SUM(scheduled_chip_hours), SUM(paid_chip_hours)), 1) AS `A 已调度给 VM`,
+  ROUND(100 * SAFE_DIVIDE(SUM(pod_chip_hours),       SUM(paid_chip_hours)), 1) AS `B 节点上有 Pod`,
+  ROUND(100 * SAFE_DIVIDE(SUM(duty_chip_hours),      SUM(paid_chip_hours)), 1) AS `C 卡被占用在跑`,
+  ROUND(100 * SAFE_DIVIDE(SUM(busy_chip_hours),      SUM(paid_chip_hours)), 1) AS `D 张量核忙`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9 AND work_coverage >= 0.9""")],
+  AND day_coverage >= 0.9 AND work_coverage >= 0.9
+  AND metric_coverage >= 0.9
+  -- Six systems, one bar chart. Nothing forces a stage to sit below the one
+  -- above it, so a day whose stages cross is excluded rather than averaged in.
+  AND funnel_monotonic""")],
         "options": {"displayMode": "gradient", "orientation": "horizontal",
                     "showUnfilled": True, "minVizWidth": 8,
                     "reduceOptions": {"calcs": ["lastNotNull"], "values": False,
@@ -1261,9 +1526,15 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
                    "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []})
     y += 1
     panels.append({
-        "type": "timeseries", "title": "三个比率（同一分母，可直接相减）",
-        "description": "三个比率共用同一个分母（已付费芯片小时），因而可以互相比较、"
-                       "相减。曲线之间的垂直距离就是各环节的损耗。",
+        "type": "timeseries", "title": "漏斗四层的逐日走势（同一分母，可直接相减）",
+        "description": "上面的产能漏斗是区间合计，这里是它逐日的样子 —— 同样的四层、"
+                       "同样的分母（已付费芯片小时），所以**两条曲线之间的垂直距离"
+                       "就是那一天该环节的损耗**。\n\n"
+                       "一张图而不是四张：分母一致才能这样叠，换了分母就必须拆开 —— "
+                       "细粒度的两个 in-VM 比率因此没有画在这里。\n\n"
+                       "曲线断开是覆盖率闸门拒绝了那一天，不是当天为零。"
+                       "A 只需要预留指标，所以它的历史最长；B C D 还要 pod 归因和"
+                       "加速器指标，断点更多。",
         "gridPos": {"x": 0, "y": y, "w": 16, "h": 9},
         "datasource": DS,
         # No row filter here. The model already NULLs each ratio that its own
@@ -1274,9 +1545,10 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
         # series happen to have. A NULL renders as a gap, which is what a series
         # with no trustworthy value should look like.
         "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
-  reservation_utilization_pct AS `预留占用率`,
-  chip_utilization_pct        AS `卡利用率`,
-  mfu_pct                     AS `MFU`
+  reservation_utilization_pct AS `A 已调度给 VM`,
+  global_allocate_rate        AS `B 全局使用率`,
+  global_tpu_utils            AS `C 全局利用率`,
+  chip_utilization_pct        AS `D 张量核忙`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
 ORDER BY day""")],
@@ -1285,16 +1557,18 @@ ORDER BY day""")],
                         "overrides": []},
     })
     panels.append({
-        "type": "timeseries", "title": "芯片小时构成",
-        "description": "付费 ≥ 调度 ≥ 忙碌 ≥ FLOPs 等效，逐层收窄。"
-                       "每一层之间的落差就是一类浪费。",
+        "type": "timeseries", "title": "芯片小时构成（同样四层，绝对量）",
+        "description": "与左图同样的层级，纵轴换成芯片小时。比率看效率，绝对量看规模 —— "
+                       "预留缩容的日子比率可以不动而绝对量整体下移，只看左图会漏掉。\n\n"
+                       "已付费 ≥ 已调度 ≥ 有 Pod ≥ 在执行 ≥ 张量核忙，逐层收窄。",
         "gridPos": {"x": 16, "y": y, "w": 8, "h": 9},
         "datasource": DS,
         "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
   paid_chip_hours      AS `已付费`,
-  scheduled_chip_hours AS `已调度`,
-  busy_chip_hours      AS `忙碌`,
-  flops_chip_hours     AS `FLOPs 等效`
+  scheduled_chip_hours AS `A 已调度`,
+  pod_chip_hours       AS `B 有 Pod`,
+  duty_chip_hours      AS `C 在执行`,
+  busy_chip_hours      AS `D 张量核忙`
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
   AND day_coverage >= 0.9
@@ -1303,6 +1577,40 @@ ORDER BY day""")],
                         "overrides": []},
     })
     y += 9
+
+    # Deliberately its own panel, not a fourth line on the ratio chart above.
+    # That chart's whole claim is that its three series share a denominator and
+    # can therefore be subtracted from one another; this one divides by chips
+    # present rather than chips paid for, so laying it alongside them would
+    # invite exactly the comparison the title rules out.
+    #
+    # It earns a place because it is the only utilisation series that needs no
+    # pod-to-job attribution -- it reads the accelerator metric directly. The
+    # attributed ratios can only reach back as far as pod identity was
+    # collected; this one reaches as far as Cloud Monitoring retains the metric.
+    panels.append({
+        "type": "timeseries", "title": "TensorCore 占用率（免归因，可看长历史）",
+        "description": "公式：Σ(tensorcore_utilization ÷ 100 × 采样间隔) ÷ Σ(采样间隔)，"
+                       "间隔由相邻采样点时间差推得，因此监控降采样（6 周后 300s→600s）不会重复计权。\n\n"
+                       "**与上面的「卡利用率」有两处不同，两个数字不可直接相减：**\n\n"
+                       "1. 分母是**在场芯片小时**（采集到指标的芯片 × 时长），不是已付费芯片小时。\n"
+                       "2. 分子的芯片群体也不同：本图直接读原始采样 `mlobs_raw.metric_samples`，"
+                       "卡利用率读 `mlobs_core.fact_metric`，后者与 `dim_pod` 内连接，"
+                       "认不出 pod 的采样会被丢掉。\n\n"
+                       "正因为不做 pod→job 归因，它的历史长度只受 Cloud Monitoring 指标保留期限制，"
+                       "而不受我们从何时开始采集 pod 身份限制——这是它存在的理由。",
+        "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
+        "datasource": DS,
+        "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
+  mean_occupancy_pct AS `TensorCore 占用率`
+FROM `{project}.mlobs_core.fin_occupancy_daily`
+WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+ORDER BY day""")],
+        "fieldConfig": {"defaults": {"unit": "percent",
+                                     "custom": {"lineWidth": 2, "fillOpacity": 10}},
+                        "overrides": []},
+    })
+    y += 8
 
     panels.append({"type": "row", "title": "对账与导出 Reconciliation",
                    "collapsed": False,

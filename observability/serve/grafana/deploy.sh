@@ -160,7 +160,10 @@ echo "=== Image ==="
 ensure_artifact_repo "$PROJECT_ID" "$REGION" "$REPO"
 gcloud builds submit "$HERE" --project "$PROJECT_ID" --region "$REGION" \
   --tag "$IMAGE" --quiet >/dev/null
-echo "  ${IMAGE}"
+BUILT_DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --project "$PROJECT_ID" \
+               --format='value(image_summary.digest)' 2>/dev/null)
+[[ -n "$BUILT_DIGEST" ]] || { echo "  cannot resolve digest for ${IMAGE}" >&2; exit 1; }
+echo "  ${IMAGE} -> ${BUILT_DIGEST}"
 
 IAP_FLAG="--no-iap"
 if [[ "$ENABLE_IAP" == "1" ]]; then
@@ -250,18 +253,45 @@ if gcloud run services describe "$DIRECT" --project "$PROJECT_ID" \
   # resolved -- not the tag, which is the same string either way and says
   # nothing -- turns that into a failed deploy.
   digest_of() {
-    local rev
+    local rev ref
     rev=$(gcloud run services describe "$1" --project "$PROJECT_ID" \
           --region "$REGION" --format="value(status.latestReadyRevisionName)")
-    gcloud run revisions describe "$rev" --project "$PROJECT_ID" \
-      --region "$REGION" --format="value(status.imageDigest)"
+    ref=$(gcloud run revisions describe "$rev" --project "$PROJECT_ID" \
+          --region "$REGION" --format="value(status.imageDigest)")
+    # status.imageDigest is the whole reference -- repo@sha256:... -- not the
+    # bare digest that `artifacts docker images describe` returns. Comparing the
+    # two forms never matches, which is invisible while this only ever compared
+    # one service against the other because both sides carried the same shape.
+    echo "${ref##*@}"
   }
-  D_MAIN=$(digest_of "$SERVICE")
-  D_SIDE=$(digest_of "$DIRECT")
-  if [[ "$D_MAIN" == "$D_SIDE" && -n "$D_MAIN" ]]; then
-    echo "  both serving ${D_MAIN##*:}"
+  # Compared against BUILT_DIGEST, not just against each other.
+  #
+  # Agreeing with each other only proves they are consistent, not that they are
+  # current -- two services pinned to the same stale image pass that test while
+  # serving month-old dashboards. The sibling script schedule/deploy.sh had the
+  # matching hole and it cost six rounds of "rebuild the image" that changed
+  # nothing: on 2026-09-08 its job was still executing 739561c... while the
+  # registry tag had long since moved on. Services re-resolve a tag on deploy
+  # where jobs pin it, so this side was never actually broken, but the assertion
+  # that was supposed to catch it could not have.
+  # Retry rather than read once. `gcloud run deploy` returns before the new
+  # revision becomes latestReady, so a single read races the promotion and
+  # reports a mismatch against the revision that is on its way out -- which is
+  # how the first version of this check failed a deploy that had in fact
+  # succeeded. An assertion that cries wolf gets ignored, which would leave the
+  # real staleness it exists to catch undetected.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    D_MAIN=$(digest_of "$SERVICE")
+    D_SIDE=$(digest_of "$DIRECT")
+    [[ "$D_MAIN" == "$BUILT_DIGEST" && "$D_SIDE" == "$BUILT_DIGEST" ]] && break
+    sleep 6
+  done
+  if [[ "$D_MAIN" == "$BUILT_DIGEST" && "$D_SIDE" == "$BUILT_DIGEST" ]]; then
+    echo "  both serving freshly built ${BUILT_DIGEST##*:}"
   else
-    echo "  MISMATCH -- ${SERVICE}=${D_MAIN:-?} ${DIRECT}=${D_SIDE:-?}" >&2
+    echo "  MISMATCH -- built=${BUILT_DIGEST:-?}" >&2
+    echo "              ${SERVICE}=${D_MAIN:-?}" >&2
+    echo "              ${DIRECT}=${D_SIDE:-?}" >&2
     exit 1
   fi
 else

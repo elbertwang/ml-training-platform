@@ -408,8 +408,7 @@ def notify(request):
                                             INTERVAL {POLL_MINUTES} MINUTE)
             AND l.log_id IN ('maintenance_googleapis_com_maintenance_events',
                              'cloudaudit_googleapis_com_activity',
-                             'cloudaudit_googleapis_com_system_event',
-                             'mlobs_smoketest')
+                             'cloudaudit_googleapis_com_system_event')
           ORDER BY l.timestamp
           LIMIT 200""")
         results = []
@@ -419,8 +418,7 @@ def notify(request):
             # expects the real name, so put the dots and slashes back.
             entry["logName"] = entry["logName"].replace(
                 "cloudaudit_googleapis_com_", "cloudaudit.googleapis.com/").replace(
-                "maintenance_googleapis_com_", "maintenance.googleapis.com/").replace(
-                "mlobs_smoketest", "mlobs-smoketest")
+                "maintenance_googleapis_com_", "maintenance.googleapis.com/")
             results.append(handle_one(entry))
         return ({"mode": "poll", "candidates": len(rows), "results": results}, 200)
 

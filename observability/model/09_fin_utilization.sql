@@ -9,6 +9,7 @@
 --
 --   paid_chip_hours     = INTEGRAL(reservation/reserved) dt        [chips x h]
 --   scheduled_chip_hours= INTEGRAL(reservation/used)     dt
+--   duty_chip_hours     = SUM(duty_cycle_pct/100 x interval x chips)
 --   busy_chip_hours     = SUM(tensorcore_pct/100 x interval x chips)
 --   flops_chip_hours    = SUM(tflops_p50 / peak_tflops x step_seconds x chips)
 --
@@ -144,9 +145,44 @@ GROUP BY day, reservation_id;
 -- no longer be resolved -- falcon's ephemeral pools, deleted before the next
 -- snapshot -- are counted separately rather than dropped, because silently
 -- discarding them would understate utilisation without saying so.
-CREATE OR REPLACE TABLE mlobs_core.fin_work_daily
-CLUSTER BY day
-AS
+-- Rebuilt over a trailing window, not from scratch.
+--
+-- Every source here is partitioned on time and the table holds one row per day,
+-- so replacing it whole means re-reading all history to rewrite rows that
+-- cannot change. Measured: the node-metric scan alone is 899 MiB and the
+-- container scan behind pod_chip_hours another 662 MiB, every thirty minutes,
+-- both growing with retention. Windowed, the same run reads a few percent of
+-- that and the cost stops tracking history length.
+--
+-- Four days, not three. fact_step lands late enough that a three-day window
+-- occasionally rewrote a day before its last steps had arrived.
+--
+-- To rebuild history -- after a backfill lands old samples, which this window
+-- will not notice -- widen the interval:
+--   sed 's/INTERVAL 4 DAY/INTERVAL 40 DAY/' model/09_fin_utilization.sql | bq query ...
+CREATE TABLE IF NOT EXISTS mlobs_core.fin_work_daily
+(
+  day                 DATE,
+  work_coverage       FLOAT64,
+  metric_coverage     FLOAT64,
+  vm_chip_hours       FLOAT64,
+  pod_chip_hours      FLOAT64,
+  duty_chip_hours     FLOAT64,
+  busy_chip_hours     FLOAT64,
+  membw_chip_hours    FLOAT64,
+  chips_seen          INT64,
+  nodes_seen          INT64,
+  flops_chip_hours    FLOAT64,
+  stepping_chip_hours FLOAT64
+)
+CLUSTER BY day;
+
+BEGIN TRANSACTION;
+
+DELETE FROM mlobs_core.fin_work_daily
+WHERE day >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY));
+
+INSERT INTO mlobs_core.fin_work_daily
 WITH pod_class AS (
   SELECT
     p.pod_name,
@@ -176,44 +212,64 @@ WITH pod_class AS (
   LEFT JOIN mlobs_core.dim_node_pool np
     ON np.ig_hash = mlobs_core.node_ig_hash(p.node_name)
 ),
+-- Chip-level work, aggregated from fact_chip.
+--
+-- fact_chip is the atomic grain -- one row per chip per five minutes -- and
+-- every quantity below is a sum over it. Reading the metric samples again here
+-- with a second weighting rule is what previously made this table and the
+-- five-minute table disagree by 13-17%; there is now one derivation and the
+-- question cannot arise.
+--
+-- Each row stands for exactly 300 seconds, so a chip-hour is a row count over
+-- twelve. A slot with no sample contributes no row, which means a collection
+-- gap reads as absence rather than being interpolated across. That is the
+-- honest reading of "we did not measure it", and the sampling gaps that made it
+-- matter were closed at source -- see the interval boundary note in
+-- collect/metrics_exporter.py.
 busy AS (
   SELECT
-    DATE(m.point_time)  AS day,
-    c.capacity_class,
-    -- Same interval reasoning as fin_capacity_daily: the bucket is 300s inside
-    -- Cloud Monitoring's six-week window and 600s beyond it, so the width is
-    -- taken from the data rather than written into the formula.
-    SUM(m.value / 100 * m.interval_s / 3600) AS busy_chip_hours,
-    -- Chip-hours on which a pod existed at all, busy or not. The gap to
-    -- busy_chip_hours is capacity handed to a pod and then not computed on.
-    SUM(m.interval_s) / 3600 AS pod_chip_hours,
-    COUNT(DISTINCT CONCAT(m.pod_name, '/', m.chip_id)) AS chips_seen
-  FROM (
-    SELECT *, COALESCE(TIMESTAMP_DIFF(point_time,
-                LAG(point_time) OVER (PARTITION BY pod_name, chip_id, metric_type
-                                      ORDER BY point_time), SECOND), 300) AS interval_s
-    FROM mlobs_core.fact_metric
-    WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
-  ) m
-  JOIN pod_class c USING (pod_name)
-  GROUP BY day, c.capacity_class
+    DATE(slot) AS day,
+    COUNT(*) / 12.0                                        AS vm_chip_hours,
+    COUNTIF(pod_name IS NOT NULL) / 12.0                   AS pod_chip_hours,
+    SUM(duty_pct)       / 100 / 12.0                       AS duty_chip_hours,
+    SUM(tensorcore_pct) / 100 / 12.0                       AS busy_chip_hours,
+    SUM(membw_pct)      / 100 / 12.0                       AS membw_chip_hours,
+    COUNT(DISTINCT chip_id)                                AS chips_seen,
+    COUNT(DISTINCT node_name)                              AS nodes_seen
+  FROM mlobs_core.fact_chip
+  WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+  GROUP BY day
 ),
 pool_coverage AS (
   -- What share of that day's pods can be attributed to a capacity class at all.
   --
   -- dim_node_pool is built from snapshots and a snapshot is not retroactive, so
   -- a pool that was deleted before the collector existed can never be resolved.
-  -- Measured on the day this was written: 100% for 2026-09-03 and 09-04, 98%
-  -- for 09-02, 57-77% across 08-28..09-01, and 3-8% for 08-27 and earlier.
+  -- Re-measured 2026-09-04, after dim_pod was backfilled to 08-05 and grew from
+  -- 40k to 109k pods: 100% for 09-02..09-04, 77-90% across 08-28..09-01, 36-46%
+  -- across 08-23..08-27, and 9-69% before that. The early days rose -- they read
+  -- 3-8% when dim_pod itself started at 08-23 -- because the backfill gave those
+  -- pods a node name to resolve against. What remains is a real ceiling, not a
+  -- collection gap: 1,378 instance-group hashes appear over the 31 days and
+  -- dim_node_pool knows 58 of them, the rest being falcon ephemeral pools that
+  -- were deleted long ago.
   --
   -- That gradient is the collector's start date, not a change in the fleet. A
   -- 30-day chart of chip_utilization built without this column shows
   -- utilisation climbing from 1% to 15% and reads as a dramatic improvement;
   -- every point of that climb is an artefact.
+  --
+  -- The ratio counts pods while the ratios it gates are measured in chip-hours,
+  -- which would matter if chipless CPU pods were padding the denominator. They
+  -- are not: restricted to pods that carry a tensorcore sample the coverage is
+  -- 0.38 vs 0.36 on 08-23, 0.80 vs 0.78 on 08-28, 0.89 vs 0.90 on 08-29. Left
+  -- unweighted on that evidence.
+  --
   -- Grouped by the day a pod first appeared, while busy_chip_hours is grouped
   -- by the day its samples landed. The two populations differ only for pods
-  -- that span midnight, which is 790 of 40,152 -- 2%. Measured rather than
-  -- waved away, and small enough to leave as an approximation.
+  -- that span midnight, which is 840 of 108,239 -- 0.8%, re-measured on the
+  -- backfilled table. Measured rather than waved away, and small enough to
+  -- leave as an approximation.
   SELECT
     DATE(p.first_seen) AS day,
     ROUND(COUNTIF(np.ig_hash IS NOT NULL OR p.job_family = 'falcon')
@@ -222,6 +278,7 @@ pool_coverage AS (
   LEFT JOIN mlobs_core.dim_node_pool np
     ON np.ig_hash = mlobs_core.node_ig_hash(p.node_name)
   WHERE p.node_name IS NOT NULL
+    AND p.first_seen >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
   GROUP BY day
 ),
 job_class AS (
@@ -246,7 +303,8 @@ job_shape AS (
          SAFE_DIVIDE(ANY_VALUE(h.peak_chips), MAX(s.ranks_reporting)) AS chips_per_rank
   FROM mlobs_core.fact_step s
   JOIN mlobs_core.job_hub h USING (job_key)
-  WHERE s.ranks_reporting > 0 AND h.peak_chips > 0
+  WHERE s.step_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+    AND s.ranks_reporting > 0 AND h.peak_chips > 0
   GROUP BY s.job_key
 ),
 flops AS (
@@ -273,21 +331,73 @@ flops AS (
   LEFT JOIN job_shape sh USING (job_key)
   CROSS JOIN (SELECT peak_tflops_per_device FROM mlobs_core.dim_chip_peak
               WHERE tpu_model = 'tpu7x' AND dtype = 'bf16') pk
-  WHERE s.tflops_p50 IS NOT NULL AND s.ranks_reporting > 0
+  WHERE s.step_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+    AND s.tflops_p50 IS NOT NULL AND s.ranks_reporting > 0
   GROUP BY day, c.capacity_class
+),
+metric_coverage AS (
+  -- How much of the day the accelerator metric itself covers.
+  --
+  -- The third gate, and the one that was missing. day_coverage watches the
+  -- reservation metric (the denominator) and work_coverage watches pod
+  -- attribution, but nothing watched the work metric, even though
+  -- busy_chip_hours and pod_chip_hours are built entirely from it. A day with a
+  -- tensorcore outage and healthy pod attribution passes both existing gates and
+  -- publishes an understated numerator, which reads as idle capacity rather than
+  -- as a hole in collection -- the same mistake day_coverage exists to prevent,
+  -- never applied to this side of the ratio.
+  --
+  -- Measured 2026-09-04, this was true only by luck: 08-23 holds 4 hours of
+  -- tensorcore, 08-24 holds 9, 08-25 none at all and 08-26 holds 23, and every
+  -- one of them was already excluded because work_coverage happened to be below
+  -- 0.9 on the same days. The two collectors started at about the same time, so
+  -- the correlation is an accident of history and not a protection.
+  --
+  -- Counted in hours rather than 5-minute buckets on purpose. A healthy day only
+  -- reaches about 266 of 288 buckets -- series drift and are not perfectly
+  -- aligned -- so a 0.9 gate on buckets would sit on the noise floor and suppress
+  -- good days. Whole hours separate cleanly: 1.0 for every healthy day above,
+  -- 0.17 / 0.375 / 0 / 0.958 for the four damaged ones.
+  SELECT
+    DATE(point_time) AS day,
+    ROUND(COUNT(DISTINCT TIMESTAMP_TRUNC(point_time, HOUR)) / 24, 3) AS metric_coverage
+  FROM mlobs_core.fact_metric
+  WHERE point_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
+    AND metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+  GROUP BY day
 )
+-- One row per day. capacity_class is no longer a dimension here: the work
+-- metrics are node-scoped and every TPU pool in this project that resolves is
+-- reserved, so splitting by class produced one populated class and a residue of
+-- unattributable rows. The class breakdown lives in dim_node_pool for anyone
+-- who needs it.
 SELECT
   COALESCE(b.day, f.day)                       AS day,
-  COALESCE(b.capacity_class, f.capacity_class) AS capacity_class,
   pc.work_coverage,
-  ROUND(b.busy_chip_hours, 2)                  AS busy_chip_hours,
+  mc.metric_coverage,
+  -- Chip-hours on a chip whose node was running. The denominator of the two
+  -- in-VM ratios, and an independent reading of reservation/used.
+  ROUND(b.vm_chip_hours, 2)                    AS vm_chip_hours,
   ROUND(b.pod_chip_hours, 2)                   AS pod_chip_hours,
+  ROUND(b.duty_chip_hours, 2)                  AS duty_chip_hours,
+  ROUND(b.busy_chip_hours, 2)                  AS busy_chip_hours,
+  ROUND(b.membw_chip_hours, 2)                 AS membw_chip_hours,
   b.chips_seen,
+  b.nodes_seen,
   ROUND(f.flops_chip_hours, 2)                 AS flops_chip_hours,
   ROUND(f.stepping_chip_hours, 2)              AS stepping_chip_hours
 FROM busy b
-FULL OUTER JOIN flops f ON f.day = b.day AND f.capacity_class = b.capacity_class
-LEFT JOIN pool_coverage pc ON pc.day = COALESCE(b.day, f.day);
+-- FULL OUTER on the log-derived side: a day can have training steps logged with
+-- no accelerator sample, or the reverse, and neither should erase the other.
+FULL OUTER JOIN (
+  SELECT day, SUM(flops_chip_hours) AS flops_chip_hours,
+         SUM(stepping_chip_hours) AS stepping_chip_hours
+  FROM flops GROUP BY day
+) f USING (day)
+LEFT JOIN pool_coverage  pc ON pc.day = COALESCE(b.day, f.day)
+LEFT JOIN metric_coverage mc ON mc.day = COALESCE(b.day, f.day);
+
+COMMIT TRANSACTION;
 
 
 -- Cluster-wide occupancy, with no attribution at all.
@@ -302,9 +412,50 @@ LEFT JOIN pool_coverage pc ON pc.day = COALESCE(b.day, f.day);
 -- counts every chip in every cluster, on-demand and flex-start included, while
 -- chip_utilization_pct counts only capacity that was paid for as reserved. Read
 -- together they bracket the fleet; read as one number they are wrong.
-CREATE OR REPLACE TABLE mlobs_core.fin_occupancy_daily
-CLUSTER BY day
-AS
+-- Incremental, not CREATE OR REPLACE, and the reason is cost rather than taste.
+--
+-- A full rebuild reads every tensorcore sample ever collected, and mlobs-refresh
+-- runs every 30 minutes: 48 full scans a day of a table that only ever grows.
+-- Measured 2026-09-04 with 24 days of samples loaded, one rebuild scanned 561 MB
+-- -- 27 GB/day, about $5/month. The 90-day backfill in flight multiplies the
+-- tensorcore rows by roughly 3.7, taking it to ~$19/month, and it would keep
+-- climbing with every day of history for no gain: a past day's occupancy cannot
+-- change once its samples have landed.
+--
+-- metric_samples is DAY-partitioned on point_time and clustered on metric_type,
+-- so a windowed read prunes hard -- the same two-day slice scans 15 MB against
+-- the full table's 561 MB. Same fix, and the same reasoning, as the dim_pod MERGE
+-- in model/01_dim_pod.sql.
+--
+-- To rebuild history -- after a backfill lands old days, which a two-day window
+-- will not notice -- run this file with the interval widened:
+--   sed 's/INTERVAL 2 DAY/INTERVAL 95 DAY/; s/INTERVAL 3 DAY/INTERVAL 96 DAY/' \
+--     model/09_fin_utilization.sql | bq query ...
+--
+-- Both intervals, and that is not a detail. Widening only the first one moves
+-- the DELETE and the final WHERE out to 95 days while the source read stays at
+-- 3, so the statement deletes three months of history and reinserts three days
+-- of it.
+--
+-- Written inline rather than as a DECLARE: BigQuery only accepts variable
+-- declarations at the start of a script or block, and this sits mid-file.
+
+CREATE TABLE IF NOT EXISTS mlobs_core.fin_occupancy_daily
+(
+  day                    DATE,
+  busy_chip_hours_all    FLOAT64,
+  present_chip_hours_all FLOAT64,
+  mean_occupancy_pct     FLOAT64,
+  chips_seen             INT64
+)
+CLUSTER BY day;
+
+BEGIN TRANSACTION;
+
+DELETE FROM mlobs_core.fin_occupancy_daily
+WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY);
+
+INSERT INTO mlobs_core.fin_occupancy_daily
 SELECT
   DATE(point_time) AS day,
   ROUND(SUM(value / 100 * interval_s / 3600), 2) AS busy_chip_hours_all,
@@ -322,8 +473,16 @@ FROM (
              ORDER BY point_time), SECOND), 300) AS interval_s
   FROM mlobs_raw.metric_samples
   WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+    -- One day of lookback beyond the window that gets written. LAG needs the
+    -- sample before the first one of the window to measure its interval;
+    -- without it every series would restart at the 300s default on the window
+    -- boundary and the first day of each run would be slightly understated.
+    AND point_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
 )
+WHERE DATE(point_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
 GROUP BY day;
+
+COMMIT TRANSACTION;
 
 
 -- The finance sheet. One row per day; every column has a formula in the header.
@@ -339,25 +498,26 @@ WITH cap AS (
   GROUP BY day
 ),
 work AS (
-  SELECT day,
-         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
-                busy_chip_hours, 0))                              AS busy_chip_hours,
-         SUM(IF(capacity_class = 'reserved_assumed', busy_chip_hours, 0))
-                                                                  AS assumed_busy_chip_hours,
-         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
-                COALESCE(pod_chip_hours, 0), 0))                  AS pod_chip_hours,
-         SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
-                COALESCE(stepping_chip_hours, 0), 0))             AS stepping_chip_hours,
-         -- SUM of a filtered IF() yields 0 when nothing matched, and 0 reads as
-         -- "MFU was zero" rather than "no job logged TFLOP/s that day". NULLIF
-         -- on the row count keeps the distinction; 2026-08-28 and 08-29 had no
-         -- such steps at all and were publishing 0.00%.
-         NULLIF(SUM(IF(capacity_class IN ('reserved', 'reserved_assumed'),
-                       COALESCE(flops_chip_hours, 0), 0)), 0)     AS flops_chip_hours,
-         SUM(IF(capacity_class = 'unresolved', busy_chip_hours, 0)) AS unresolved_busy_chip_hours,
-         MIN(work_coverage) AS work_coverage
+  -- fin_work_daily is already one row per day, so this is a passthrough rather
+  -- than an aggregation. It stays as a CTE so the join below reads the same as
+  -- the capacity side.
+  SELECT
+    day,
+    vm_chip_hours,
+    pod_chip_hours,
+    duty_chip_hours,
+    busy_chip_hours,
+    membw_chip_hours,
+    stepping_chip_hours,
+    -- NULLIF on the sum, not on the row: zero flops-hours means no job logged
+    -- TFLOP/s that day, which is absence of evidence, and publishing it as
+    -- "MFU was 0.00%" states the opposite.
+    NULLIF(flops_chip_hours, 0) AS flops_chip_hours,
+    chips_seen,
+    nodes_seen,
+    work_coverage,
+    metric_coverage
   FROM mlobs_core.fin_work_daily
-  GROUP BY day
 ),
 price AS (
   -- The committed rate, not the on-demand one. Every reserved chip in this
@@ -379,6 +539,10 @@ SELECT
   ROUND(w.pod_chip_hours, 1)                                     AS pod_chip_hours,
   ROUND(w.stepping_chip_hours, 1)                                AS stepping_chip_hours,
   ROUND(w.busy_chip_hours, 1)                                    AS busy_chip_hours,
+  -- Chip-hours the accelerator was actively processing. Sits between pod and
+  -- busy: the gap above it is capacity handed to a pod that did nothing, the
+  -- gap below it is a chip that worked without doing dense arithmetic.
+  ROUND(w.duty_chip_hours, 1)                                    AS duty_chip_hours,
   ROUND(w.flops_chip_hours, 1)                                   AS flops_chip_hours,
   -- Every ratio is NULL below 0.9 day coverage, rather than published small.
   --
@@ -393,9 +557,44 @@ SELECT
   IF(c.day_coverage < 0.9, NULL,
      ROUND(100 * SAFE_DIVIDE(c.scheduled_chip_hours, c.paid_chip_hours), 2))
                                                                  AS reservation_utilization_pct,
-  IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
-     ROUND(100 * SAFE_DIVIDE(w.busy_chip_hours, c.paid_chip_hours), 2))
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND(100 * SAFE_DIVIDE(w.busy_chip_hours, c.paid_chip_hours), 2))
                                                                  AS chip_utilization_pct,
+  -- ---------------------------------------------------------------------
+  -- The four named efficiency ratios, gated here rather than at each reader.
+  --
+  -- Every one of them was previously computed in the dashboard, once per tile
+  -- and again per trend line, each carrying its own copy of the gate
+  -- expression. Four ratios x two surfaces is eight places for the threshold to
+  -- drift, and a reader cannot tell a gated NULL from a missing row. Computing
+  -- them here means a ratio that fails its coverage test is NULL everywhere at
+  -- once, and fin_export carries them to downstream systems already gated.
+  --
+  -- global_*      divide by paid_chip_hours      -- what was bought
+  -- *_in_vm       divide by scheduled_chip_hours -- what was handed to a VM
+  --
+  -- The pair differs only in denominator, and
+  --   global_X = X_in_vm x reservation_utilization
+  -- holds by construction: the scheduled term cancels. Verified on 30 days --
+  -- 80.42% x 95.18% = 76.54% and 34.60% x 95.18% = 32.93%.
+  --
+  -- "Utilisation" is duty_cycle, not tensorcore_utilization, matching the
+  -- Cloud Monitoring dashboard this replaces: its panel was titled
+  -- "芯片利用率 % (utilized/scheduled, by type)" over duty_cycle, while
+  -- tensorcore appeared separately as "Per-job MFU 代理". chip_utilization_pct
+  -- above keeps the tensorcore reading under its own name.
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND(100 * SAFE_DIVIDE(w.pod_chip_hours, c.paid_chip_hours), 2))
+                                                                 AS global_allocate_rate,
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND(100 * SAFE_DIVIDE(w.duty_chip_hours, c.paid_chip_hours), 2))
+                                                                 AS global_tpu_utils,
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND(100 * SAFE_DIVIDE(w.pod_chip_hours, c.scheduled_chip_hours), 2))
+                                                                 AS tpu_allocate_rate_in_vm,
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND(100 * SAFE_DIVIDE(w.duty_chip_hours, c.scheduled_chip_hours), 2))
+                                                                 AS tpu_utils_in_vm,
   -- bf16 peak
   IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
      ROUND(100 * SAFE_DIVIDE(w.flops_chip_hours, c.paid_chip_hours), 2))
@@ -405,8 +604,8 @@ SELECT
   -- the page: 2026-08-25 has work_coverage 0.38 and reported 100.0% of that
   -- day's spend as idle, which says the whole day was wasted when the truth is
   -- that its work could not be attributed to a capacity class.
-  IF(c.day_coverage < 0.9 OR IFNULL(w.work_coverage, 0) < 0.9, NULL,
-     ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
+  IF(c.day_coverage < 0.9
+       OR IFNULL(w.metric_coverage, 0) < 0.9, NULL,     ROUND((c.paid_chip_hours - COALESCE(w.busy_chip_hours, 0))
            * (SELECT usd_per_chip_hour FROM price), 0))          AS idle_usd,
   ROUND(c.paid_chip_hours * (SELECT usd_per_chip_hour FROM price), 0) AS paid_usd,
   -- The rate travels with the money so any figure here can be re-derived, and
@@ -415,14 +614,60 @@ SELECT
   -- Trust markers, published beside the numbers rather than in a footnote.
   c.day_coverage,
   -- Share of that day's pods that could be attributed to a capacity class.
-  -- The numerators only see this fraction of the work; below 0.9 the two
-  -- work-based ratios above are suppressed rather than published low.
+  --
+  -- It gates mfu_pct alone. Every other ratio on this row is measured from the
+  -- node-scoped accelerator series, which carries no pod and therefore needs no
+  -- pod-to-pool mapping; MFU is the exception because its numerator comes from
+  -- the training log and is attributed per job.
   w.work_coverage,
+  -- How much of the day the accelerator metric covers. Gates chip_utilization
+  -- and idle_usd, which are built from it. Deliberately does NOT gate mfu_pct:
+  -- flops_chip_hours is parsed from the training log and never reads this
+  -- metric, so an accelerator outage leaves MFU perfectly measurable.
+  w.metric_coverage,
   -- How much of busy_chip_hours rests on the falcon assumption above, and how
   -- much is still unattributable. Both published so a reader can re-derive the
   -- conservative figure by subtracting.
-  ROUND(w.assumed_busy_chip_hours, 1)                            AS assumed_busy_chip_hours,
-  ROUND(w.unresolved_busy_chip_hours, 1)                         AS unresolved_busy_chip_hours
+  -- Chip-hours on a chip whose node was running, measured from the node-scoped
+  -- accelerator series. It is the denominator of the two in-VM ratios and an
+  -- independent reading of reservation/used -- the two agree hour by hour, from
+  -- unrelated systems, which is what licenses reporting either.
+  ROUND(w.vm_chip_hours, 1)                                      AS vm_chip_hours,
+  -- Chip-hours weighted by HBM bandwidth in use. Read against duty and busy it
+  -- separates a chip waiting on memory from one waiting on the network.
+  ROUND(w.membw_chip_hours, 1)                                   AS membw_chip_hours,
+  w.chips_seen,
+  w.nodes_seen,
+  -- Does this day's funnel actually nest? Every stage is measured by a different
+  -- system -- reservation metrics, the accelerator agent, the training log -- so
+  -- nothing structural forces stage N to sit below stage N-1, and a day where it
+  -- does not is a measurement fault rather than a finding about the fleet. It is
+  -- published as a column instead of being silently dropped so a consumer of
+  -- fin_export can see which days were excluded and why.
+  --
+  -- Written 2026-09-08 after 2026-08-22 produced duty_chip_hours below
+  -- busy_chip_hours: on that day 71.4% of duty samples read 0 against
+  -- tensorcore's 56.1%, with both metrics covering all 24 hours.
+  -- duty and stepping are checked as a pair rather than ordered against each
+  -- other. They measure nearly the same thing by unrelated means -- the
+  -- accelerator agent's binary occupancy signal, and the wall-clock of steps
+  -- parsed out of the training log -- and over 24 days they come to 30.9% and
+  -- 30.8% of paid capacity, crossing on individual days. Forcing an order
+  -- between them would reject days for a disagreement of a fraction of a
+  -- percent between two estimates of one quantity; that they land on top of
+  -- each other is corroboration, not a fault. What must hold is that both sit
+  -- inside the chain.
+  (c.scheduled_chip_hours <= c.paid_chip_hours
+   AND COALESCE(w.pod_chip_hours, 0) <= c.scheduled_chip_hours
+   AND GREATEST(COALESCE(w.duty_chip_hours, 0),
+                COALESCE(w.stepping_chip_hours, 0)) <= COALESCE(w.pod_chip_hours, 0)
+   AND COALESCE(w.busy_chip_hours, 0) <= LEAST(COALESCE(w.duty_chip_hours, 0),
+                                               COALESCE(w.stepping_chip_hours, 0)))
+   -- flops is deliberately not checked. The funnel stopped displaying that stage
+   -- on 2026-09-10, and gating a chart on a stage it does not show would drop
+   -- days for a reason invisible to whoever reads it. mfu_pct keeps its own
+   -- coverage gates and is still published in fin_daily and fin_export.
+                                                                 AS funnel_monotonic
 FROM cap c
 LEFT JOIN work w USING (day);
 
@@ -451,9 +696,11 @@ SELECT
   -- row with a value in it has passed both -- but the columns travel with the
   -- data so a downstream system can apply a stricter bar of its own.
   day_coverage,
-  work_coverage
+  work_coverage,
+  metric_coverage,
+  funnel_monotonic
 FROM (
-  SELECT day, day_coverage, work_coverage,
+  SELECT day, day_coverage, work_coverage, metric_coverage, funnel_monotonic,
     [STRUCT('paid_chip_hours' AS metric, paid_chip_hours AS value,
             'chip*hour' AS unit,
             'INTEGRAL(compute.googleapis.com/reservation/reserved) dt, reserved pools only' AS formula),
@@ -466,7 +713,15 @@ FROM (
      STRUCT('reservation_utilization_pct', reservation_utilization_pct, 'percent',
             'scheduled_chip_hours / paid_chip_hours'),
      STRUCT('chip_utilization_pct', chip_utilization_pct, 'percent',
-            'busy_chip_hours / paid_chip_hours'),
+            'busy_chip_hours / paid_chip_hours; tensorcore, the MFU proxy'),
+     STRUCT('global_allocate_rate', global_allocate_rate, 'percent',
+            'pod_chip_hours / paid_chip_hours'),
+     STRUCT('global_tpu_utils', global_tpu_utils, 'percent',
+            'duty_chip_hours / paid_chip_hours = tpu_utils_in_vm * reservation_utilization_pct'),
+     STRUCT('tpu_allocate_rate_in_vm', tpu_allocate_rate_in_vm, 'percent',
+            'pod_chip_hours / scheduled_chip_hours; denominator is VMs brought up, NOT comparable with the global_* pair'),
+     STRUCT('tpu_utils_in_vm', tpu_utils_in_vm, 'percent',
+            'duty_chip_hours / scheduled_chip_hours; matches the legacy panel 芯片利用率 % (utilized/scheduled)'),
      STRUCT('mfu_pct', mfu_pct, 'percent',
             'flops_chip_hours / paid_chip_hours; bf16 peak, so fp8 jobs read ~half'),
      STRUCT('paid_usd', paid_usd, 'USD',

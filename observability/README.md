@@ -24,7 +24,7 @@
 5. [Grafana 面板](#5-grafana-面板)
 6. [当前状态](#6-当前状态)
 7. [成本](#7-成本)
-8. [待决策与进行中](#8-待决策与进行中)
+8. [待决策与已知缺口](#8-待决策与已知缺口)
 9. [路线图](#9-路线图)
 10. [运行方式](#10-运行方式)
 11. [Caveats](#11-caveats)
@@ -410,7 +410,74 @@ flowchart LR
 （要开发）。粗框 `fact_step` 同时喂两个问题，原料已在 sink 里，
 详见[附录 A](docs/logs.md)。
 
-### 4.4 `dim_pod`：pod → job 的映射
+### 4.4 事实层的骨架：从原子表往上聚合
+
+财务与效能这一整条链路，只有一个测量点，其余都是它的聚合。
+
+```
+                     采集                        原子事实                 聚合
+  node/accelerator/{tensorcore,duty_cycle,        fact_chip           chip_hourly      ← 客户宽表
+    memory_bandwidth}  每芯片每5分钟一条序列  →  每芯片×5分钟       →  每芯片×小时
+                                                 460万行/35天           1.2万行/天
+                                                        │
+  container/accelerator/tensorcore                      │            fin_work_daily   → fin_daily
+    （只用来判定"这块卡上有谁的作业"）                     └──────────→  每天一行            财务口径
+                                                                       41 行
+  compute/reservation/{reserved,used}  ────────────→  fin_capacity_daily
+    （分母，按预留而非按芯片）                            每预留每天
+```
+
+**为什么加速器指标取 node 级而非容器级。** node 级每块物理芯片一条序列，
+无论上面有没有 Pod 都上报。三个后果：
+
+- 空闲芯片计为 0% 而不是从平均里消失 —— 这正是被替换的那个 GCP 面板的错误
+- **序列数本身就是已开出的芯片数**，`vm_chip_hours` 因此可测，而不是推断出来的
+- 一块芯片只有一个读数。容器级把芯片归给声称拥有它的容器，Pod 交接时同一块硅片
+  会被报两次，实测使 `fin_daily` 系统性偏高 6.0%–9.1%
+
+无交接干扰时两者逐点相同（180 块芯片，中位差 0.0000pp）；有交接时 node 级是物理真值。
+
+**为什么只有一个原子表。** 曾经有三处各自从原始指标推导同样的五个量，各带一套
+权重规则 —— 有的按相邻采样间隔积分、有的按固定 5 分钟桶计数 —— 结果日表与
+5 分钟表差 13%–17%，而每次对账都要重新判断哪个对。现在只有一个推导，这个问题
+不是被解决，是不再存在。
+
+**分母为什么分在两张表。** 预留了但没开出 VM 的芯片不产生任何序列：没有节点、
+没有容器、没有指标。「每芯片一行」的表结构上无法容纳它 —— 不能为不存在的实体造行。
+所以 `paid` 只能按预留计，其余四层按芯片计。这也是把宽表自己汇总当分母会错的原因：
+那样得到的是「有数据的芯片」而不是「买了的芯片」。
+
+**`duty_cycle` 的一个限制。** 它按 TPU 切片坐标编号（`<实例>-4 -5 -12 -13`），
+与物理芯片不是一一对应：同一时刻 tensorcore 与 memory_bandwidth 各报 512 块、
+128 个实例、恰好 4.00 块/实例，而 duty 报同样 512 块却分布在 120 个实例上、
+4.27 块/实例。因此 `fact_chip` 的芯片轴取 tensorcore 的编号（主机内 0–3，
+与容器级拼写一致），duty 以**实例均值**挂到该实例的 4 行上 —— 按实例及以上聚合
+完全精确，只有同主机内两块芯片的对比是近似。
+
+**`chip_id` 自带实例身份。** 格式是 `<GCE 实例 ID>-<0..3>`，前缀就是节点的
+instance id（与 `compute instances describe` 核对一致），所以芯片↔实例不需要
+映射表，`SPLIT` 即可。
+
+### 4.5 四个资源效能口径
+
+```
+                     分母 = 买下的产能              分母 = 已开出的 VM
+有 Pod 调度          global_allocate_rate          tpu_allocate_rate_in_vm
+                     pod ÷ paid                    pod ÷ vm
+加速器在跑           global_tpu_utils              tpu_utils_in_vm
+                     duty ÷ paid                   duty ÷ vm
+```
+
+`global_X = X_in_vm × 预留占用率`，因为 `vm` 约掉。四个比率在 `fin_daily` 里
+已按各自的覆盖率闸门置空，下游不需要再判一次。
+
+**「利用率」指 `duty_cycle` 而非 `tensorcore_utilization`**，与既有口径一致：
+被替换的 GCP 面板里「芯片利用率 % (utilized/scheduled)」和「集群 Duty Cycle 均值」
+都基于 duty，tensorcore 在那里标的是「Per-job MFU 代理」。两者都保留 —— duty 回答
+「卡有没有在跑」，tensorcore 回答「用掉了多少算力」，近 30 天前者约为后者的两倍多，
+差额是访存受限与通信受限的负载，`membw_chip_hours` 用于区分这两者。
+
+### 4.6 `dim_pod`：pod → job 的映射
 
 Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job 必须有映射，
 三种做法只有一种可靠：
@@ -428,7 +495,7 @@ Cloud Monitoring 的时间序列只带 `pod_name`。要把指标关联到 job �
 job 两样都不产生。加入 event 前后：生产可见 falcon job **589 → 1,540**，
 JobSet **65 → 201**。
 
-### 4.5 两个粒度：`job_key` 与 `attempt_uid`
+### 4.7 两个粒度：`job_key` 与 `attempt_uid`
 
 | 键 | 含义 | 缺失的后果 |
 |---|---|---|
@@ -437,19 +504,69 @@ JobSet **65 → 201**。
 
 非 Job 工作负载（Deployment/DaemonSet）没有 controller_uid，回落到 controller 名。
 
-### 4.6 四条收集路径
+### 4.8 五条收集路径
 
 | 路径 | 承载 | 不可替代之处 |
 |---|---|---|
 | `defaultLink`（Log Analytics） | 全量，30 天 | 免费全保真；但重复扫描贵，受保留期限制。只用于一次性回填和人工排查 |
 | sink `mlobs-selective` | ERROR+、`completed step`、**k8s event**、autoscaler、TPU runtime、mldiag event、audit | 永久保留 + 反复查询便宜（813 MB vs 303 GB）。~180 万行/天 |
-| `metrics_exporter.py` | tensorcore、log_entry_count | 这些是指标不是日志。`log_entry_count` 零成本检测日志风暴 |
+| `metrics_exporter.py` | tensorcore、log_entry_count、goodput/badput/elapsed/disruptions、reservation reserved+used | 这些是指标不是日志。`log_entry_count` 零成本检测日志风暴；reservation 两个是财务口径唯一的分母来源 |
 | `mldiag_poller.py` | ML run、monitored event、analyzer 判定 | 只有 REST，`gcloud` 无 `mldiagnostics` 命令组。支持多 region |
+| **Cloud Asset Inventory** | node pool 的**配置历史**（35 天） | 唯一能回溯已删除资源配置的通道。日志记录的是「发生了什么」，它记录的是「当时长什么样」——两者不能互相替代，详见 4.6.1 |
+
+#### 4.8.1 资源配置不在日志里：一次找错层级的教训
+
+`capacity_class`（这个 pod 跑在预留还是按需容量上）是财务口径的分母过滤条件。
+falcon 在一个 job 的生命周期内创建并删除 node pool，所以靠 GKE API 轮询的
+`node_pool_snapshot.py` 只认得当下存在的池：2026-09-04 实测，31 天里 dim_pod 出现过
+**1,378 个实例组，它只认得 58 个**。`work_coverage` 因此在 0.09–0.90 之间，
+把 09-01 以前的卡利用率和 MFU 全部压成 NULL。
+
+按「日志里总能找到」的思路找了三条路，全部走死，而且**死因相同——在错误的层级找东西**：
+
+| 尝试 | 结果 | 为什么 |
+|---|---|---|
+| 从节点名解析池名 | 失败 | 短式命名 `gke-tpu-3cf4ffd9-w09c` 只带 8 位实例组哈希，不含池名 |
+| `compute.instances.insert` 审计日志 | 失败 | request 体只有 `@type`。GKE 经实例组管理器创建节点，不存在每实例的创建请求 |
+| `instanceGroupManagers` 审计条目 | 不可靠 | 确实同时含池名和哈希，但抽查 5 个缺失哈希只命中 1 个 |
+
+**`reservationAffinity` 是 node pool 的属性，不是 node 的属性**，所以任何节点级通道
+都不可能带上它。日志回答「发生了什么」，回答不了「这个资源当时的配置是什么」。
+
+Cloud Asset Inventory 正是后者，一次调用给全三样：
+
+```
+config.reservationAffinity   容量类别 + 具体预留名
+instanceGroupUrls            节点名里那 8 位哈希
+readTime                     35 天窗口内的任意时点快照
+```
+
+`collect/backfill_node_pools_asset.py` 拉 31 天日快照，写进
+`node_pool_snapshot` **同一张表、复用同一个 `to_rows()`**——所以容量类别的判定规则
+只有一份，两条来源不可能漂。实测效果：
+
+| | 之前 | 之后 |
+|---|---|---|
+| `dim_node_pool` 实例组数 | 58 | **573** |
+| `work_coverage`（08-21） | 0.093 | **1.0** |
+| 卡利用率有效天数 | 3 | **26** |
+| MFU 有效天数 | 3 | **26** |
+
+补齐之后才看得见的东西：卡利用率在 08-05..08-16 是 **1.9–4.1%**，08-17 起跳到
+**10.6–17.7%**。同期预留占用率一直是 80–98%——预留芯片确实发给了 VM，上面却没在算。
+`fact_step` 的源头也对得上（08-06 有 88,446 行步骤日志，08-28 有 352,461 行）。
+三条独立来源同向，所以这是真实拐点，不是采集起点造成的假象——两个覆盖率列在整段
+区间都是 1.0，正是为了把这两种情况区分开才引入的。
+
+三个约束值得记住：Asset Inventory 是 **35 天滚动窗口且只向前滚**，没抓的历史永久
+丢失；日快照会漏掉活不到 24 小时的池（1,378 里有 906 个），目前无害是因为那些 pod
+被 `job_family='falcon'` 兜底，若哪天去掉那条规则就得改小时级；08-11/12/13/15/16
+这五天 `work_coverage` 停在 0.71–0.87 仍被闸掉，就是日快照漏池的直接后果。
 
 **`severity=WARNING` 刻意不入 sink**：9.33 亿行/天，几乎全是两次 gcsfuse 风暴。
 日志「量」的异常由免费的 `log_entry_count` 指标发现。
 
-### 4.7 目录结构
+### 4.9 目录结构
 
 三个部署脚本，各管一层，因为它们的爆炸半径和重部署频率都不同。
 `./deploy.sh` 默认把三层都装好，`STAGES=data` 只装数据面。
@@ -467,9 +584,16 @@ observability/
 ├── collect/
 │   ├── create_log_sink.sh          精选 Log Router sink
 │   ├── mldiag_poller.py            MLDiag REST → mlobs_raw（多 region）
-│   ├── metrics_exporter.py         Monitoring → metric_samples（幂等）
-│   └── backfill_pod_labels.sh      一次性：sink 建立之前的 pod→job 映射
+│   ├── metrics_exporter.py         Monitoring → metric_samples（幂等，按块落库+token 自续期）
+│   ├── node_pool_snapshot.py       GKE API → node_pool_snapshot（*/5min，只见当下）
+│   ├── load_tpu_price.sh           从 GCS 载入费率卡；费率不进 git
+│   ├── backfill_node_pools_asset.py  一次性：Asset Inventory 35 天配置史 → 已删除池的容量类别
+│   ├── backfill_pod_labels.sh      一次性：sink 建立之前的 pod→job 映射（整窗重跑约 $67）
+│   └── backfill_step_lines.sh      一次性：sink 建立之前的 `completed step` 行（按天跳过）
 ├── model/
+│   ├── 00b_dim_config.sql          部署事实（project_id、日志保留期），job_hub 依赖
+│   ├── 11_fact_chip.sql            原子事实：每芯片每 5 分钟
+│   ├── 12_chip_hourly.sql          客户宽表：每芯片每小时
 │   ├── build_v_sink_logs.py        动态发现 sink 表
 │   ├── 00_functions.sql            api_ts()、job_key_from_pod_fallback()
 │   ├── 01_dim_pod.sql              ★ 骨架
@@ -491,6 +615,9 @@ observability/
 │       ├── deploy.sh
 │       ├── build_dashboard.py      dashboard JSON 由代码生成
 │       └── provisioning/           三个数据源：BQ / Cloud Monitoring / Cloud Logging
+├── serve/share/
+│   └── create_share.sh             mlobs_share 数据集：9 个对外视图 + 只读 SA
+│                                   建完逐个实查，编译通过不等于能查
 ├── tools/
 │   ├── build_capability_map.py     生成能力地图
 │   ├── render_deployment.py        画部署视图（官方 GCP 图标）
@@ -711,18 +838,21 @@ gcloud 会警告这个 API 已于 2026-03-19 关停 —— 那只针对**新项�
 **所有**数据集（含 `defaultLink` 全量日志）。已收窄，并用一次实跑确认
 `mlobs-grafana` 查 `defaultLink` 会被拒绝。
 
-### 6.2 生产模型层规模
+### 6.2 生产模型层规模（2026-09-14 实测）
 
-| 表 | 行数 |
-|---|---|
-| `fact_event` | 3,104,603 |
-| `job_hub` | 2,955 |
-| `dim_pod` | 12,275 |
-| `fact_metric` | 302,126 |
-| `mldiag_runs`（原始） | 15,220 |
+| | 表数 | 体积 | 行数 |
+|---|---|---|---|
+| `mlobs_raw` 暂存 | 32 | 91.9 GiB | 1.67 亿 |
+| `mlobs_core` 模型 | 28 | 11.4 GiB | 4,600 万 |
+| `mlobs_share` 对外 | 9 视图 | — | — |
 
-> **历史深度只有 3 天**（`dim_pod` 最早 08-23），而 `_Default` 有 30 天可用。
-> 这是当前最大的缺口，见附录 A 的 TBD-1 / TBD-2。
+最大的几张：`stderr` 61.6 GiB、`mldiag_runs` 11.0 GiB、`metric_samples` 8.6 GiB、
+`fact_event` 7.6 GiB、`fact_chip` 1.2 GiB。
+
+每 30 分钟一轮刷新，13 个模型文件，实测 370–510 秒。
+`fin_work_daily` 与 `fact_chip` 都是 4 天滚动窗口增量，扫描量不随历史增长
+（改增量前 `node_metric` 单次扫 899 MiB，之后 141 MiB）。
+
 
 ### 6.3 延迟预算（实测）
 
@@ -815,21 +945,64 @@ Grafana 查询 ~$4（10 人 × 1 分钟刷新）。
 
 ---
 
-## 8. 待决策与进行中
+## 8. 待决策与已知缺口
 
-| # | 事项 | 影响 | 状态 |
+以下都是实测确认的，不是猜测。
+
+### 8.1 sink 每天丢 5k–28k 条日志
+
+`mlobs_raw.export_errors` 累计 20.6 万行，仍在增长。原因是 `stderr` 表建表时把
+`json_payload` 推断成 RECORD，而 kueue 控制器输出的是 JSON 字符串，类型冲突整条
+丢弃 —— 近两天 24,638 条，全部来自 `kueue-controller-manager`，`level` 是
+`Level(-2)`（debug，被 GKE 标成 ERROR 严重性）。
+
+丢的不是训练错误，但 kueue 恰好决定「作业为什么没被调度」。sink 的表 schema 由
+Cloud Logging 推断，我们无法干预；彻底解决要走 Log Analytics 链接数据集
+（`defaultLink` 已存在，payload 是 JSON 类型，不存在这个冲突）。
+**最低成本的缓解是给 `export_errors` 行数加一条告警**，至少让它可见。
+
+### 8.2 13 GiB 的 ML Diagnostics 采了没接上
+
+存在两条并行链路，一条在跑一条从未接通：
+
+| 路径 | 数据量 | 状态 | 进 fact_event |
 |---|---|---|---|
-| 0 | ~~提交流默认打开 goodput 开关~~ + 平台侧接入 | `primatrix/maxtext#958` 08-31 合并，平台已采 4 个 workload 指标并建 `fact_goodput_measured`，首个任务实测 measured 8.1% vs 代理 22.1%。见[附录 B §9](docs/metrics.md) | ✅ 已完成 |
-| 0b | **通知提交者拉取 main** | `resolve_config()` 跑在提交端，不拉取就还是旧默认值。09-01 集群里只有 1 个 job 是 `ENABLE_GOODPUT=true` | ⏳ **待推动，这是现在唯一的瓶颈** |
-| 1 | ~~`sidecar-log-collector` exclusion filter~~ | **撤回。** 实测该容器 99.94% 的输出是 TPU 驱动日志（`tpu_driver.INFO`），不是噪声 —— 「零信息量」那句只占 0.06%。它反而是编译耗时和显存分配的唯一来源，见 [附录 A](docs/logs.md) §4 | ❌ 已撤回 |
-| 2 | **TPU 价格单位核实 + 开 Billing Export** | 所有成本数字有 **4 倍**不确定性 | ⏳ 待决策 |
-| 3 | **修 `maxtext_completed_step` 指标** | 「Training Stalled」告警对 **falcon-jobs 全部不生效**（filter 要求 `pod_name=~"-worker-"`，falcon pod 名对不上） | ⏳ 待决策（改现有生产告警） |
-| 4 | **kubemaker 改用 JobSet** | 1,540 个任务白拿 GKE 原生 goodput | 🚧 **TBD —— 蚂蚁正在做** |
-| 5 | Cluster Director 单 run 深链接路径 | 一站式页面上该按钮只到项目级 | ⏳ 需在浏览器里实测一次 |
-| 7 | **All Capacity 拓扑与健康** | 可拿到 block / sub-block / OCS 健康（`degradedInfraCount`）与 VM 的 `physical_host_topology`，能回答「变慢的 rank 是不是都在同一个 block」 | 🚧 **TBD —— 集群尚未启用该模式** |
-| 6 | 废弃 771 个 `custom.googleapis.com` 描述符 | 省 $0，仅整洁 | ⏳ 低优先级，`tools/deprecate_legacy_metrics.sh` 已备 |
+| 日志 sink `ml_diagnostics_workload_event` | 23,419 行 | 在跑 | 4,351 条 |
+| REST 轮询 `mldiag_poller.py` → `mldiag_runs/events` | **13 GiB / 1,900 万行** | `02_dim_mlrun.sql` 从未进刷新序列 | 0 |
 
----
+手工跑一次 `02_dim_mlrun.sql` 产出 24,793 个 run、8,041 条事件、24,098 个 job 可对上。
+两条路**不是重复**：
+
+```
+sink 路径    PERFORMANCE_DEGRADATION 4,344 · HANG 7
+轮询路径     PERFORMANCE_DEGRADATION 8,020（349 条带根因）
+             ORCHESTRATOR_INTERRUPTION 14（全部带根因）← sink 路径完全没有
+             HANG 7（全部带根因）
+```
+
+轮询路径多近一倍事件，且带 `detected_analyzers` 根因与 `duration_s` 时长。
+要么接上（`02_dim_mlrun` 进序列），要么停采（省 13 GiB 与轮询开销）。
+两者都比现在好 —— 现在是付着存储费却没有产出。
+
+`03_dim_job.sql` 同样从未进序列，但它的角色已被 `08_views.sql` 的 `job_hub` 取代，
+可以直接删除。
+
+### 8.3 对外交付的两个前置动作
+
+- **给 `mlobs-share-reader` 设每日扫描配额**，凭据交付前必须完成。IAM 管得住
+  「能读什么」，管不住「读多频」：一条不带时间条件的 `SELECT * FROM v_event`
+  单次扫 6.3 GiB，每分钟一次就是 9 TiB/天。
+- **凭据方式**：工作负载身份联合（无长期密钥，需对方提供 OIDC issuer）
+  优于密钥文件。
+
+### 8.4 已记录的取舍
+
+- `v_job.owner` 是真实邮箱（含 QQ、Gmail、高校地址）。曾改为哈希假名，按要求
+  回退为明文 —— 消费方需要联系到人。已在 `create_share.sh` 注明是决定而非疏漏。
+- `fact_chip.duty_pct` 是实例均值，见 4.4。
+- MFU 已从面板隐藏（峰值按 bf16 取，fp8 任务读数约为真实值一半），
+  `mfu_pct` 仍在 `fin_daily` 与 `fin_export` 中可查。
+
 
 ## 9. 路线图
 

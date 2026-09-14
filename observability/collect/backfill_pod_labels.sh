@@ -20,6 +20,12 @@
 # immutable for the pod's lifetime, so one row each is all dim_pod can use.
 #
 #   DAYS=7 PROJECT_ID=tpu-launchpad-playground ./backfill_pod_labels.sh
+#
+# COST: 10.71 TiB billed for the 31-day window, about $67 at the US on-demand
+# rate, measured 2026-09-04. Unlike backfill_step_lines.sh this has no per-day
+# skip -- it is one CREATE OR REPLACE over the whole window -- so every run pays
+# in full. Do not re-run to "refresh" it; widen DAYS only when the extra history
+# is actually needed.
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID must be set}"
@@ -34,22 +40,26 @@ SQL="
 -- linked dataset keeps them verbatim, dots and slashes included. dim_pod reads
 -- the sanitised form, so the backfill has to translate. A first version did
 -- not, and silently produced zero rows.
--- DROP first: an earlier version of this script created the table partitioned
--- by DATE(timestamp), and CREATE OR REPLACE cannot drop a partitioning spec.
-DROP TABLE IF EXISTS mlobs_raw.pod_labels_backfill;
-CREATE TABLE mlobs_raw.pod_labels_backfill AS
+-- CREATE OR REPLACE, not DROP-then-CREATE. The old table was partitioned by
+-- DATE(timestamp) and a replace cannot drop a partitioning spec, which is why
+-- this dropped first; the table has since been rebuilt unpartitioned, so the
+-- reason is gone and the drop is now pure downside. A replace only swaps the
+-- table if the query succeeds, whereas a drop destroys the existing history the
+-- moment the run starts -- and this scans ~16 TB over 30 days, which is exactly
+-- the length of run that fails partway.
+CREATE OR REPLACE TABLE mlobs_raw.pod_labels_backfill AS
 WITH src AS (
   SELECT
     timestamp,
     -- events name the pod only in involvedObject; normalise it into one place
-    COALESCE(resource.labels.pod_name,
+    COALESCE(JSON_VALUE(resource.labels, '\$.pod_name'),
              IF(JSON_VALUE(json_payload, '\$.involvedObject.kind') = 'Pod',
                 JSON_VALUE(json_payload, '\$.involvedObject.name'), NULL)) AS pod_name,
     resource.type                  AS resource_type,
-    resource.labels.namespace_name AS namespace_name,
-    resource.labels.cluster_name   AS cluster_name,
-    resource.labels.location       AS location,
-    resource.labels.container_name AS container_name,
+    JSON_VALUE(resource.labels, '\$.namespace_name') AS namespace_name,
+    JSON_VALUE(resource.labels, '\$.cluster_name')   AS cluster_name,
+    JSON_VALUE(resource.labels, '\$.location')       AS location,
+    JSON_VALUE(resource.labels, '\$.container_name') AS container_name,
     JSON_VALUE(labels, '\$.\"logging.gke.io/top_level_controller_name\"')          AS controller_name,
     JSON_VALUE(labels, '\$.\"logging.gke.io/top_level_controller_type\"')          AS controller_type,
     JSON_VALUE(labels, '\$.\"k8s-pod/jobset_sigs_k8s_io/jobset-name\"')            AS jobset_name,
@@ -104,3 +114,19 @@ FROM src
 WHERE pod_name IS NOT NULL
 GROUP BY pod_name
 "
+
+# The SQL above was assembled into $SQL and then never run: the script ended at
+# the closing quote, exited 0, and printed nothing, so it looked like a success
+# every time. The 8,746 rows that were in the table came from a hand-run copy of
+# the query, not from this file.
+echo "  scanning ${DAYS} days of defaultLink._AllLogs -- this is a large scan"
+bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --quiet --format=none "$SQL"
+
+bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=csv --quiet \
+  "SELECT CONCAT('  ', CAST(COUNT(*) AS STRING), ' pods, ',
+                 FORMAT_TIMESTAMP('%Y-%m-%d', MIN(timestamp)), ' .. ',
+                 FORMAT_TIMESTAMP('%Y-%m-%d', MAX(timestamp)))
+   FROM \`${PROJECT_ID}.mlobs_raw.pod_labels_backfill\`" | tail -1
+
+echo "  done. Re-run model/01_dim_pod.sql to merge these pods in, then"
+echo "  model/07_fact_step.sql with a widened window so the steps can join."

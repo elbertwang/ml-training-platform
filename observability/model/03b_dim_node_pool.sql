@@ -19,6 +19,22 @@
 -- from the current snapshot would answer "unknown" for three quarters of the
 -- fleet's history, and would answer it worse every month. Rows are kept
 -- forever: 60 per snapshot, a few hundred distinct groups a year, kilobytes.
+--
+-- Accumulating only fixes the future, though. Pools deleted before the collector
+-- existed were still missing, and that gap is what suppressed chip_utilization
+-- and MFU for every day before 2026-09-01: 1,378 instance groups appear in
+-- dim_pod over 31 days and this table knew 58 of them.
+--
+-- The history came back from Cloud Asset Inventory, which keeps 35 days of
+-- resource configuration and answers a question no log can -- not "what
+-- happened" but "what did this resource look like at time T". See
+-- collect/backfill_node_pools_asset.py, which writes into the same
+-- node_pool_snapshot table through the same to_rows(), with observed_at set to
+-- the snapshot's readTime. That took this table from 58 groups to 573.
+--
+-- Note the MERGE window below is two days. A backfill writing month-old rows is
+-- invisible to it, so a run of that script has to be followed by this file with
+-- the interval widened past the oldest snapshot written.
 
 CREATE OR REPLACE FUNCTION mlobs_core.node_ig_hash(node_name STRING)
 RETURNS STRING AS (

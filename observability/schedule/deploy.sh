@@ -65,14 +65,33 @@ ensure_artifact_repo "$PROJECT_ID" "$REGION" "$REPO"
 gcloud builds submit "$ROOT" --project "$PROJECT_ID" --region "$REGION" \
   --config "${HERE}/cloudbuild.yaml" \
   --substitutions "_IMAGE=${IMAGE}" --quiet >/dev/null
-echo "  ${IMAGE}"
+
+# Resolve the tag to a digest and deploy THAT.
+#
+# refresh:v1 is a moving tag, and Cloud Run pins whatever digest it resolved at
+# the time the job was last updated. Re-pushing the tag therefore changes
+# nothing: `gcloud run jobs update --image <same tag string>` is a no-op, the
+# job keeps executing the old digest, and every model change silently fails to
+# ship. That is not hypothetical -- it is what made the scheduled refresh
+# overwrite hand-applied SQL six times running, each "fix" being another rebuild
+# that the job never picked up. On 2026-09-08 the registry held
+# bcdd286... while the job was still executing 739561c...
+#
+# serve/grafana/deploy.sh already asserted digests for its service pair; this
+# script never did, which is exactly why the problem stopped happening there and
+# kept happening here.
+DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --project "$PROJECT_ID" \
+         --format='value(image_summary.digest)' 2>/dev/null)
+[[ -n "$DIGEST" ]] || { echo "  cannot resolve digest for ${IMAGE}" >&2; exit 1; }
+IMAGE_REF="${IMAGE%%:*}@${DIGEST}"
+echo "  ${IMAGE} -> ${DIGEST}"
 
 echo "=== Cloud Run job ==="
 # --task-timeout stays under the hour the metadata token is valid for; see
 # entrypoint.sh. --max-retries 1 because every step is idempotent (a bounded
 # DELETE-then-INSERT inside a transaction, or a CREATE OR REPLACE) but a
 # genuinely broken run should surface rather than loop.
-ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE"
+ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE_REF"
       --service-account "$SA"
       --set-env-vars "PROJECT_ID=${PROJECT_ID},REGION=${REGION},MLDIAG_LOCATIONS=${MLDIAG_LOCATIONS},METRIC_HOURS=1"
       --memory 2Gi --cpu 1 --task-timeout 45m --max-retries 1 --quiet)
@@ -96,7 +115,7 @@ fi
 # so there is nothing extra to build: one API call and a small load, a few
 # seconds per run.
 POOLSNAP="${POOLSNAP:-mlobs-poolsnap}"
-SNAP_ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE"
+SNAP_ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE_REF"
            --service-account "$SA"
            --command python3
            --args "/app/collect/node_pool_snapshot.py,--project,${PROJECT_ID}"
@@ -135,6 +154,7 @@ for ATTEMPT in 1 2 3 4 5 6; do   # same SA creation-propagation delay as above
 done
 echo "  ${SCHED_SA} may invoke ${JOB}"
 
+
 URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB}:run"
 SARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$SCHEDULE"
        --uri "$URI" --http-method POST --time-zone UTC
@@ -151,3 +171,18 @@ fi
 echo
 echo "  Run once now:  gcloud run jobs execute ${JOB} --project ${PROJECT_ID} --region ${REGION}"
 echo "  Pause:         gcloud scheduler jobs pause ${JOB} --project ${PROJECT_ID} --location ${REGION}"
+
+# Assert, do not assume. The failure this guards against is silent: the deploy
+# reports success, the job runs on schedule, and only the SQL inside it is
+# months stale. Comparing what each job actually resolved against what was just
+# built turns that into a failed deploy.
+for J in "$JOB" "$POOLSNAP"; do
+  RUNNING=$(gcloud run jobs describe "$J" --project "$PROJECT_ID" --region "$REGION" \
+            --format='value(spec.template.spec.template.spec.containers[0].image)' 2>/dev/null)
+  if [[ "$RUNNING" == "$IMAGE_REF" ]]; then
+    echo "  ${J} on ${DIGEST##*:}"
+  else
+    echo "  MISMATCH -- ${J} runs ${RUNNING:-?}, expected ${IMAGE_REF}" >&2
+    exit 1
+  fi
+done

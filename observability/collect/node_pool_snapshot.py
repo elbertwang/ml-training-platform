@@ -126,9 +126,10 @@ def to_rows(pools, cluster, location, observed_at):
     return rows
 
 
-def bq_load(project, dataset, rows):
+def bq_load_rows(project, dataset, table, rows, schema, clustering=None):
+    """Load NDJSON into one table. Shared by both snapshots in this collector."""
     if not rows:
-        print("  nothing to load", flush=True)
+        print(f"  {table}: nothing to load", flush=True)
         return
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         for r in rows:
@@ -138,19 +139,103 @@ def bq_load(project, dataset, rows):
         "bq", f"--project_id={project}", "load",
         "--source_format=NEWLINE_DELIMITED_JSON",
         "--time_partitioning_field=observed_at",
-        "--clustering_fields=node_pool",
-        f"{dataset}.node_pool_snapshot", path,
-        ("cluster_name:STRING,location:STRING,node_pool:STRING,ig_hash:STRING,"
-         "reservation_affinity:STRING,reservation_name:STRING,capacity_class:STRING,"
-         "machine_type:STRING,tpu_topology:STRING,node_version:STRING,"
-         "initial_node_count:INTEGER,pool_status:STRING,observed_at:TIMESTAMP"),
     ]
+    if clustering:
+        cmd.append(f"--clustering_fields={clustering}")
+    cmd += [f"{dataset}.{table}", path, schema]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         # bq writes load errors to stdout, not stderr -- print both or the
         # failure reads as empty. Learned from metric_samples' schema drift.
-        sys.exit(f"load failed:\n{res.stdout}\n{res.stderr}")
-    print(f"  loaded {len(rows)} rows", flush=True)
+        sys.exit(f"load into {table} failed:\n{res.stdout}\n{res.stderr}")
+    print(f"  {table}: loaded {len(rows)} rows", flush=True)
+
+
+def bq_load(project, dataset, rows):
+    bq_load_rows(
+        project, dataset, "node_pool_snapshot", rows,
+        ("cluster_name:STRING,location:STRING,node_pool:STRING,ig_hash:STRING,"
+         "reservation_affinity:STRING,reservation_name:STRING,capacity_class:STRING,"
+         "machine_type:STRING,tpu_topology:STRING,node_version:STRING,"
+         "initial_node_count:INTEGER,pool_status:STRING,observed_at:TIMESTAMP"),
+        clustering="node_pool")
+
+
+def fetch_reservations(token, project):
+    """id, name and size for every reservation, from the Compute API.
+
+    The reason this exists is a mismatch between two sources that both describe
+    the same reservation and share no key:
+
+        compute.googleapis.com/reservation/reserved   resource label
+                                                      reservation_id=2877059003882016695
+        container nodePools[].config.reservationAffinity
+                                                      values=[ghostfish-luwqsqv4va7tk]
+
+    The metric carries only the numeric id, the node pool only the name, so the
+    denominator (chips paid for) and the numerator (chips doing work) cannot be
+    joined without this. The Compute API returns both in one call, which is why
+    the mapping is resolved at collection time and written into the capacity
+    table rather than published as a bridge for the consumer to join -- they get
+    one denominator table carrying both identifiers.
+
+    Folded into this collector rather than given its own Cloud Run job: it needs
+    the same token, runs on the same cadence, and returns two rows.
+    """
+    url = (f"https://compute.googleapis.com/compute/v1/projects/{project}"
+           f"/aggregated/reservations")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        body = json.load(urllib.request.urlopen(req, timeout=120))
+    except urllib.error.HTTPError as e:
+        print(f"  reservations.aggregatedList failed: HTTP {e.code} "
+              f"{e.read()[:200]}", flush=True)
+        return []
+    rows = []
+    for scope, blk in (body.get("items") or {}).items():
+        for r in blk.get("reservations", []):
+            # TPU pod slices come back as aggregateReservation, not
+            # specificReservation -- the shape a first version assumed, which
+            # left every count NULL. The accelerator count is the chip count,
+            # and the API reports reserved and in-use side by side:
+            #
+            #   aggregateReservation.reservedResources[].accelerator.acceleratorCount
+            #   aggregateReservation.inUseResources[].accelerator.acceleratorCount
+            #
+            # That makes this an independent check on
+            # compute.googleapis.com/reservation/{reserved,used}: two unrelated
+            # surfaces reporting the same pair. specificReservation is still
+            # handled because a non-TPU reservation would use it.
+            def _chips(bucket):
+                total = 0
+                for item in (agg.get(bucket) or []):
+                    total += int(item.get("accelerator", {}).get("acceleratorCount") or 0)
+                return total or None
+
+            agg = r.get("aggregateReservation", {}) or {}
+            accel_type = None
+            for item in (agg.get("reservedResources") or []):
+                accel_type = item.get("accelerator", {}).get("acceleratorType")
+                if accel_type:
+                    accel_type = accel_type.rsplit("/", 1)[-1]
+                    break
+            reserved = _chips("reservedResources")
+            in_use = _chips("inUseResources")
+            if reserved is None:
+                sp = r.get("specificReservation", {}) or {}
+                reserved = int(sp["count"]) if sp.get("count") else None
+            rows.append({
+                "reservation_id": r.get("id"),
+                "reservation_name": r.get("name"),
+                "zone": scope.split("/")[-1],
+                "status": r.get("status"),
+                "vm_family": agg.get("vmFamily"),
+                "accelerator_type": accel_type,
+                "reserved_chips": reserved,
+                "in_use_chips": in_use,
+                "observed_at": None,   # filled by the caller
+            })
+    return rows
 
 
 def main():
@@ -183,6 +268,17 @@ def main():
             print(json.dumps(r, ensure_ascii=False))
         return
     bq_load(a.project, a.dataset, rows)
+
+    # Reservations, into their own table. Same run, same token, two rows.
+    res = fetch_reservations(token, a.project)
+    for r in res:
+        r["observed_at"] = observed_at
+    if res:
+        bq_load_rows(
+            a.project, a.dataset, "reservation_snapshot", res,
+            "reservation_id:STRING,reservation_name:STRING,zone:STRING,"
+            "status:STRING,vm_family:STRING,accelerator_type:STRING,"
+            "reserved_chips:INTEGER,in_use_chips:INTEGER,observed_at:TIMESTAMP")
 
 
 if __name__ == "__main__":
