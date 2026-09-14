@@ -188,9 +188,16 @@ def fetch_reservations(token, project):
     try:
         body = json.load(urllib.request.urlopen(req, timeout=120))
     except urllib.error.HTTPError as e:
-        print(f"  reservations.aggregatedList failed: HTTP {e.code} "
-              f"{e.read()[:200]}", flush=True)
-        return []
+        # Raised, not swallowed. This returned [] for three days on a 403 --
+        # the caller's `if res:` then wrote nothing, printed nothing, and the
+        # job exited 0 on every one of 160 runs. reservation_snapshot stopped
+        # at two rows from 2026-09-11 06:12 and mlobs_share.v_capacity_daily
+        # lost the name for five of its seven reservations, which is a column
+        # the customer document calls the join key. A collector that cannot
+        # collect has to say so; refresh.sh decides whether that is fatal.
+        raise RuntimeError(
+            f"reservations.aggregatedList: HTTP {e.code} {e.read()[:300]}"
+        ) from None
     rows = []
     for scope, blk in (body.get("items") or {}).items():
         for r in blk.get("reservations", []):
@@ -270,10 +277,17 @@ def main():
     bq_load(a.project, a.dataset, rows)
 
     # Reservations, into their own table. Same run, same token, two rows.
+    # This is the only source of reservation_id -> reservation_name: the
+    # Monitoring series carries the numeric id and nothing else, so without
+    # this call v_capacity_daily can only publish ids.
     res = fetch_reservations(token, a.project)
     for r in res:
         r["observed_at"] = observed_at
-    if res:
+    if not res:
+        # An empty list is a real answer only if the project has no
+        # reservations, which would itself be worth seeing in the log.
+        print("  reservation_snapshot: no reservations returned", flush=True)
+    else:
         bq_load_rows(
             a.project, a.dataset, "reservation_snapshot", res,
             "reservation_id:STRING,reservation_name:STRING,zone:STRING,"
