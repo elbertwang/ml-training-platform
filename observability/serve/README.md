@@ -29,7 +29,7 @@ PROJECT_ID=tpu-for-training ./grafana/deploy.sh
 一条命令做完：服务账号 + 三个数据源各自的读权限、Artifact Registry、
 生成 dashboard JSON、Cloud Build 构建镜像、部署 Cloud Run。
 
-两个 dashboard：`/d/mlobs-jobs`（任务索引，点 job 名进详情）与
+四个 dashboard：`/d/mlobs-jobs`（任务索引，点 job 名进详情）与
 `/d/mlobs-job`（单个 job 的七个分区，可带 `?var-job_key=<JOB>` 直达）。
 
 ### 认证模型：两个服务

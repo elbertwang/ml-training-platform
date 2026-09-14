@@ -438,90 +438,30 @@ LEFT JOIN metric_coverage mc ON mc.day = COALESCE(b.day, f.day);
 COMMIT TRANSACTION;
 
 
--- Cluster-wide occupancy, with no attribution at all.
+-- fin_occupancy_daily was here, and is gone.
 --
--- Everything above needs to know which capacity class a pod ran on, and that
--- knowledge starts when the node pool snapshot did -- so the reserved-only
--- ratios cannot reach back before it. This one only sums the accelerator
--- metric, so it goes back as far as Cloud Monitoring keeps the samples, which
--- is where the long trend has to come from.
+-- It was the last table in this model that derived a quantity from raw metric
+-- samples on its own -- container-scoped tensorcore, its own LAG to measure the
+-- sampling interval, its own 300s fallback. That is the exact pattern fact_chip
+-- was built to end, and keeping one instance of it alive kept alive the
+-- question "which of these two numbers is right".
 --
--- It is a different question and the numbers are not interchangeable: this
--- counts every chip in every cluster, on-demand and flex-start included, while
--- chip_utilization_pct counts only capacity that was paid for as reserved. Read
--- together they bracket the fleet; read as one number they are wrong.
--- Incremental, not CREATE OR REPLACE, and the reason is cost rather than taste.
+-- Three things were wrong with it by 2026-09-14:
 --
--- A full rebuild reads every tensorcore sample ever collected, and mlobs-refresh
--- runs every 30 minutes: 48 full scans a day of a table that only ever grows.
--- Measured 2026-09-04 with 24 days of samples loaded, one rebuild scanned 561 MB
--- -- 27 GB/day, about $5/month. The 90-day backfill in flight multiplies the
--- tensorcore rows by roughly 3.7, taking it to ~$19/month, and it would keep
--- climbing with every day of history for no gain: a past day's occupancy cannot
--- change once its samples have landed.
+--   * Its stated purpose was long history, and it had the shortest: 101 days
+--     against 184 everywhere else, because it read mlobs_raw.metric_samples,
+--     which only holds container tensorcore from 2026-06-06. The recovered
+--     history lives in fact_chip.
+--   * Its denominator was chips a *container* reported, so it published 19.44%
+--     over thirty days where the node-scoped equivalent is 14.67%. That 33%
+--     overstatement is the same series-average artefact this file's header
+--     criticises, sitting one panel away from the corrected figures.
+--   * It duplicated quantities fin_work_daily already carries.
 --
--- metric_samples is DAY-partitioned on point_time and clustered on metric_type,
--- so a windowed read prunes hard -- the same two-day slice scans 15 MB against
--- the full table's 561 MB. Same fix, and the same reasoning, as the dim_pod MERGE
--- in model/01_dim_pod.sql.
---
--- To rebuild history -- after a backfill lands old days, which a two-day window
--- will not notice -- run this file with the interval widened:
---   sed 's/INTERVAL 2 DAY/INTERVAL 95 DAY/; s/INTERVAL 3 DAY/INTERVAL 96 DAY/' \
---     model/09_fin_utilization.sql | bq query ...
---
--- Both intervals, and that is not a detail. Widening only the first one moves
--- the DELETE and the final WHERE out to 95 days while the source read stays at
--- 3, so the statement deletes three months of history and reinserts three days
--- of it.
---
--- Written inline rather than as a DECLARE: BigQuery only accepts variable
--- declarations at the start of a script or block, and this sits mid-file.
-
-CREATE TABLE IF NOT EXISTS mlobs_core.fin_occupancy_daily
-(
-  day                    DATE,
-  busy_chip_hours_all    FLOAT64,
-  present_chip_hours_all FLOAT64,
-  mean_occupancy_pct     FLOAT64,
-  chips_seen             INT64
-)
-CLUSTER BY day;
-
-BEGIN TRANSACTION;
-
-DELETE FROM mlobs_core.fin_occupancy_daily
-WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY);
-
-INSERT INTO mlobs_core.fin_occupancy_daily
-SELECT
-  DATE(point_time) AS day,
-  ROUND(SUM(value / 100 * interval_s / 3600), 2) AS busy_chip_hours_all,
-  ROUND(SUM(interval_s) / 3600, 2)               AS present_chip_hours_all,
-  ROUND(100 * SAFE_DIVIDE(SUM(value / 100 * interval_s),
-                          SUM(interval_s)), 2)   AS mean_occupancy_pct,
-  COUNT(DISTINCT CONCAT(JSON_VALUE(resource_labels, '$.pod_name'), '/',
-                        JSON_VALUE(metric_labels, '$.accelerator_id'))) AS chips_seen
-FROM (
-  SELECT point_time, value, resource_labels, metric_labels,
-         COALESCE(TIMESTAMP_DIFF(point_time,
-           LAG(point_time) OVER (
-             PARTITION BY JSON_VALUE(resource_labels, '$.pod_name'),
-                          JSON_VALUE(metric_labels, '$.accelerator_id')
-             ORDER BY point_time), SECOND), 300) AS interval_s
-  FROM mlobs_raw.metric_samples
-  WHERE metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
-    -- One day of lookback beyond the window that gets written. LAG needs the
-    -- sample before the first one of the window to measure its interval;
-    -- without it every series would restart at the 300s default on the window
-    -- boundary and the first day of each run would be slightly understated.
-    AND point_time >= TIMESTAMP(DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
-)
-WHERE DATE(point_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
-GROUP BY day;
-
-COMMIT TRANSACTION;
-
+-- The Grafana panel that read it now computes busy_chip_hours / vm_chip_hours
+-- from fin_daily. That is still attribution-free -- neither column needs
+-- job_key -- so the panel keeps the property it existed for, and gains the
+-- full 184 days.
 
 -- The finance sheet. One row per day; every column has a formula in the header.
 CREATE OR REPLACE VIEW mlobs_core.fin_daily AS

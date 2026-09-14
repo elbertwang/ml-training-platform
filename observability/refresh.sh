@@ -28,8 +28,8 @@ echo "=== Collect ==="
 #
 # This used to be four bare commands under `set -e`. On 2026-09-14 a 403 from a
 # cosmetic link lookup aborted the run before a single model file executed, and
-# mldiag_poller -- whose output nothing downstream reads, because 02_dim_mlrun is
-# not in the loop below -- ran first and had exactly the same power. The metric
+# mldiag_poller -- which had no business going first -- ran first and had
+# exactly the same power. The metric
 # window is one hour and the cadence thirty minutes, so two consecutive aborts
 # lose accelerator samples permanently. Letting an unrelated collector hold that
 # hostage is the wrong trade.
@@ -70,19 +70,31 @@ collect required v_sink_logs \
 collect optional node_pool_snapshot \
   python3 "${HERE}/collect/node_pool_snapshot.py" --project "$PROJECT_ID"
 
-# Last, and optional: 02_dim_mlrun.sql is not in the model loop, so nothing
-# downstream consumes what this writes. It used to run first.
+# Last, and optional. Its output does reach fact_event -- 02_dim_mlrun.sql
+# builds dim_mlrun and fact_mlrun_event as views over these tables and
+# 04_fact_event.sql joins them -- but they are views, so a poll that fails
+# leaves the previous state readable rather than leaving a hole. It used to
+# run first, where a failure cost the whole model rebuild.
 collect optional mldiag_poller \
   "${HERE}/collect/mldiag_poller.py" --project "$PROJECT_ID" \
                                      --locations "$MLDIAG_LOCATIONS" --since-hours 6
 
 echo "=== Model ==="
-for f in 00b_dim_config 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
+for f in 00b_dim_config 00c_compact_mldiag 02_dim_mlrun 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
   printf "  %-18s " "$f"
   if out=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
              < "${HERE}/model/${f}.sql" 2>&1); then
-    echo "$out" | grep -Eo '(Created|Replaced|Number of affected rows: [0-9]+)[ a-z._-]*' \
-      | tr '\n' ' '; echo
+    # `|| true`, because grep exits 1 when it matches nothing and `set -o
+    # pipefail` then makes that the pipeline's status, which `set -e` turns into
+    # the end of the run. Every model file used to emit at least one
+    # Created/Replaced/affected-rows line, so this never fired until
+    # 00c_compact_mldiag -- whose whole point is to print nothing on the runs
+    # where it decides not to act -- killed two consecutive refreshes at the
+    # second file in the loop, with no error message, because the failing
+    # command was the summariser and not the query.
+    { echo "$out" | grep -Eo '(Created|Replaced|Number of affected rows: [0-9]+)[ a-z._-]*' \
+      | tr '\n' ' '; } || true
+    echo
   else
     echo "FAILED"; echo "$out" | tail -6; exit 1
   fi

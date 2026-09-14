@@ -41,16 +41,34 @@ bqq "CREATE TABLE IF NOT EXISTS ${TABLE}
      (timestamp TIMESTAMP, resource JSON, text_payload STRING, json_payload JSON)
      PARTITION BY DATE(timestamp)"
 
-for ((i = DAYS; i >= 1; i--)); do
-  DAY=$(date -u -d "$i days ago" +%Y-%m-%d)
-  NEXT=$(date -u -d "$((i - 1)) days ago" +%Y-%m-%d)
+# Anchored to a fixed date, computed once. `date -u -d "$i days ago"` inside the
+# loop is relative to the moment it runs, so two runs a few hours apart covered
+# different ranges and today was never covered by either -- the loop stops at
+# i=1, which is yesterday. END_DAY defaults to today so the current partial day
+# is included; set it to pin a historical window.
+END_DAY="${END_DAY:-$(date -u +%Y-%m-%d)}"
+for ((i = DAYS; i >= 0; i--)); do
+  DAY=$(date -u -d "${END_DAY} -${i} days" +%Y-%m-%d)
+  NEXT=$(date -u -d "${DAY} +1 day" +%Y-%m-%d)
 
+  # "Any rows at all" is not the same as "this day is done". An INSERT that
+  # committed part-way, or an earlier run with a narrower window, leaves rows
+  # behind and this skip then makes the shortfall permanent -- fact_step and
+  # MFU are quietly light for that day with nothing to notice. SKIP_PARTIAL=0
+  # re-reads a day that already has rows; the load is idempotent per day
+  # because the DELETE below clears the date first.
   HAVE=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=csv --quiet \
          "SELECT COUNT(*) FROM ${TABLE} WHERE DATE(timestamp) = '${DAY}'" | tail -1)
-  if [[ "${HAVE:-0}" -gt 0 ]]; then
-    echo "  ${DAY}: ${HAVE} rows already, skipping"
+  if [[ "${HAVE:-0}" -gt 0 && "${SKIP_PARTIAL:-1}" == "1" ]]; then
+    echo "  ${DAY}: ${HAVE} rows already, skipping (SKIP_PARTIAL=0 to re-read)"
     continue
   fi
+
+  # Clear the day first. This used to be a bare INSERT, which made the skip
+  # above load-bearing: without it a second pass over a day silently doubled its
+  # rows. Deleting the date makes one day one unit of work, so re-reading a
+  # partial day is a repair rather than a corruption.
+  bqq "DELETE FROM ${TABLE} WHERE DATE(timestamp) = '${DAY}'" >/dev/null
 
   # resource is rebuilt as JSON with only labels.pod_name, which is the single
   # field fact_step reads out of it. TO_JSON of the whole struct would carry

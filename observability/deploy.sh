@@ -94,11 +94,27 @@ done
 echo "=== Config table ==="
 RETENTION=$(gcloud logging buckets describe _Default --location=global \
             --project="$PROJECT_ID" --format="value(retentionDays)" 2>/dev/null || echo 30)
-bqq "CREATE OR REPLACE TABLE mlobs_core.dim_config AS
-     SELECT '${PROJECT_ID}' AS project_id,
-            '${LOCATION}'   AS bq_location,
-            ${RETENTION}    AS log_retention_days" >/dev/null
-echo "  project_id=${PROJECT_ID} location=${LOCATION} log_retention_days=${RETENTION}"
+# MERGE, not CREATE OR REPLACE, and no bq_location column.
+#
+# Two files were writing this table with different schemas: this one with three
+# columns and model/00b_dim_config.sql with two. Whichever ran last won, and
+# this one would discard whatever the model's MERGE had accumulated. The live
+# table has the model's two columns, so this side had been losing the race
+# anyway, and nothing ever read bq_location.
+#
+# Ownership now follows what each side knows. The model file owns the schema and
+# guarantees a row exists with a documented default, so a refresh works on a
+# project deploy.sh has never touched. This owns the *measured* value --
+# retention read from the live bucket a moment ago -- and writes only that.
+bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
+   < "${HERE}/model/00b_dim_config.sql" >/dev/null
+bqq "MERGE mlobs_core.dim_config T
+     USING (SELECT '${PROJECT_ID}' AS project_id, ${RETENTION} AS log_retention_days) S
+     ON T.project_id = S.project_id
+     WHEN MATCHED THEN UPDATE SET log_retention_days = S.log_retention_days
+     WHEN NOT MATCHED THEN INSERT (project_id, log_retention_days)
+     VALUES (S.project_id, S.log_retention_days)" >/dev/null
+echo "  project_id=${PROJECT_ID} log_retention_days=${RETENTION}"
 
 # The model references metric_samples, which metrics_exporter.py creates on its
 # first load. Bootstrap it empty so `deploy.sh` works on a fresh project before

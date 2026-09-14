@@ -33,6 +33,7 @@ and avoids a window function over a growing table on every read.
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import os
 import subprocess
@@ -249,6 +250,18 @@ def fetch_series(token, project, metric_type, resource_type,
                     raise RuntimeError(
                         f"{metric_type}: HTTP {e.code} {e.read()[:200]}")
                 time.sleep(2 ** attempt)
+            except (urllib.error.URLError, TimeoutError, OSError,
+                    http.client.HTTPException) as e:
+                # Transport-level failures were propagating while HTTP errors
+                # retried, and this is the harmful direction: clear_window has
+                # already deleted the window and bq_load runs per chunk, so a
+                # crash mid-metric leaves it part-cleared and part-reloaded --
+                # and the next run's window has moved on, so the uncovered half
+                # is never re-fetched. A four-page request under a 120s timeout
+                # reaches this. mldiag_poller already catches these.
+                if attempt == 3:
+                    raise RuntimeError(f"{metric_type}: {type(e).__name__} {e}")
+                time.sleep(2 ** attempt)
         out.extend(page.get("timeSeries", []))
         token_next = page.get("nextPageToken")
         if not token_next:
@@ -290,8 +303,13 @@ def clear_window(project, dataset, start, end, metric_types=None):
     newly added metric over a wide window is the case that needs this -- a full
     reload of a day of tensorcore samples is thousands of series for no reason.
     """
+    # Closed on both ends, because the fetch is (start - 1s, end] and so
+    # returns the point at exactly `end`. A half-open delete leaves that point
+    # inserted-but-never-deleted, and two runs that snap to the same end_dt --
+    # a manual run racing the scheduled one, of which there were nine on
+    # 2026-09-14 -- would each insert it.
     where = (f"point_time >= TIMESTAMP('{start}') "
-             f"AND point_time < TIMESTAMP('{end}')")
+             f"AND point_time <= TIMESTAMP('{end}')")
     if metric_types:
         quoted = ", ".join("'" + m.replace("'", "") + "'" for m in metric_types)
         where += f" AND metric_type IN ({quoted})"
@@ -407,7 +425,15 @@ def main():
                 # could not reload it. With a 30-minute cadence and a one-hour
                 # window the boundaries land on :00 and :30, and those were
                 # exactly the buckets missing: 48 of 288 a day, 17%.
-                (cursor - dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                # ...but only for the first chunk. clear_window runs once,
+                # before this loop, so chunk N fetching (.., chunk_end] and
+                # chunk N+1 fetching (chunk_end - 1s, ..] both return the point
+                # at chunk_end and nothing deletes the first copy. A live run is
+                # a single chunk so it has never fired, but deploy.sh's
+                # FIRST_FILL_HOURS=12 against the default --chunk-hours 6 is two
+                # chunks, and any wide backfill duplicates once every 6 hours.
+                ((cursor - dt.timedelta(seconds=1)) if cursor == start_dt
+                 else cursor).isoformat().replace("+00:00", "Z"),
                 chunk_end.isoformat().replace("+00:00", "Z"),
                 alignment, aligner)
             rows = to_rows(series, metric_type, ingested_at)

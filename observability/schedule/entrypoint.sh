@@ -88,5 +88,5 @@ print(" ".join(sorted(
   fi
 fi
 
-echo "refresh start $(date -u +%FT%TZ) project=${PROJECT_ID}"
+echo "refresh start $(date -u +%FT%TZ) project=${PROJECT_ID} build=${BUILD_STAMP:-unstamped}"
 exec /app/refresh.sh

@@ -147,7 +147,10 @@ def bq_load(project: str, dataset: str, table: str, rows: list, schema: str) -> 
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(path)
     if result.returncode != 0:
-        sys.exit(f"bq load failed for {table}:\n{result.stderr}")
+        # bq writes load errors to stdout, not stderr, so printing only stderr
+        # yields a blank message on a schema-drift failure. The three sibling
+        # collectors all carry this note; this one was missed.
+        sys.exit(f"bq load failed for {table}:\n{result.stdout}\n{result.stderr}")
     print(f"  {table}: loaded {len(rows)} rows")
     return len(rows)
 

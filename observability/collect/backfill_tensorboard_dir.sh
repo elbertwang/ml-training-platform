@@ -57,6 +57,26 @@ if [[ ! -s "$TMP" ]]; then
   exit 0
 fi
 
+# The load below is --replace, so a truncated read would overwrite the table
+# with the truncated set. The empty check above catches a total failure; these
+# two catch a partial one.
+PARSED=$(wc -l < "$TMP")
+if (( PARSED >= 100000 )); then
+  echo "  parsed ${PARSED} lines, which is the --limit passed to gcloud logging"
+  echo "  read: the result is truncated and --replace would discard the rest."
+  echo "  Raise the limit or narrow DAYS, then re-run."
+  exit 1
+fi
+EXISTING=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
+             --format=csv --quiet "SELECT COUNT(*) FROM \`${PROJECT_ID}.${TABLE}\`" \
+           2>/dev/null | tail -1)
+EXISTING=${EXISTING:-0}
+if [[ "$EXISTING" =~ ^[0-9]+$ ]] && (( PARSED < EXISTING / 2 )); then
+  echo "  parsed ${PARSED} rows against ${EXISTING} already in the table."
+  echo "  A --replace here would halve it. Set FORCE=1 if that is intended."
+  [[ "${FORCE:-}" == "1" ]] || exit 1
+fi
+
 # WRITE_TRUNCATE: the window is the whole retained history every time, so the
 # file is the complete picture and a re-run cannot accumulate duplicates.
 bq --project_id="$PROJECT_ID" load \

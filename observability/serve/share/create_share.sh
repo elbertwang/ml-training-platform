@@ -94,7 +94,7 @@ echo "  v_freshness"
 # chip. v_capacity_daily carries that denominator per reservation, joined on
 # reservation_name.
 #
-# 12k rows a day. A full read of a month is cheap; no partition predicate is
+# 20k rows a day. A full read of a month is cheap; no partition predicate is
 # required, though one still prunes.
 bqq "CREATE OR REPLACE VIEW ${SHARE}.v_chip_hourly AS
 SELECT

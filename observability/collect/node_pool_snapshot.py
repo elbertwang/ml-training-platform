@@ -35,7 +35,8 @@ import urllib.request
 DEFAULT_PROJECT = os.environ.get("MLOBS_PROJECT", "tpu-for-training")
 DEFAULT_DATASET = os.environ.get("MLOBS_RAW_DATASET", "mlobs_raw")
 DEFAULT_CLUSTER = os.environ.get("GKE_CLUSTER", "")   # empty = discover
-DEFAULT_LOCATION = os.environ.get("GKE_LOCATION", "us-central1")
+# "-" is the API's wildcard for every location. See fetch_clusters().
+DEFAULT_LOCATION = os.environ.get("GKE_LOCATION", "-")
 
 # gke-tpu-for-trainin-tpu-256chips-p-aad6ce9c-grp -> aad6ce9c
 IG_HASH = re.compile(r"-([0-9a-f]{8})-grp$")
@@ -52,11 +53,21 @@ def access_token() -> str:
 
 
 def fetch_clusters(token, project, location):
-    """Every cluster in the location.
+    """Every cluster, as (name, location) pairs.
 
     Discovered rather than configured. The project went from one cluster to
     three without this collector noticing, and a finance number that silently
     covers a subset of the fleet is worse than one that is missing.
+
+    The location defaults to "-", meaning every region, and each cluster's own
+    location travels back with it -- listing is region-wide but nodePools.list
+    is not, so a single location variable could only ever be right for one of
+    them. With a hard-coded us-central1 the collector had missed
+    gke-tpu-train-us-east1-1-prod for the four days it had existed, while
+    metrics_exporter -- which filters on metric and resource type, never on
+    location -- was already landing everything that cluster produced. CPU-only
+    today, so the damage is zero; the first TPU pool there would have appeared
+    in every metric and in no capacity table.
     """
     url = (f"https://container.googleapis.com/v1/projects/{project}"
            f"/locations/{location}/clusters")
@@ -65,7 +76,8 @@ def fetch_clusters(token, project, location):
         body = json.load(urllib.request.urlopen(req, timeout=120))
     except urllib.error.HTTPError as e:
         sys.exit(f"clusters.list failed: HTTP {e.code} {e.read()[:300]}")
-    return [c["name"] for c in body.get("clusters", [])]
+    return [(c["name"], c.get("location", location))
+            for c in body.get("clusters", [])]
 
 
 def fetch_pools(token, project, location, cluster):
@@ -258,14 +270,20 @@ def main():
                          "them, to see what a run would record")
     a = ap.parse_args()
 
+    # Printed by every entry point, because the image is built from a working
+    # directory and the tag alone cannot say what is in it. See the build-stamp
+    # note in schedule/deploy.sh.
+    print(f"  build={os.environ.get('BUILD_STAMP', 'unstamped')}", flush=True)
     token = access_token()
     observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    clusters = ([c.strip() for c in a.cluster.split(",") if c.strip()]
+    # An explicit --cluster keeps --location's meaning: you named the cluster,
+    # so you have to say where it is.
+    clusters = ([(c.strip(), a.location) for c in a.cluster.split(",") if c.strip()]
                 or fetch_clusters(token, a.project, a.location))
     rows = []
-    for cluster in clusters:
-        pools = fetch_pools(token, a.project, a.location, cluster)
-        got = to_rows(pools, cluster, a.location, observed_at)
+    for cluster, cluster_location in clusters:
+        pools = fetch_pools(token, a.project, cluster_location, cluster)
+        got = to_rows(pools, cluster, cluster_location, observed_at)
         rows.extend(got)
         if not a.print_only:
             print(f"  {cluster}: {len(pools)} pools -> {len(got)} instance groups",

@@ -9,7 +9,8 @@
 -- recent days, one 3600-second row for days past Cloud Monitoring's six-week
 -- full-resolution window. It adds no measurement of its own; the reason it
 -- exists rather than a view is that a view over 4.6M rows is re-read on every
--- query, while this is 12k rows a day and can be scanned whole.
+-- query, while this is 20k rows a day on average -- 70k on the busiest day of
+-- the recovered history -- and can be scanned whole.
 --
 -- Numerator and denominator are both here. `vm_slots` is the five-minute-
 -- equivalent time in which the chip's node was up, which is the denominator of

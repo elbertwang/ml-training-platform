@@ -1586,27 +1586,33 @@ ORDER BY day""")],
     # present rather than chips paid for, so laying it alongside them would
     # invite exactly the comparison the title rules out.
     #
-    # It earns a place because it is the only utilisation series that needs no
-    # pod-to-job attribution -- it reads the accelerator metric directly. The
-    # attributed ratios can only reach back as far as pod identity was
-    # collected; this one reaches as far as Cloud Monitoring retains the metric.
+    # It earns a place because it needs no pod-to-job attribution: both of its
+    # terms come from the node-scoped accelerator metrics, which report for a
+    # chip whether or not anything is scheduled on it.
+    #
+    # It used to read mlobs_core.fin_occupancy_daily, a table that derived the
+    # same idea from raw container-scoped samples with its own interval logic.
+    # That table is gone -- it had the shortest history on a page whose point
+    # was long history (101 days against 184), and its container-scoped
+    # denominator published 19.44% where the node-scoped one reads 14.67%.
     panels.append({
         "type": "timeseries", "title": "TensorCore 占用率（免归因，可看长历史）",
-        "description": "公式：Σ(tensorcore_utilization ÷ 100 × 采样间隔) ÷ Σ(采样间隔)，"
-                       "间隔由相邻采样点时间差推得，因此监控降采样（6 周后 300s→600s）不会重复计权。\n\n"
-                       "**与上面的「卡利用率」有两处不同，两个数字不可直接相减：**\n\n"
-                       "1. 分母是**在场芯片小时**（采集到指标的芯片 × 时长），不是已付费芯片小时。\n"
-                       "2. 分子的芯片群体也不同：本图直接读原始采样 `mlobs_raw.metric_samples`，"
-                       "卡利用率读 `mlobs_core.fact_metric`，后者与 `dim_pod` 内连接，"
-                       "认不出 pod 的采样会被丢掉。\n\n"
-                       "正因为不做 pod→job 归因，它的历史长度只受 Cloud Monitoring 指标保留期限制，"
-                       "而不受我们从何时开始采集 pod 身份限制——这是它存在的理由。",
+        "description": "公式：`busy_chip_hours ÷ vm_chip_hours`，两者都来自 `fact_chip`，"
+                       "按每行的 `interval_s` 加权，因此实时段的 300 秒与回补历史段的"
+                       "3600 秒不会被算成同样长。\n\n"
+                       "**分母与上面的「卡利用率」不同，两个数字不可直接相减：**"
+                       "这里是**已开出 VM 的芯片小时**（节点起来了的芯片 × 时长），"
+                       "上面是**已付费芯片小时**。买了却没开出 VM 的芯片只进上面的分母。\n\n"
+                       "它不需要 pod→job 归因，所以历史长度只受指标保留期限制，"
+                       "而不受我们从何时开始采集 pod 身份限制——这是它存在的理由，"
+                       "现在覆盖 2026-03-11 起的全部区间。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 8},
         "datasource": DS,
         "targets": [sql(f"""SELECT TIMESTAMP(day) AS time,
-  mean_occupancy_pct AS `TensorCore 占用率`
-FROM `{project}.mlobs_core.fin_occupancy_daily`
+  ROUND(100 * SAFE_DIVIDE(busy_chip_hours, vm_chip_hours), 2) AS `TensorCore 占用率`
+FROM `{project}.mlobs_core.fin_daily`
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
+  AND vm_chip_hours > 0
 ORDER BY day""")],
         "fieldConfig": {"defaults": {"unit": "percent",
                                      "custom": {"lineWidth": 2, "fillOpacity": 10}},

@@ -84,6 +84,23 @@ DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --project "$PROJECT_ID
          --format='value(image_summary.digest)' 2>/dev/null)
 [[ -n "$DIGEST" ]] || { echo "  cannot resolve digest for ${IMAGE}" >&2; exit 1; }
 IMAGE_REF="${IMAGE%%:*}@${DIGEST}"
+
+# Stamp what is actually in the image.
+#
+# The image is built from the working directory, so the tag, the digest and the
+# repository can all disagree. On 2026-09-11 a change went live that existed in
+# no commit; it was reverted on 09-14, also before being committed, and for 67
+# hours the code running in production could not be read anywhere. That is why a
+# three-day data defect looked unexplainable: the file on disk described the
+# fix, not the thing that was running.
+#
+# The dirty count matters as much as the SHA -- a SHA alone would have said
+# "d7c451a" for both of those images. Deploying dirty is not refused, because
+# that is how a fix gets tested before it is committed; it is recorded.
+GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+BUILD_STAMP="${GIT_SHA}$([ "${GIT_DIRTY:-0}" -gt 0 ] && echo "+${GIT_DIRTY}dirty")"
+echo "  build stamp: ${BUILD_STAMP}"
 echo "  ${IMAGE} -> ${DIGEST}"
 
 echo "=== Cloud Run job ==="
@@ -93,7 +110,7 @@ echo "=== Cloud Run job ==="
 # genuinely broken run should surface rather than loop.
 ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE_REF"
       --service-account "$SA"
-      --set-env-vars "PROJECT_ID=${PROJECT_ID},REGION=${REGION},MLDIAG_LOCATIONS=${MLDIAG_LOCATIONS},METRIC_HOURS=1"
+      --set-env-vars "PROJECT_ID=${PROJECT_ID},REGION=${REGION},MLDIAG_LOCATIONS=${MLDIAG_LOCATIONS},METRIC_HOURS=1,BUILD_STAMP=${BUILD_STAMP}"
       --memory 2Gi --cpu 1 --task-timeout 45m --max-retries 1 --quiet)
 if gcloud run jobs describe "$JOB" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs update "$JOB" "${ARGS[@]}" >/dev/null
@@ -119,7 +136,7 @@ SNAP_ARGS=(--project "$PROJECT_ID" --region "$REGION" --image "$IMAGE_REF"
            --service-account "$SA"
            --command python3
            --args "/app/collect/node_pool_snapshot.py,--project,${PROJECT_ID}"
-           --set-env-vars "PROJECT_ID=${PROJECT_ID}"
+           --set-env-vars "PROJECT_ID=${PROJECT_ID},BUILD_STAMP=${BUILD_STAMP}"
            --memory 512Mi --cpu 1 --task-timeout 5m --max-retries 1 --quiet)
 if gcloud run jobs describe "$POOLSNAP" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs update "$POOLSNAP" "${SNAP_ARGS[@]}" >/dev/null && echo "  ${POOLSNAP} updated"
