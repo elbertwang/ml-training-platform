@@ -87,7 +87,7 @@ SELECT * FROM UNNEST([
 CREATE OR REPLACE TABLE mlobs_core.fin_capacity_daily
 CLUSTER BY reservation_id
 AS
-WITH s AS (
+WITH raw_s AS (
   SELECT
     DATE(point_time)                                       AS day,
     JSON_VALUE(resource_labels, '$.reservation_id')        AS reservation_id,
@@ -103,16 +103,29 @@ WITH s AS (
     -- would therefore halve every chip-hour older than six weeks -- invisibly,
     -- because the number stays plausible. Taking the gap to the previous sample
     -- makes the integral correct at either resolution.
-    COALESCE(
-      TIMESTAMP_DIFF(point_time,
-        LAG(point_time) OVER (PARTITION BY DATE(point_time),
-                                           JSON_VALUE(resource_labels, '$.reservation_id'),
-                                           metric_type
-                              ORDER BY point_time), SECOND),
-      300) AS interval_s
+    TIMESTAMP_DIFF(point_time,
+      LAG(point_time) OVER (PARTITION BY DATE(point_time),
+                                         JSON_VALUE(resource_labels, '$.reservation_id'),
+                                         metric_type
+                            ORDER BY point_time), SECOND) AS gap_s
   FROM mlobs_raw.metric_samples
   WHERE metric_type IN ('compute.googleapis.com/reservation/reserved',
                         'compute.googleapis.com/reservation/used')
+),
+s AS (
+  SELECT * EXCEPT(gap_s),
+    -- The day's first sample has no predecessor inside its partition. Falling
+    -- back to a hard 300 was right while everything was 300s and wrong the
+    -- moment history arrived at 3600s: it would drop 3,300 seconds from every
+    -- day, a 3.8% undercount that lands in paid_chip_hours and in day_coverage.
+    -- The partition's smallest observed gap is the sampling period -- gaps only
+    -- ever grow, at holes -- so it is the right width for the leading sample at
+    -- either resolution, and for a reservation that lived one hour it is still
+    -- that reservation's own period rather than a day-length guess.
+    COALESCE(gap_s,
+             MIN(gap_s) OVER (PARTITION BY day, reservation_id, metric_type),
+             300) AS interval_s
+  FROM raw_s
 )
 SELECT
   day,
@@ -220,20 +233,23 @@ WITH pod_class AS (
 -- five-minute table disagree by 13-17%; there is now one derivation and the
 -- question cannot arise.
 --
--- Each row stands for exactly 300 seconds, so a chip-hour is a row count over
--- twelve. A slot with no sample contributes no row, which means a collection
--- gap reads as absence rather than being interpolated across. That is the
--- honest reading of "we did not measure it", and the sampling gaps that made it
--- matter were closed at source -- see the interval boundary note in
+-- Each row stands for interval_s seconds, so a chip-hour is summed interval_s
+-- over 3600. It is not a row count: the live collector writes 300 and the
+-- history loaded from beyond Cloud Monitoring's six-week full-resolution window
+-- writes 3600, and counting rows would report one twelfth of the historical
+-- work without failing. A slot with no sample contributes no row, which means a
+-- collection gap reads as absence rather than being interpolated across. That
+-- is the honest reading of "we did not measure it", and the sampling gaps that
+-- made it matter were closed at source -- see the interval boundary note in
 -- collect/metrics_exporter.py.
 busy AS (
   SELECT
     DATE(slot) AS day,
-    COUNT(*) / 12.0                                        AS vm_chip_hours,
-    COUNTIF(pod_name IS NOT NULL) / 12.0                   AS pod_chip_hours,
-    SUM(duty_pct)       / 100 / 12.0                       AS duty_chip_hours,
-    SUM(tensorcore_pct) / 100 / 12.0                       AS busy_chip_hours,
-    SUM(membw_pct)      / 100 / 12.0                       AS membw_chip_hours,
+    SUM(interval_s) / 3600.0                               AS vm_chip_hours,
+    SUM(IF(pod_name IS NULL, 0, interval_s)) / 3600.0      AS pod_chip_hours,
+    SUM(duty_pct       * interval_s) / 100 / 3600.0        AS duty_chip_hours,
+    SUM(tensorcore_pct * interval_s) / 100 / 3600.0        AS busy_chip_hours,
+    SUM(membw_pct      * interval_s) / 100 / 3600.0        AS membw_chip_hours,
     COUNT(DISTINCT chip_id)                                AS chips_seen,
     COUNT(DISTINCT node_name)                              AS nodes_seen
   FROM mlobs_core.fact_chip
@@ -358,12 +374,20 @@ metric_coverage AS (
   -- aligned -- so a 0.9 gate on buckets would sit on the noise floor and suppress
   -- good days. Whole hours separate cleanly: 1.0 for every healthy day above,
   -- 0.17 / 0.375 / 0 / 0.958 for the four damaged ones.
+  --
+  -- Measured on fact_chip, which is where every numerator above comes from.
+  -- It used to be measured on fact_metric's container-scoped series, and while
+  -- one resolution and one collector existed the two moved together. They stop
+  -- agreeing the moment history arrives: the recovered range has node-scoped
+  -- hourly rows in fact_chip and nothing at all in fact_metric, so the gate
+  -- read 0 and suppressed all four published ratios for 143 of 184 days --
+  -- data that was present, correct, and invisible. A coverage gate has to
+  -- measure the table it is guarding.
   SELECT
-    DATE(point_time) AS day,
-    ROUND(COUNT(DISTINCT TIMESTAMP_TRUNC(point_time, HOUR)) / 24, 3) AS metric_coverage
-  FROM mlobs_core.fact_metric
-  WHERE point_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
-    AND metric_type = 'kubernetes.io/container/accelerator/tensorcore_utilization'
+    DATE(slot) AS day,
+    ROUND(COUNT(DISTINCT TIMESTAMP_TRUNC(slot, HOUR)) / 24, 3) AS metric_coverage
+  FROM mlobs_core.fact_chip
+  WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
   GROUP BY day
 )
 -- One row per day. capacity_class is no longer a dimension here: the work

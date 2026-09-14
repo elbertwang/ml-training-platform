@@ -53,13 +53,22 @@ CREATE TABLE IF NOT EXISTS mlobs_core.fact_chip
   pod_name      STRING,
   job_key       STRING,
   job_family    STRING,
-  -- Percentages as reported, 0-100. Chip-hours are (pct/100 * 300/3600) and are
-  -- left to the reader so this table stays additive in one obvious way.
+  -- Percentages as reported, 0-100. Chip-hours are (pct/100 * interval_s/3600)
+  -- and are left to the reader so this table stays additive in one obvious way.
   -- The instance mean, repeated across that instance's four chip rows. See the
   -- duty_inst note below: duty_cycle cannot be keyed to a physical chip.
   duty_pct      FLOAT64,
   tensorcore_pct FLOAT64,
-  membw_pct     FLOAT64
+  membw_pct     FLOAT64,
+  -- How many seconds this row stands for. 300 for everything this file writes.
+  --
+  -- It is a column rather than a constant because Cloud Monitoring downsamples:
+  -- data older than six weeks is only served at 600s, so the history loaded by
+  -- 11h_fact_chip_history.sql carries 3600. Every consumer therefore weights by
+  -- interval_s instead of counting rows. Counting rows was correct while one
+  -- resolution existed and would have silently halved every historical
+  -- numerator the moment a second one arrived -- no error, just wrong totals.
+  interval_s    INT64
 )
 PARTITION BY DATE(slot)
 CLUSTER BY chip_id, job_key;
@@ -174,7 +183,8 @@ SELECT
   p.job_family,
   ROUND(du.duty_pct, 2),
   ROUND(n.tensorcore_pct, 2),
-  ROUND(n.membw_pct, 2)
+  ROUND(n.membw_pct, 2),
+  300 AS interval_s
 FROM node n
 LEFT JOIN duty_inst du
   ON du.slot = n.slot AND du.instance_id = SPLIT(n.chip_id, '-')[OFFSET(0)]

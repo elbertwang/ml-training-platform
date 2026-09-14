@@ -463,6 +463,27 @@ flowchart LR
 instance id（与 `compute instances describe` 核对一致），所以芯片↔实例不需要
 映射表，`SPLIT` 即可。
 
+**两段分辨率，靠 `interval_s` 统一。** 采集器只能向前跑，所以事实层原本从它上线
+那天开始。Cloud Monitoring 实际能回溯到 **2026-03-11**——集群 `tpu-training-antgroup`
+的创建时间，不是保留边界。取回来的数据有两种分辨率：六周以内是原生 300 秒，
+更早一律降采样到 600 秒。
+
+`fact_chip` 因此带 `interval_s` 列，`11_fact_chip.sql` 写 300，
+`11h_fact_chip_history.sql` 从 `mlobs_raw.metric_hourly` 按小时写 3600。所有下游
+一律按 `pct/100 × interval_s/3600` 加权，不再数行数。**数行数在只有一种分辨率时是对的，
+在第二种到达的那一刻会把历史的每个分子砍掉 12 分之 11，而且不报任何错。**
+改完在已有的 35 天上逐日比对，五个量的最大差都是 `0.0`。
+
+历史段的上线时长是实测的：抓取时同时取 `ALIGN_MEAN` 和 `ALIGN_COUNT`，
+在内存里按 (序列, 时间戳) 合并，`interval_s = count × 600`。只取均值的话，
+一个在整点前十分钟才起来的节点会被记成整整一芯片小时。
+
+`metric_coverage` 闸门也因此改成度量 `fact_chip` 本身而不是 `fact_metric`：
+后者是容器级、历史段没有数据，闸门读到 0，把 184 天里 143 天的四个比率全部置空——
+数据在、正确、但不可见。**闸门必须度量它要守的那张表。**
+
+
+
 ### 4.5 四个资源效能口径
 
 ```

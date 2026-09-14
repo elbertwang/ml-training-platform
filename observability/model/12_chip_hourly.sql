@@ -5,14 +5,15 @@
 -- paid for it, what ran on it, and how hard it worked -- so answering a
 -- question needs no joins.
 --
--- A straight aggregate of fact_chip, twelve five-minute rows to one hour. It
--- adds no measurement of its own; the reason it exists rather than a view is
--- that a view over 4.6M rows is re-read on every query, while this is 12k rows
--- a day and can be scanned whole.
+-- A straight aggregate of fact_chip: twelve five-minute rows to one hour for
+-- recent days, one 3600-second row for days past Cloud Monitoring's six-week
+-- full-resolution window. It adds no measurement of its own; the reason it
+-- exists rather than a view is that a view over 4.6M rows is re-read on every
+-- query, while this is 12k rows a day and can be scanned whole.
 --
--- Numerator and denominator are both here. `vm_slots` counts the five-minute
--- slots in which the chip's node was up, which is the denominator of the two
--- in-VM ratios; `pod_slots` counts those where a pod held it. That works
+-- Numerator and denominator are both here. `vm_slots` is the five-minute-
+-- equivalent time in which the chip's node was up, which is the denominator of
+-- the two in-VM ratios; `pod_slots` is the part a pod held. That works
 -- because the node-scoped accelerator metrics report for a chip whether or not
 -- anything is scheduled on it, so an idle chip is a row of zeroes rather than
 -- an absent row.
@@ -27,7 +28,8 @@
 --
 -- Hours are partial at the edges of a run and while a node is coming or going;
 -- vm_slots says how much of the hour was actually observed, and 12 is a full
--- one.
+-- one. Everything here weights by fact_chip.interval_s rather than counting
+-- rows, so the two source resolutions produce the same chip-hours.
 
 CREATE TABLE IF NOT EXISTS mlobs_core.chip_hourly
 (
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS mlobs_core.chip_hourly
   pod_name         STRING,
   job_key          STRING,
   job_family       STRING,
-  -- Slots out of 12. vm_slots is the denominator of the in-VM ratios.
+  -- Five-minute-equivalents out of 12. vm_slots is the in-VM denominator.
   vm_slots         INT64,
   pod_slots        INT64,
   -- Time-weighted means over the slots that reported, 0-100.
@@ -57,7 +59,7 @@ CREATE TABLE IF NOT EXISTS mlobs_core.chip_hourly
   tensorcore_pct   FLOAT64,
   membw_pct        FLOAT64,
   -- The same three as chip-hours, so a reader can sum across chips without
-  -- reweighting. chip_hours = pct/100 * slots/12.
+  -- reweighting. chip_hours = pct/100 * slots/12 = pct/100 * interval_s/3600.
   vm_chip_hours    FLOAT64,
   pod_chip_hours   FLOAT64,
   duty_chip_hours  FLOAT64,
@@ -77,8 +79,9 @@ WITH src AS (
   SELECT * FROM mlobs_core.fact_chip
   WHERE slot >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 4 DAY)
 ),
--- The job holding the chip for the most slots in the hour. Ties break on the
--- name so a rerun produces the same row.
+-- The job holding the chip longest in the hour -- ranked on summed interval_s
+-- rather than row count, because a row is no longer a fixed amount of time.
+-- Ties break on the name so a rerun produces the same row.
 owner AS (
   SELECT hour, chip_id, pod_name, job_key, job_family
   FROM (
@@ -87,7 +90,7 @@ owner AS (
                               ORDER BY n DESC, pod_name) AS rn
     FROM (
       SELECT TIMESTAMP_TRUNC(slot, HOUR) AS hour,
-             chip_id, pod_name, job_key, job_family, COUNT(*) AS n
+             chip_id, pod_name, job_key, job_family, SUM(interval_s) AS n
       FROM src
       WHERE pod_name IS NOT NULL
       GROUP BY hour, chip_id, pod_name, job_key, job_family
@@ -111,16 +114,26 @@ SELECT
   ANY_VALUE(o.pod_name),
   ANY_VALUE(o.job_key),
   ANY_VALUE(o.job_family),
-  COUNT(*)                                        AS vm_slots,
-  COUNTIF(s.pod_name IS NOT NULL)                 AS pod_slots,
-  ROUND(AVG(s.duty_pct), 2)                       AS duty_pct,
-  ROUND(AVG(s.tensorcore_pct), 2)                 AS tensorcore_pct,
-  ROUND(AVG(s.membw_pct), 2)                      AS membw_pct,
-  ROUND(COUNT(*) / 12.0, 4)                       AS vm_chip_hours,
-  ROUND(COUNTIF(s.pod_name IS NOT NULL) / 12.0, 4) AS pod_chip_hours,
-  ROUND(SUM(s.duty_pct)       / 100 / 12.0, 4)    AS duty_chip_hours,
-  ROUND(SUM(s.tensorcore_pct) / 100 / 12.0, 4)    AS busy_chip_hours,
-  ROUND(SUM(s.membw_pct)      / 100 / 12.0, 4)    AS membw_chip_hours
+  -- Slot counts are expressed in five-minute units regardless of the source
+  -- resolution, so "12 is a full hour" holds for a historical row built from a
+  -- single 3600-second sample exactly as it does for twelve 300-second ones.
+  CAST(ROUND(SUM(s.interval_s) / 300.0) AS INT64)  AS vm_slots,
+  CAST(ROUND(SUM(IF(s.pod_name IS NULL, 0, s.interval_s)) / 300.0) AS INT64)
+                                                   AS pod_slots,
+  -- Time-weighted, not a plain mean: a 3600-second row must not count the same
+  -- as a 300-second one. Each denominator counts only the rows that reported
+  -- that metric, which is what AVG did before.
+  ROUND(SAFE_DIVIDE(SUM(s.duty_pct * s.interval_s),
+                    SUM(IF(s.duty_pct IS NULL, 0, s.interval_s))), 2) AS duty_pct,
+  ROUND(SAFE_DIVIDE(SUM(s.tensorcore_pct * s.interval_s),
+                    SUM(IF(s.tensorcore_pct IS NULL, 0, s.interval_s))), 2) AS tensorcore_pct,
+  ROUND(SAFE_DIVIDE(SUM(s.membw_pct * s.interval_s),
+                    SUM(IF(s.membw_pct IS NULL, 0, s.interval_s))), 2) AS membw_pct,
+  ROUND(SUM(s.interval_s) / 3600, 4)               AS vm_chip_hours,
+  ROUND(SUM(IF(s.pod_name IS NULL, 0, s.interval_s)) / 3600, 4) AS pod_chip_hours,
+  ROUND(SUM(s.duty_pct       * s.interval_s) / 100 / 3600, 4) AS duty_chip_hours,
+  ROUND(SUM(s.tensorcore_pct * s.interval_s) / 100 / 3600, 4) AS busy_chip_hours,
+  ROUND(SUM(s.membw_pct      * s.interval_s) / 100 / 3600, 4) AS membw_chip_hours
 FROM src s
 LEFT JOIN owner o
   ON o.hour = TIMESTAMP_TRUNC(s.slot, HOUR) AND o.chip_id = s.chip_id
