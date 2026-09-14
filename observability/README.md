@@ -210,6 +210,11 @@ Grafana 里是「训练稳定性与效率」那一行。详见[附录 A §7](doc
 
 ## 4. 架构
 
+分层交互图：[`docs/architecture.html`](docs/architecture.html)（下载后用浏览器打开；
+源规格 [`docs/architecture.arch.json`](docs/architecture.arch.json)，由 archify 渲染）。
+它画的是五层之间实际流动的数据，带三条导览路径：客户主路径、财务分子与分母、日志与事件。
+本节的 mermaid 图覆盖面更全，两者互补——交互图突出主干，mermaid 图列全表名。
+
 ### 4.1 总体
 
 ```mermaid

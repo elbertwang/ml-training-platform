@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "TPU 训练可观测与财务分析平台",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1360,
+      600
+    ],
+    "views": [
+      {
+        "id": "chip-path",
+        "label": "客户主路径：每芯片每小时",
+        "focus": [
+          "exporter",
+          "metric_samples",
+          "fact_chip",
+          "chip_hourly",
+          "share"
+        ],
+        "note": "node 级加速器指标是唯一测量点，宽表与财务表都是它的聚合。"
+      },
+      {
+        "id": "finance-path",
+        "label": "财务口径：分子与分母",
+        "focus": [
+          "fact_chip",
+          "fin_daily",
+          "fin_capacity",
+          "metric_samples"
+        ],
+        "note": "分母走独立路径：预留了但没开出 VM 的芯片不产生任何序列。"
+      },
+      {
+        "id": "log-path",
+        "label": "日志与事件",
+        "focus": [
+          "sink",
+          "v_sink_logs",
+          "fact_ev_step",
+          "grafana"
+        ],
+        "note": "sink 只收全量日志的 0.83%，永久保留且反复查询便宜。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "sink",
+      "type": "cloud",
+      "label": "Log Router sink",
+      "sublabel": "mlobs-selective",
+      "tag": "590 万行/天 · 全量的 0.83%",
+      "pos": [
+        40,
+        98
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "exporter",
+      "type": "backend",
+      "label": "metrics_exporter.py",
+      "sublabel": "Cloud Monitoring → BigQuery",
+      "tag": "11 指标 · 300 秒对齐",
+      "pos": [
+        40,
+        266
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "snapshot",
+      "type": "backend",
+      "label": "node_pool_snapshot.py",
+      "sublabel": "GKE + Reservations API",
+      "tag": "每 5 分钟",
+      "pos": [
+        40,
+        434
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "v_sink_logs",
+      "type": "database",
+      "label": "v_sink_logs",
+      "sublabel": "运行时发现并 union 24 张 sink 表",
+      "pos": [
+        300,
+        98
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "metric_samples",
+      "type": "database",
+      "label": "metric_samples",
+      "sublabel": "8.6 GiB",
+      "tag": "node 级 / 容器级 / 预留",
+      "pos": [
+        300,
+        266
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "fact_ev_step",
+      "type": "database",
+      "label": "fact_event · fact_step",
+      "sublabel": "3088 万 / 100 万",
+      "pos": [
+        560,
+        98
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "fact_chip",
+      "type": "database",
+      "label": "fact_chip",
+      "sublabel": "每芯片每 5 分钟 · 460 万行",
+      "tag": "唯一测量点",
+      "pos": [
+        560,
+        266
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "dim_pool",
+      "type": "database",
+      "label": "dim_pod · dim_node_pool",
+      "sublabel": "13.9 万 / 762",
+      "pos": [
+        560,
+        434
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "chip_hourly",
+      "type": "database",
+      "label": "chip_hourly",
+      "sublabel": "每芯片每小时 · 1.2 万行/天",
+      "pos": [
+        820,
+        203
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "fin_daily",
+      "type": "database",
+      "label": "fin_daily",
+      "sublabel": "四个资源效能比率",
+      "pos": [
+        820,
+        329
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "fin_capacity",
+      "type": "database",
+      "label": "fin_capacity_daily",
+      "sublabel": "每预留每天 · 分母",
+      "pos": [
+        820,
+        455
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "grafana",
+      "type": "frontend",
+      "label": "Grafana on Cloud Run",
+      "sublabel": "IAP 与 run.invoker 双服务",
+      "tag": "同一镜像摘要",
+      "pos": [
+        1090,
+        98
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "share",
+      "type": "cloud",
+      "label": "mlobs_share",
+      "sublabel": "9 视图 · 只读服务账号",
+      "tag": "对外交付",
+      "pos": [
+        1090,
+        266
+      ],
+      "size": [
+        190,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "采集 Collection",
+      "wraps": [
+        "sink",
+        "exporter",
+        "snapshot"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "暂存 mlobs_raw · 32 表 91.9 GiB",
+      "wraps": [
+        "v_sink_logs",
+        "metric_samples"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "模型 mlobs_core · 28 表 11.4 GiB · 每 30 分钟刷新",
+      "wraps": [
+        "fact_ev_step",
+        "fact_chip",
+        "dim_pool",
+        "chip_hourly",
+        "fin_daily",
+        "fin_capacity"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "服务与对外",
+      "wraps": [
+        "grafana",
+        "share"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "sink-raw",
+      "from": "sink",
+      "to": "v_sink_logs",
+      "label": "精选日志"
+    },
+    {
+      "id": "raw-events",
+      "from": "v_sink_logs",
+      "to": "fact_ev_step",
+      "label": "解析归因"
+    },
+    {
+      "id": "events-grafana",
+      "from": "fact_ev_step",
+      "to": "grafana",
+      "label": "事件面板"
+    },
+    {
+      "id": "exp-raw",
+      "from": "exporter",
+      "to": "metric_samples",
+      "label": "node 级加速器指标",
+      "variant": "emphasis",
+      "labelDy": -52
+    },
+    {
+      "id": "raw-chip",
+      "from": "metric_samples",
+      "to": "fact_chip",
+      "label": "按芯片按时隙",
+      "variant": "emphasis"
+    },
+    {
+      "id": "chip-hourly",
+      "from": "fact_chip",
+      "to": "chip_hourly",
+      "label": "聚合到小时",
+      "variant": "emphasis"
+    },
+    {
+      "id": "hourly-share",
+      "from": "chip_hourly",
+      "to": "share",
+      "label": "v_chip_hourly",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "chip-fin",
+      "from": "fact_chip",
+      "to": "fin_daily",
+      "label": "聚合到天"
+    },
+    {
+      "id": "raw-capacity",
+      "from": "metric_samples",
+      "to": "fin_capacity",
+      "label": "预留指标 · 不经 fact_chip",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [
+        [
+          395,
+          392
+        ],
+        [
+          785,
+          392
+        ],
+        [
+          785,
+          491
+        ]
+      ]
+    },
+    {
+      "id": "capacity-fin",
+      "from": "fin_capacity",
+      "to": "fin_daily",
+      "label": "分母"
+    },
+    {
+      "id": "fin-share",
+      "from": "fin_daily",
+      "to": "share",
+      "label": "v_utilization_daily",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [
+        [
+          1185,
+          365
+        ]
+      ],
+      "labelSegment": 0
+    },
+    {
+      "id": "fin-grafana",
+      "from": "fin_daily",
+      "to": "grafana",
+      "label": "财务面板",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          915,
+          420
+        ],
+        [
+          1320,
+          420
+        ],
+        [
+          1320,
+          67
+        ],
+        [
+          1185,
+          67
+        ]
+      ]
+    },
+    {
+      "id": "snap-dim",
+      "from": "snapshot",
+      "to": "dim_pool",
+      "label": "节点池与预留"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "一个测量点",
+      "items": [
+        "fact_chip 是唯一从原始指标推导的表，其余都是它的聚合",
+        "node 级读数把空闲芯片计为 0% 而非从平均中消失，序列数即已开出的芯片数"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "分母为何独立成表",
+      "items": [
+        "预留了但没开出 VM 的芯片不产生任何序列：没有节点、没有容器、没有指标",
+        "维度表 dim_pod / dim_node_pool 供多张事实表归因，不止 fact_chip 一条链路"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "已知缺口",
+      "items": [
+        "sink 每天丢 5k–28k 条 kueue 日志，schema 类型冲突，累计 20.9 万",
+        "mldiag_poller 采集 13 GiB，02_dim_mlrun 从未进刷新序列"
+      ]
+    }
+  ]
+}
