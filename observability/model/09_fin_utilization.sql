@@ -122,9 +122,22 @@ s AS (
     -- ever grow, at holes -- so it is the right width for the leading sample at
     -- either resolution, and for a reservation that lived one hour it is still
     -- that reservation's own period rather than a day-length guess.
-    COALESCE(gap_s,
-             MIN(gap_s) OVER (PARTITION BY day, reservation_id, metric_type),
-             300) AS interval_s
+    -- Capped at the sampling period as well as defaulted to it.
+    --
+    -- A collection gap makes the next sample's LAG large, and the uncapped gap
+    -- then credits the whole hole as measured time. On 2026-09-04 that put
+    -- 86,488 seconds of width into a 86,400-second day: day_coverage is clamped
+    -- to 1.0 but the chip-hours were not, so the tile that divides them read
+    -- 512.52 chips and rendered 513 on a day whose reservation never moved off
+    -- 512. Capping says the honest thing instead -- a gap is time we did not
+    -- measure, so coverage falls rather than the level rising. Verified not to
+    -- change which days pass the 0.9 gate: 182 of 185 before and after.
+    LEAST(
+      COALESCE(gap_s,
+               MIN(gap_s) OVER (PARTITION BY day, reservation_id, metric_type),
+               300),
+      COALESCE(MIN(gap_s) OVER (PARTITION BY day, reservation_id, metric_type),
+               300)) AS interval_s
   FROM raw_s
 )
 SELECT
@@ -639,8 +652,29 @@ SELECT
    AND COALESCE(w.pod_chip_hours, 0) <= c.scheduled_chip_hours
    AND GREATEST(COALESCE(w.duty_chip_hours, 0),
                 COALESCE(w.stepping_chip_hours, 0)) <= COALESCE(w.pod_chip_hours, 0)
-   AND COALESCE(w.busy_chip_hours, 0) <= LEAST(COALESCE(w.duty_chip_hours, 0),
-                                               COALESCE(w.stepping_chip_hours, 0)))
+   AND COALESCE(w.busy_chip_hours, 0) <= COALESCE(w.duty_chip_hours, 0)
+   -- stepping only constrains a day that has one.
+   --
+   -- This used to read LEAST(duty, COALESCE(stepping, 0)), and stepping comes
+   -- from fact_step, which begins 2026-08-05 because the log window it was
+   -- recovered from has since closed. So for all 143 earlier days the COALESCE
+   -- made the bound zero, `busy <= 0` was false whenever any work had happened,
+   -- and funnel_monotonic was true on 3 of those 143 days. The funnel bar gauge
+   -- and the daily trend both filter on it, so 119 days of correct, fully
+   -- covered history -- 2026-03-12 to 2026-08-04 -- rendered as an empty chart.
+   --
+   -- The argument against it is the one written directly below about flops, and
+   -- it was simply not applied here: the funnel draws scheduled, pod, duty and
+   -- busy. stepping is not one of them. Gating a chart on a stage it does not
+   -- show drops days for a reason invisible to whoever reads it.
+   --
+   -- What remains excluded before 08-05 is what should be: 18 days in March and
+   -- April where pod exceeds scheduled because the cluster was being built and
+   -- most machines were not on the reservation, one June day where scheduled
+   -- exceeds paid, and one July day where duty exceeds pod. May and the first
+   -- four days of August lose nothing.
+   AND (w.stepping_chip_hours IS NULL
+        OR COALESCE(w.busy_chip_hours, 0) <= w.stepping_chip_hours))
    -- flops is deliberately not checked. The funnel stopped displaying that stage
    -- on 2026-09-10, and gating a chart on a stage it does not show would drop
    -- days for a reason invisible to whoever reads it. mfu_pct keeps its own

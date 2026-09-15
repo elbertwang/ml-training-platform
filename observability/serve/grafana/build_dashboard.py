@@ -1391,7 +1391,16 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
   ROUND(100*SAFE_DIVIDE(SUM(scheduled_chip_hours),SUM(paid_chip_hours)),2) AS v
 FROM {fin}
 WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
-  AND day_coverage >= 0.9""")],
+  AND day_coverage >= 0.9
+  -- Its own invariant, and only its own. On 2026-06-25 a reservation was
+  -- deleted mid-day and its /used series carried one sample more than its
+  -- /reserved series, so the two integrals covered different spans and the day
+  -- read 111% for that reservation and 102.08% fleet-wide -- off the end of a
+  -- gauge whose fixed 0-100 scale exists because you cannot schedule more than
+  -- you reserved. One day in 185. Filtering on funnel_monotonic instead would
+  -- also drop March and April for pod exceeding scheduled, which is a stage
+  -- this gauge does not draw.
+  AND scheduled_chip_hours <= paid_chip_hours""")],
          "options": {"reduceOptions": {"calcs": ["lastNotNull"],
                                        "fields": "/^v$/", "values": False},
                      "showThresholdMarkers": True, "showThresholdLabels": False},
@@ -1406,17 +1415,26 @@ WHERE day BETWEEN DATE($__timeFrom()) AND DATE($__timeTo())
         # not say whether 94% is 94% of 512 chips or of 64, and the reservation
         # is resized often enough that the reader cannot carry the denominator
         # in their head.
-        {"type": "stat", "title": "已调度 / 已预留（芯片，最新一天）", "datasource": DS,
+        {"type": "stat", "title": "已调度 / 已预留（最新一天，芯片·日均）", "datasource": DS,
          "gridPos": {"x": 5, "y": y, "w": 4, "h": 5},
          "description":
-            "**取区间内最后一个完整日，不是区间平均。**\n\n"
-            "预留规模是阶跃变化的，跨越一次调整去取平均会得到一个从未成立过的数字。"
-            "实测：`3615901865426835680` 在 08-31 由 512 缩到 384，"
-            "`2877059003882016695` 的 128 张卡在 09-02 才创建 —— 两者相加"
-            "09-04 起重新是 512，而这 30 天的平均是 503，那一天都不曾是真的。\n\n"
+            "**取区间内最后一个完整日的日均，不是区间平均，也不是某一刻的瞬时值。**\n\n"
+            "预留规模是阶跃变化的，跨越一次调整去取整个区间的平均会得到一个从未成立过的"
+            "数字——所以这里只取一天。但**如果那一天本身发生了调整，日均同样不是任何"
+            "一刻的真值**，这一点必须说清楚，标题里的「日均」就是为此。\n\n"
+            "实测一例：`3615901865426835680` 在 2026-08-31 18:05–18:10 UTC 由 512 缩到 384，"
+            "全天 75.7% 的时间在 512、24.3% 在 384，日均 481。把时间范围选成"
+            "「上个月」落在这一天，磁贴就显示 464 / 481——**481 那天一秒都没成立过**，"
+            "但 464/481 = 96.4% 是那天真实的交付率。要看阶跃本身，查 "
+            "`mlobs_raw.metric_samples` 里 `compute.googleapis.com/reservation/reserved`。\n\n"
+            "分子和分母是两种不同性质的量，这是不能给它们换不同估计量的原因："
+            "`reserved` 是阶跃函数，185 天里只有 7 天变过；`used` 是连续波动的，"
+            "平常一天就有 8–19 个不同取值。对分母取「当日最后一个样本」看似更准，"
+            "对分子就会变成错的——2026-08-29 那样平稳的一天会从真实日均 501 变成 488。"
+            "两者必须用同一个窗口、同一种估计量，否则 `scheduled ≤ reserved` 会被打破。\n\n"
             "芯片数由芯片小时还原：`chip_hours ÷ (24 × day_coverage)`。"
             "除数带 `day_coverage` 而不是直接按整天摊，否则采集有中断的日子会被压低。\n\n"
-            "左侧表盘是**区间**的占用率，本磁贴是**最新一天**的绝对值，"
+            "左侧表盘是**区间**的占用率，本磁贴是**最新一天**的日均，"
             "两者在预留刚调整过的区间里对不上是正常的。",
          "targets": [sql(f"""SELECT CONCAT(
     CAST(ROUND(SAFE_DIVIDE(scheduled_chip_hours, 24*day_coverage)) AS INT64),
