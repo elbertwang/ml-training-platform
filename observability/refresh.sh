@@ -70,6 +70,22 @@ collect required v_sink_logs \
 collect optional node_pool_snapshot \
   python3 "${HERE}/collect/node_pool_snapshot.py" --project "$PROJECT_ID"
 
+# Optional, and it reads a dataset outside mlobs_*: the Log Analytics linked
+# dataset, which the refresh service account is not granted. It ran green while
+# its own watermark guard held the query back, then started failing the moment
+# the guard opened 24 hours later -- and because it sat in the model loop, whose
+# contract is that any failure stops the run, it froze the entire model for 40
+# hours while every execution reported a clean collect phase first. dim_pod,
+# job_hub, fact_event, fact_step, fact_chip, chip_hourly and fin_daily all stood
+# still at 2026-09-15 17:06 with raw collection perfectly current.
+#
+# It belongs here rather than there. It is an extraction from an external
+# source, which is what this section is for, and "optional" is exactly its
+# status: nothing in the model depends on it existing today.
+collect optional kueue_admission \
+  bash -c 'bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
+              < "'"${HERE}"'/model/00d_kueue_admission.sql" >/dev/null'
+
 # Last, and optional. Its output does reach fact_event -- 02_dim_mlrun.sql
 # builds dim_mlrun and fact_mlrun_event as views over these tables and
 # 04_fact_event.sql joins them -- but they are views, so a poll that fails
@@ -80,7 +96,7 @@ collect optional mldiag_poller \
                                      --locations "$MLDIAG_LOCATIONS" --since-hours 6
 
 echo "=== Model ==="
-for f in 00b_dim_config 00c_compact_mldiag 00d_kueue_admission 02_dim_mlrun 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
+for f in 00b_dim_config 00c_compact_mldiag 02_dim_mlrun 01_dim_pod 03b_dim_node_pool 03c_jobs_on_target 03d_dim_job_artifact 04_fact_event 04b_fact_incident 06_fact_goodput 07_fact_step 08_views 11_fact_chip 12_chip_hourly 09_fin_utilization; do
   printf "  %-18s " "$f"
   if out=$(bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
              < "${HERE}/model/${f}.sql" 2>&1); then
