@@ -71,17 +71,25 @@ collect optional node_pool_snapshot \
   python3 "${HERE}/collect/node_pool_snapshot.py" --project "$PROJECT_ID"
 
 # Optional, and it reads a dataset outside mlobs_*: the Log Analytics linked
-# dataset, which the refresh service account is not granted. It ran green while
-# its own watermark guard held the query back, then started failing the moment
-# the guard opened 24 hours later -- and because it sat in the model loop, whose
-# contract is that any failure stops the run, it froze the entire model for 40
-# hours while every execution reported a clean collect phase first. dim_pod,
-# job_hub, fact_event, fact_step, fact_chip, chip_hourly and fin_daily all stood
-# still at 2026-09-15 17:06 with raw collection perfectly current.
+# dataset. The refresh service account was granted roles/bigquery.dataViewer and
+# roles/logging.viewAccessor on 2026-09-18 so it can; a linked dataset needs
+# both, because BigQuery guards the table and Logging guards the view behind it.
+# The dataset's own ACL cannot be edited -- it is owned by the Logging service
+# agent and bigquery.datasets.update is denied on it -- so project-level roles
+# are the only route.
 #
-# It belongs here rather than there. It is an extraction from an external
-# source, which is what this section is for, and "optional" is exactly its
-# status: nothing in the model depends on it existing today.
+# It sits here rather than in the model loop because of what happened when it
+# did not. It ran green while its own watermark guard held the query back, then
+# started failing the moment the guard opened 24 hours later, and the model
+# loop's contract is that any failure stops the run: dim_pod, job_hub,
+# fact_event, fact_step, fact_chip, chip_hourly and fin_daily all stood still at
+# 2026-09-15 17:06 for 40 hours while every execution reported a clean collect
+# phase first.
+#
+# Keeping it optional is not about the permission, which is fixed. It is an
+# extraction from a source outside this project's control, and nothing in the
+# model depends on it existing today. A Log Analytics outage should cost the
+# admission decisions, not the whole model.
 collect optional kueue_admission \
   bash -c 'bq --project_id="$PROJECT_ID" query --use_legacy_sql=false \
               < "'"${HERE}"'/model/00d_kueue_admission.sql" >/dev/null'

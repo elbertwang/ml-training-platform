@@ -35,6 +35,19 @@
 -- carry none of them and 626 would fail. The sink is left alone and the loss is
 -- recovered here instead.
 --
+-- **Permissions.** Querying a linked dataset needs two grants, not one:
+-- roles/bigquery.dataViewer for the table and roles/logging.viewAccessor for
+-- the log view behind it. Both are project-level because the linked dataset's
+-- own ACL is owned by the Logging service agent and cannot be edited --
+-- bigquery.datasets.update is denied on it even to a project editor. They were
+-- granted to mlobs-refresh on 2026-09-18, and the grant is broad: read on every
+-- log the project routes, audit logs included.
+--
+-- This file was written and tested by a human identity that already had that
+-- access, so it passed every check and failed the first time the service
+-- account executed its query -- which was not the first run, because the
+-- watermark guard below kept the query unexecuted for 24 hours first.
+--
 -- Cost and cadence. One day of the linked dataset scans 22.5 GiB, about $0.14,
 -- and yields roughly 6,000 decisions. The guard below advances one day per run
 -- and only when the watermark is more than a day behind, so the steady state is
