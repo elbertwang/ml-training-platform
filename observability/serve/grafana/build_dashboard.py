@@ -595,17 +595,36 @@ WHERE $__timeFilter(step_time) ORDER BY step_time""")],
     log_opts = {"showTime": True, "wrapLogMessage": True,
                 "sortOrder": "Descending", "enableLogDetails": True}
 
-    # L-pod. jax-tpu is the JobSet container name, task the falcon one; a job is
-    # only ever one family, so naming both keeps one panel working for both.
+    # L-pod. The training container is named differently by each stack, and a pod
+    # only ever runs one of them, so naming all four keeps one panel working for
+    # all four. Measured over three days -- 6,559 pods carry jax-tpu, 3,795
+    # tunix-primatrix, 809 task, 19 trainer, and no pod carries two, so widening
+    # the filter cannot double anything.
+    #
+    #   jax-tpu           MaxText under JobSet
+    #   task              falcon
+    #   trainer           the aistudio JobSet stack. Emits the same
+    #                     `completed step:` lines as jax-tpu, so fact_step has
+    #                     always parsed them -- 07_fact_step matches on message
+    #                     text, never on container name -- but this panel showed
+    #                     nothing for those jobs.
+    #   tunix-primatrix   the RL stack. Not MaxText-shaped: GRPO engine output,
+    #                     34.2M lines over 7,218 pods, and the single largest
+    #                     thing this panel was silently missing.
     panels.append({
-        "type": "logs", "title": "训练主输出（jax-tpu / task 容器）",
-        "description": "MaxText 的 stdout/stderr 原文。条数受面板宽度限制 —— "
-                       "要计数或排序请看上面 BigQuery 的面板。",
+        "type": "logs", "title": "训练主输出（训练容器，按栈自动匹配）",
+        "description": "训练容器的 stdout/stderr 原文。容器名随训练栈不同："
+                       "`jax-tpu`（MaxText/JobSet）、`task`（falcon）、"
+                       "`trainer`（aistudio）、`tunix-primatrix`（RL）。"
+                       "一个 pod 只会有其中一个，四个名字都列出来是为了让同一个面板"
+                       "对四种栈都有效。\n\n"
+                       "条数受面板宽度限制 —— 要计数或排序请看上面 BigQuery 的面板。",
         "gridPos": {"x": 0, "y": y, "w": 24, "h": 10},
         "datasource": DS_LOG, "options": log_opts,
         "targets": [logs(project, 'resource.type="k8s_container"\n'
                                   'resource.labels.pod_name=~"^${pods:regex}$"\n'
-                                  'resource.labels.container_name=("jax-tpu" OR "task")')],
+                                  'resource.labels.container_name=("jax-tpu" OR "task"'
+                                  ' OR "trainer" OR "tunix-primatrix")')],
     })
     y += 10
 
